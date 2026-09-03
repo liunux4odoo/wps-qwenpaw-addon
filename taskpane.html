@@ -9,17 +9,31 @@
     <div id="app">
         <header id="header">
             <span id="title">QwenPaw AI</span>
-            <span id="statusDot" class="status-dot" title="连接状态"></span>
+            <div id="statusArea">
+                <span id="statusDot" class="status-dot connecting" title="连接状态"></span>
+                <span id="connLabel" class="conn-label">连接中</span>
+                <span id="wpsLabel" class="wps-label pending" title="WPS 桥状态">WPS 未激活</span>
+            </div>
         </header>
 
         <div id="messages" class="messages"></div>
 
+        <!-- P4：打字指示器（置于消息区外，避免被滚动隐藏） -->
+        <div id="typingIndicator" class="typing" style="display:none">
+            <span class="dots"><span></span><span></span><span></span></span>
+            <span id="phaseLabel">思考中…</span>
+        </div>
+
         <div id="toolbar" class="toolbar">
-            <span id="toolStatus" class="tool-status">WPS 桥: --</span>
+            <label class="toggle" title="显示/隐藏 AI 思考与工具调用过程">
+                <input type="checkbox" id="showProcess" checked> 显示过程
+            </label>
+            <span id="toolStatus" class="tool-status">正在连接…</span>
         </div>
 
         <div id="inputArea" class="input-area">
             <textarea id="input" rows="3" placeholder="输入指令，如：把第三段润色一下…"></textarea>
+            <button id="stopBtn" class="stop-btn" style="display:none">停止</button>
             <button id="sendBtn" class="send-btn">发送</button>
         </div>
     </div>

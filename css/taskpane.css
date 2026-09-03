@@ -28,11 +28,23 @@ html, body {
     background: #2b579a;
     color: #fff;
     flex-shrink: 0;
+    gap: 8px;
 }
 
 #title {
     font-weight: 600;
     font-size: 14px;
+    white-space: nowrap;
+}
+
+/* 状态区（P1：ACP 连接 + WPS 桥，两级状态合并右上角） */
+#statusArea {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    white-space: nowrap;
+    min-width: 0;
 }
 
 .status-dot {
@@ -40,10 +52,29 @@ html, body {
     height: 10px;
     border-radius: 50%;
     background: #f39c12;
+    flex-shrink: 0;
 }
 
+.status-dot.connecting { background: #f39c12; }
 .status-dot.connected { background: #2ecc71; }
 .status-dot.disconnected { background: #e74c3c; }
+
+.conn-label {
+    opacity: 0.95;
+}
+
+.wps-label {
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 10px;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 未激活 = 预期状态（懒启动端口），非错误，用中性色 */
+.wps-label.pending { background: rgba(255,255,255,0.18); color: #ffe0a3; }
+.wps-label.connected { background: rgba(46,204,113,0.3); color: #d5f5e3; }
 
 /* 消息区 */
 .messages {
@@ -93,17 +124,181 @@ html, body {
     font-size: 12px;
 }
 
+/* ── P2：可操作错误卡片 ── */
+.msg.error-card {
+    align-self: center;
+    background: #fdecea;
+    border: 1px solid #f5c6cb;
+    color: #7a2a22;
+    font-size: 12px;
+    max-width: 90%;
+    padding: 10px 14px;
+}
+
+.error-card-title {
+    font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.error-card-text {
+    opacity: 0.9;
+    margin-bottom: 8px;
+    word-break: break-all;
+}
+
+.error-card-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.err-btn {
+    padding: 4px 12px;
+    border: 1px solid #c0392b;
+    border-radius: 4px;
+    background: #fff;
+    color: #c0392b;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.err-btn:hover { background: #c0392b; color: #fff; }
+
+.err-btn.primary {
+    background: #c0392b;
+    color: #fff;
+}
+
+.err-btn.primary:hover { background: #a93226; }
+
+/* ── P4：工具卡片 ── */
+.tool-card {
+    align-self: flex-start;
+    max-width: 90%;
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-left: 3px solid #f39c12;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    animation: tool-in 0.15s ease-out;
+}
+
+.tool-card.pending { border-left-color: #f39c12; }
+.tool-card.done { border-left-color: #2ecc71; }
+.tool-card.error { border-left-color: #e74c3c; }
+.tool-card.cancelled { border-left-color: #95a5a6; opacity: 0.75; }
+
+.tool-card-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.tool-card-icon { font-size: 12px; }
+
+.tool-card-name {
+    font-weight: 600;
+    color: #333;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-card-status {
+    color: #888;
+    font-size: 11px;
+    flex-shrink: 0;
+}
+
+.tool-card-detail {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed #e0e0e0;
+    color: #666;
+    word-break: break-all;
+    font-family: monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+}
+
+@keyframes tool-in {
+    from { opacity: 0; transform: translateY(2px); }
+    to { opacity: 1; transform: none; }
+}
+
+/* P4：关闭"显示过程"时隐藏工具卡片 */
+.messages.hide-process .tool-card { display: none; }
+
+/* ── P4：打字指示器 + 阶段切换（位于消息区与工具栏之间，始终可见） ── */
+.typing {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 8px;
+    align-self: flex-start;
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 14px;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: #888;
+    flex-shrink: 0;
+}
+
+.typing .dots {
+    display: inline-flex;
+    gap: 3px;
+}
+
+.typing .dots span {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #2b579a;
+    animation: blink 1.2s infinite both;
+}
+
+.typing .dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing .dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes blink {
+    0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+}
+
 /* 工具状态条 */
 .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     padding: 4px 12px;
     border-top: 1px solid #e0e0e0;
     background: #f5f5f5;
     flex-shrink: 0;
+    gap: 8px;
 }
+
+.toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #666;
+    cursor: pointer;
+    user-select: none;
+}
+
+.toggle input { cursor: pointer; }
 
 .tool-status {
     font-size: 11px;
     color: #888;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* 输入区 */
@@ -145,4 +340,20 @@ html, body {
 .send-btn:disabled {
     background: #a0a0a0;
     cursor: not-allowed;
+}
+
+/* P5：停止按钮 */
+.stop-btn {
+    align-self: flex-end;
+    padding: 8px 16px;
+    border: 1px solid #c0392b;
+    border-radius: 6px;
+    background: #fff;
+    color: #c0392b;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.stop-btn:hover {
+    background: #fdecea;
 }

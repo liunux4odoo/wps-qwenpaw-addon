@@ -59,6 +59,20 @@
   var pendingRequests = {}; // requestId -> { method, text }
   var ribbonUI = null;
 
+  // ── 阶段 3 批 1：P1 状态合并 / P2 中断恢复 / P4 过程呈现 / P5 中止 ──
+  var P2_NO_FIRST_CHUNK_MS = 60000;  // 发送后 60s 无任何 chunk → 判定中断（P2）
+  var P2_ACTIVITY_MS = 120000;       // 连续 120s 无任何下行活动 → 判定卡死（P2）
+  var acpState = 'connecting';       // 'connecting' | 'connected' | 'disconnected'
+  var wpsState = 'pending';          // 'pending'（未激活，预期）| 'connected'
+  var lastAcpShown = null;           // 已渲染的 ACP 状态（避免 500ms 轮询重复写 DOM）
+  var lastWpsShown = null;           // 已渲染的 WPS 状态
+  var gotFirstChunk = false;         // P2 诊断：prompt 发出后是否收到首个 chunk
+  var lastUserText = '';             // P2 重试用：最近一次用户消息
+  var lastPromptReqId = null;        // 当前 prompt 的请求 id
+  var pendingToolCards = [];         // P4：当前进行中的工具卡片（新工具调用时旧的先标记完成）
+  var noFirstChunkTimer = null;      // P2：无首 chunk 看门狗
+  var activityTimer = null;          // P2：无下行活动看门狗
+
   // ── 路线 P：从 bridge 集中分配 poll 端口 ──
   // 异步 cb(result)：{port, ok}。失败/超时回退默认 58891（ok=false）。
   // 注意：sync XHR 会忽略 timeout 属性（规范行为），阻塞主线程且无法超时回退，故用异步。
@@ -177,7 +191,14 @@
   function initTaskpane() {
     QPLog('main', 'initTaskpane: 初始化聊天 UI + ACP + 轮询客户端');
     // 1. 聊天 UI
-    ChatUi.init({ onSend: onUserSend });
+    ChatUi.init({
+      onSend: onUserSend,
+      onStop: onStop,
+      onRetry: onRetry,
+      onRebuild: onRebuild
+    });
+    // P1：初始状态（启动握手：ACP 连接中 + WPS 未激活）
+    updateStatus();
 
     // 2. 从 bridge 拉取确定性配置（wps-mcp 入口），完成后再分配 poll 端口 + 连接 ACP，
     //    保证 ensureSession 用到的 MCP_SERVERS 路径已就绪
@@ -192,7 +213,6 @@
         });
         WpsPollClient.start();
         QPLog('main', 'initTaskpane: WpsPollClient.start() 已调用 (poll=' + alloc.port + ')');
-        ChatUi.setStatus('WPS 桥: 轮询中');
       });
 
       // 4. ACP 客户端：连接 + 会话管理
@@ -205,10 +225,137 @@
     });
   }
 
+  // ── P1：头部状态合并（一个状态区：ACP 连接 + WPS 桥，两级状态） ──
+  // onPollStatus 每 500ms 回调一次，用 last*Shown 守卫避免重复写 DOM
+  function updateStatus() {
+    if (acpState !== lastAcpShown) {
+      lastAcpShown = acpState;
+      var label;
+      if (acpState === 'connected') {
+        label = '就绪';
+      } else if (acpState === 'connecting') {
+        label = '连接中';
+      } else {
+        label = '未连接';
+      }
+      ChatUi.setConnStateText(acpState, label);
+    }
+    var wps = (wpsState === 'connected') ? 'connected' : 'pending';
+    if (wps !== lastWpsShown) {
+      lastWpsShown = wps;
+      if (wps === 'connected') {
+        ChatUi.setWpsState('connected', 'WPS 已连接');
+      } else {
+        // P1：懒启动端口连不上 = 预期行为（首次工具调用后才监听），显示"未激活"，不显示红色"错误"
+        ChatUi.setWpsState('pending', 'WPS 未激活');
+      }
+    }
+  }
+
+  // ── P2：中断恢复看门狗 ──
+  function clearPromptTimers() {
+    if (noFirstChunkTimer) { clearTimeout(noFirstChunkTimer); noFirstChunkTimer = null; }
+    if (activityTimer) { clearTimeout(activityTimer); activityTimer = null; }
+  }
+
+  function startPromptTimers() {
+    clearPromptTimers();
+    noFirstChunkTimer = setTimeout(onNoFirstChunkTimeout, P2_NO_FIRST_CHUNK_MS);
+    activityTimer = setTimeout(onActivityTimeout, P2_ACTIVITY_MS);
+  }
+
+  function touchActivity() {
+    if (activityTimer) {
+      clearTimeout(activityTimer);
+      activityTimer = setTimeout(onActivityTimeout, P2_ACTIVITY_MS);
+    }
+  }
+
+  // P2：prompt 发出后 60s 无任何 chunk → 中断恢复
+  function onNoFirstChunkTimeout() {
+    QPLog('P2', 'prompt 发出 ' + (P2_NO_FIRST_CHUNK_MS / 1000) + 's 无任何 chunk，触发中断恢复');
+    recoverFromInterruption('长时间未收到 AI 响应，连接可能已中断');
+  }
+
+  // P2：连续 120s 无任何下行活动（流式丢失/工具卡死）→ 中断恢复
+  function onActivityTimeout() {
+    QPLog('P2', '连续 ' + (P2_ACTIVITY_MS / 1000) + 's 无下行活动，触发中断恢复');
+    recoverFromInterruption('AI 响应中断（长时间无数据）');
+  }
+
+  // P2：恢复 UI 状态 + 可操作错误卡片（重试/重建会话）
+  function recoverFromInterruption(reason) {
+    if (!waitingResponse) return;
+    QPLog('P2', '中断恢复: ' + reason);
+    var reqId = lastPromptReqId;
+    if (reqId !== null && pendingRequests[reqId]) {
+      delete pendingRequests[reqId];
+    }
+    lastPromptReqId = null;
+    waitingResponse = false;
+    gotFirstChunk = false;
+    clearPromptTimers();
+    var cards = pendingToolCards.slice();
+    pendingToolCards = [];
+    for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'error');
+    ChatUi.hideTyping();
+    ChatUi.setInputEnabled(true);
+    ChatUi.setBusy(false);
+    ChatUi.addErrorCard('连接中断', reason + '。可重试当前消息或重建会话。', { retry: true, rebuild: true });
+    ChatUi.setStatus('对话中断');
+    streamBuffer = '';
+  }
+
+  // ── P2：错误卡片按钮动作 ──
+  function onRetry() {
+    QPLog('P2', '用户点击"重试"');
+    if (lastUserText) onUserSend(lastUserText);
+  }
+
+  function onRebuild() {
+    QPLog('P2', '用户点击"重建会话"');
+    if (acpSessionId) {
+      var cid = AcpClient.send('session/close', { sessionId: acpSessionId });
+      if (cid !== null) pendingRequests[cid] = { method: 'session/close' };
+    }
+    acpSessionId = null;
+    ensureSession();
+  }
+
+  // ── P5：中止执行 ──
+  function onStop() {
+    QPLog('P5', '用户点击"停止"');
+    if (!waitingResponse) return;
+    var reqId = lastPromptReqId;
+    if (reqId !== null && pendingRequests[reqId]) {
+      delete pendingRequests[reqId];
+    }
+    lastPromptReqId = null;
+    waitingResponse = false;
+    gotFirstChunk = false;
+    clearPromptTimers();
+    var cards = pendingToolCards.slice();
+    pendingToolCards = [];
+    for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
+    ChatUi.hideTyping();
+    ChatUi.setInputEnabled(true);
+    ChatUi.setBusy(false);
+    ChatUi.addMessage('system', '已停止');
+    ChatUi.setStatus('已停止');
+    streamBuffer = '';
+    if (acpSessionId) {
+      // qwenpaw acp 支持 cancel 方法（ACP 协议 session/cancel）；若协议不支持也无妨：
+      // 已置 waitingResponse=false，后续流式输出一律丢弃（P5 退化路径）。
+      var cid = AcpClient.send('session/cancel', { sessionId: acpSessionId });
+      QPLog('P5', '已发送 session/cancel id=' + cid);
+    }
+  }
+
   // ── ACP 连接状态 ──
   function onAcpConnChange(state) {
     QPLog('main', 'ACP 连接状态变化: ' + state);
-    ChatUi.setConnState(state === 'connected');
+    acpState = (state === 'connected') ? 'connected' : (state === 'connecting') ? 'connecting' : 'disconnected';
+    updateStatus();
     if (state === 'connected') {
       syncPollPort();  // 重连时同步权威端口（覆盖初始分配失败/bridge 重启场景）
       ensureSession();
@@ -247,24 +394,39 @@
       } else if (result && result.sessionId) {
         acpSessionId = result.sessionId;
         QPLog('main', 'session/new 成功 sessionId=' + acpSessionId);
-        ChatUi.setStatus('ACP: 已连接（' + acpSessionId.slice(0, 8) + '…）');
+        ChatUi.setStatus('就绪');
       }
     } else if (req.method === 'session/prompt') {
       // 完整响应到达：流式结束，收尾 assistant 消息
       waitingResponse = false;
+      gotFirstChunk = false;
+      clearPromptTimers();
+      lastPromptReqId = null;
       ChatUi.finishAssistant();
+      ChatUi.hideTyping();
       ChatUi.setInputEnabled(true);
+      ChatUi.setBusy(false);
+      var cards = pendingToolCards.slice();
+      pendingToolCards = [];
       if (error) {
         // 会话可能已失效（如 bridge/qwenpaw 重启）：清除旧 sessionId 并重建
-        QPLog('main', 'session/prompt 错误 -> 重建会话: ' + JSON.stringify(error).slice(0, 200));
-        ChatUi.addMessage('error', '发送失败: ' + (error.message || JSON.stringify(error)) + '（正在重建会话）');
+        QPLog('P2', 'session/prompt 错误 -> 重建会话: ' + JSON.stringify(error).slice(0, 200));
+        for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'error');
+        ChatUi.addErrorCard('对话中断', (error.message || JSON.stringify(error)) + '。可重试当前消息或重建会话。', { retry: true, rebuild: true });
         acpSessionId = null;
         ensureSession();
         ChatUi.setStatus('ACP: 会话重建中…');
       } else {
         var stopReason = result && result.stopReason;
-        QPLog('main', 'session/prompt 结束 stopReason=' + stopReason + ' 累计流式长度=' + streamBuffer.length);
-        ChatUi.setStatus(stopReason === 'end_turn' ? 'ACP: 已完成' : 'ACP: 已停止');
+        QPLog('P2', 'session/prompt 结束 stopReason=' + stopReason + ' 累计流式长度=' + streamBuffer.length);
+        if (stopReason === 'cancelled') {
+          for (var j = 0; j < cards.length; j++) ChatUi.markToolCard(cards[j], 'cancelled');
+          ChatUi.addMessage('system', '已停止');
+          ChatUi.setStatus('已停止');
+        } else {
+          for (var k = 0; k < cards.length; k++) ChatUi.markToolCard(cards[k], 'done');
+          ChatUi.setStatus('已完成');
+        }
       }
       streamBuffer = '';
     } else if (req.method === 'session/close') {
@@ -280,8 +442,42 @@
     if (update.sessionUpdate === 'agent_message_chunk' && update.content) {
       var text = update.content.text || '';
       if (text) {
+        touchActivity();
+        // P5：无进行中请求（已停止/已恢复）→ 丢弃残留流式，不污染 UI
+        if (!waitingResponse) {
+          QPLog('P2', '丢弃残留流式 chunk');
+          return;
+        }
+        if (!gotFirstChunk) {
+          gotFirstChunk = true;
+          QPLog('P2', 'first-chunk 到达');
+          // P4：首个文本到达 → 工具阶段结束，进入"生成回复"阶段
+          ChatUi.showTyping('正在生成回复…');
+          var cards = pendingToolCards.slice();
+          pendingToolCards = [];
+          for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'done');
+        }
         streamBuffer += text;
         ChatUi.appendAssistantChunk(text);
+      }
+    } else if (update.sessionUpdate === 'status_update') {
+      // P4：阶段/工具调用状态（qwenpaw 若下发 status_update）；仅进行中请求时处理
+      if (!waitingResponse) return;
+      touchActivity();
+      var st = update.status || {};
+      if (st.subtype === 'tool_call' && st.toolCall) {
+        var tc = st.toolCall;
+        var name = tc.title || tc.tool_call_id || '工具调用';
+        // 新工具调用 → 之前的工具已完成（标记 done），避免卡片滞留"调用中"
+        var prev = pendingToolCards.slice();
+        pendingToolCards = [];
+        for (var p = 0; p < prev.length; p++) ChatUi.markToolCard(prev[p], 'done');
+        ChatUi.showTyping('正在调用工具…');
+        var card = ChatUi.addToolCard(name);
+        pendingToolCards.push(card);
+      } else if (st.subtype === 'phase' || st.subtype === 'spinner') {
+        var phaseLabel = st.label || st.text || '';
+        if (phaseLabel) ChatUi.showTyping(phaseLabel);
       }
     }
   }
@@ -295,8 +491,22 @@
     if (req.method === 'session/request_permission') {
       var params = req.params || {};
       var options = params.options || [];
-      var toolTitle = (params.toolCall && params.toolCall.title) || '';
+      var toolCall = params.toolCall || {};
+      var toolTitle = toolCall.title || toolCall.tool_call_id || '';
+      var toolArgs = toolCall.arguments || null;
       QPLog('main', 'request_permission: tool=' + toolTitle + ' options=' + JSON.stringify(options.map(function (o) { return o.optionId; })));
+      // 工具审批也是下行活动：重置卡死看门狗（长工具链不误报）
+      touchActivity();
+      // P4：工具卡片（结构化呈现，结果状态由后续流式/响应更新）
+      if (waitingResponse) {
+        // 新工具调用 → 之前的工具已结束（标记 done），避免多张卡片滞留"调用中"
+        var prev = pendingToolCards.slice();
+        pendingToolCards = [];
+        for (var p = 0; p < prev.length; p++) ChatUi.markToolCard(prev[p], 'done');
+        var card = ChatUi.addToolCard(toolTitle || '工具调用', toolArgs ? JSON.stringify(toolArgs).slice(0, 200) : '');
+        pendingToolCards.push(card);
+        ChatUi.showTyping('正在调用工具…');
+      }
       var allow = null;
       for (var i = 0; i < options.length; i++) {
         if (options[i].optionId === 'allow_once') { allow = options[i]; break; }
@@ -307,18 +517,16 @@
           outcome: { outcome: 'selected', optionId: allow.optionId }
         });
         QPLog('main', 'request_permission: 已自动批准 ' + allow.optionId + ' (tool=' + toolTitle + ')');
-        ChatUi.addMessage('system', '🔓 已批准工具调用' + (toolTitle ? ': ' + toolTitle : ''));
       } else {
         AcpClient.respond(req.id, { outcome: { outcome: 'cancelled' } });
         QPLog('main', 'request_permission: 无可用选项，已拒绝');
-        ChatUi.addMessage('system', '已拒绝工具调用');
       }
     }
   }
 
   // ── 用户发送 ──
   function onUserSend(text) {
-    QPLog('main', '用户发送: ' + text.slice(0, 100));
+    QPLog('P2', '用户发送: ' + text.slice(0, 100));
     if (!acpSessionId) {
       // 会话未就绪/失效（可能是 bridge 重启导致旧 sessionId 失效）：
       // 主动重建会话并提示用户重发
@@ -330,21 +538,31 @@
       ChatUi.addMessage('system', '上一条还在处理中，请稍候…');
       return;
     }
+    lastUserText = text;
     ChatUi.addMessage('user', text);
     waitingResponse = true;
+    gotFirstChunk = false;
     ChatUi.setInputEnabled(false);
-    ChatUi.setStatus('ACP: 处理中…');
+    ChatUi.setBusy(true);
+    ChatUi.setStatus('处理中…');
+    ChatUi.showTyping('思考中…');
+    pendingToolCards = [];
     streamBuffer = '';
     var id = AcpClient.send('session/prompt', {
       sessionId: acpSessionId,
       prompt: [{ type: 'text', text: text }]
     });
     if (id !== null) {
+      lastPromptReqId = id;
       pendingRequests[id] = { method: 'session/prompt' };
-      QPLog('main', 'session/prompt 已发送 id=' + id + ' sessionId=' + acpSessionId);
+      QPLog('P2', 'prompt 已发送 id=' + id + ' sessionId=' + acpSessionId);
+      startPromptTimers();
     } else {
       waitingResponse = false;
+      gotFirstChunk = false;
       ChatUi.setInputEnabled(true);
+      ChatUi.setBusy(false);
+      ChatUi.hideTyping();
       ChatUi.addMessage('error', '发送失败：未连接 ACP');
     }
   }
@@ -420,10 +638,13 @@
   function onPollStatus(failCount, lastError) {
     if (failCount > 0) {
       QPLog('poll', 'WPS 桥轮询失败 #' + failCount + ' lastError=' + lastError);
-      ChatUi.setStatus('WPS 桥: 重连中 (' + failCount + ' 次失败' + (lastError ? ': ' + lastError : '') + ')');
+      // P1：懒启动端口连不上 = 预期（首次工具调用后才监听），不显示"错误"
+      wpsState = 'pending';
     } else {
-      ChatUi.setStatus('WPS 桥: 已连接');
+      QPLog('poll', 'WPS 桥已连接');
+      wpsState = 'connected';
     }
+    updateStatus();
   }
 
   // ══════════════════════════════════════════════
