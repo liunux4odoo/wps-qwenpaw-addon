@@ -215,12 +215,18 @@ var AcpClient = (function () {
     return status === 'connected';
   }
 
+  // clientId 用于：/acp/* 轮询 + /poll-port/allocate 端口分配（同一 client 保持一致）
+  function getClientId() {
+    return clientId;
+  }
+
   return {
     connect: connect,
     disconnect: disconnect,
     send: send,
     respond: respond,
     isConnected: isConnected,
+    getClientId: getClientId,
     onConnectionChange: function (cb) { cbConnChange = cb; },
     onResponse: function (cb) { cbResponse = cb; },
     onSessionUpdate: function (cb) { cbSessionUpdate = cb; },

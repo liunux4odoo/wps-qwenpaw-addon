@@ -58,6 +58,15 @@
 
 ### 变更历史
 
+- **v0.17（code 实施，2026-09-03 已落地，待实机重开侧边栏验证）**：
+  - **wps-office-mcp 1 行改动**：`wps-client.ts:46` `const POLL_PORT = Number(process.env.WPS_POLL_PORT) || 58891;`（已 build 到 dist，默认行为不变）
+  - **bridge 集中分配端口**（acp-bridge.py 新增职责）：`POST /poll-port/allocate` / `GET /poll-port` / `POST /poll-port/release`（59000+ 段，60s 释放宽限期防残留碰撞）；`session/new`/`session/load` 转发前强制注入 `env.WPS_POLL_PORT`（权威值，ACP schema env 为 `[{name,value}]` 列表）；`session/close` 自动回收；`session/new` 响应补记 `session_id → poll_port`；`/status` 暴露 `ports`/`session_ports`
+  - **加载项 main.js**：`MCP_SERVERS` 从 http 改回 **stdio**（`{name:'wps',command:'node',args:[dist/index.js],env:[{name:'WPS_POLL_PORT',value:'<port>'}]}`）；`initTaskpane` 先 `allocatePollPort()`（同步 XHR，失败回退 58891）再连 ACP + 启动 WpsPollClient 轮询分配端口；`closeSession` 显式 `releasePollPort()`；acp-client.js 暴露 `getClientId()` 复用同一 clientId
+  - **验证通过（Python 端到端，真实 qwenpaw acp）**：allocate 唯一且幂等；http 型 mcpServer 不占端口；`session/new` 注入后 qwenpaw spawn 的 wps-mcp 进程 environ 含 `WPS_POLL_PORT=<port>`；`session/close` 自动释放；release 后 60s 宽限期不复用
+  - **审查加固（2026-09-03，code review 后）**：①多窗口请求 id 路由去重——`http_pending` 平铺 id 表改为**全局 FIFO 队列**（`_request_queue` + `_pop_request_owner`，qwenpaw 顺序处理/顺序回响应，同 id 响应按转发顺序归属，杜绝多窗口 session 串台/端口错配）；②`_inject_poll_port` 非对象 JSON 防护（`isinstance(msg, dict)`）；③`/status` 默认脱敏（端口/session 映射仅 `?debug=1` 暴露）；④分配池上限 64 + 1h 租期自动回收失联 client；⑤`_allocate_port` O(1) 占用集 + 宽限期满复用兜底；⑥加载项端口分配改**异步 XHR**（sync XHR 忽略 timeout 无法超时回退）+ ACP 重连时 `syncPollPort()` 重同步权威端口
+  - **部署配套**：addon 文件已同步到 `~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/`；待 WPS 实机重开侧边栏端到端验收（§8.3）
+  - **⚠️ 部署依赖（跨仓库）**：wps-office-mcp 的 `WPS_POLL_PORT` 支持只在 **opencode-wps 仓库未提交的工作区**（`src/client/wps-client.ts` + 重新 build 的 `dist/`）——若该仓库被从已提交源码重新 checkout/rebuild，`dist` 会退回 `POLL_PORT=58891`，路线 P 的多窗口隔离即失效。**需把该改动 commit 进 opencode-wps（或加 build 步骤）并固定版本**后再依赖它
+
 - **v0.17**（2026-09-03）：wps MCP 路线 P 决策（取代 v0.16 http 化）
   - **双份加载根因确认**：qwenpaw 侧 `drivers/mcp/wps-office-mcp.yaml` 之前一直 enabled + ACP session 注入 → 双份 wps-mcp 加载（用户"问 agent 工具反馈两份"铁证）；用户已禁用 yaml = 已清除双份源
   - **多窗口并发定论**：每窗口 = 每 ACP session（"文档即会话"决策）；poll-server **单槽位无路由**（`mac-poll-server.ts:415-425` 谁先 poll 谁领走）→ 多窗口多进程抢 :58891 + 命令串台；http 化只解抢端口**不解命令串台** → 必须改 wps-office-mcp
@@ -495,16 +504,17 @@ wps-office-mcp 通过 **ACP 的 `session/new` mcpServers 动态注入**（每 se
   "mcpServers": [
     {
       "name": "wps",
-      "transport": "stdio",
       "command": "node",
       "args": ["/data/myrepo/opencode-wps/wps-office-mcp/dist/index.js"],
-      "env": {
-        "WPS_POLL_PORT": "<bridge 分配的唯一端口>"
-      }
+      "env": [
+        { "name": "WPS_POLL_PORT", "value": "<bridge 分配的唯一端口>" }
+      ]
     }
   ]
 }
 ```
+
+> **schema 注意（实测）**：ACP `McpServerStdio` 的 `env` 是 **`[{name,value}]` 列表**（`acp/schema.py` `McpServerStdio.env: List[EnvVariable]`），不是 dict；且**没有** `transport`/`type` 字段（http/sse 型才有 `type:"http"|"sse"` + `url`，stdio 靠 `command`+`args`+`env` 判别）。上文早期版本把 env 写成 dict、加 `transport` 字段是**文档笔误**，以这里为准。
 
 > **关键**：`env.WPS_POLL_PORT` 由 **acp-bridge 集中分配**（poll port ↔ session id 映射表），每 session 唯一。QwenPaw 原生支持 mcpServers 的 env 注入 stdio 子进程（`mcp/client/stdio/__init__.py:127`），零 QwenPaw 改动。
 
@@ -761,8 +771,9 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 **待完成**：
 
-- 🚧 **noop 脚本部署**（v0.13 新增）：按 §5.1.1 步骤替换 `wps-auto.sh`
-- 🚧 端到端验收：WPS 内侧边栏 → 发消息 → ACP → AI 回复（人工：需 WPS + 打开文档 + acp-bridge 运行中，见 §3.3 v0.8 定论）
+- ✅ **noop 脚本已部署**（v0.13，2026-09-03 复核）：`opencode-wps-linux/wps-auto.sh` 已是 noop 版本（§5.1.1）
+- ✅ **路线 P 代码落地**（v0.17，2026-09-03）：wps-mcp `WPS_POLL_PORT` env（1 行，已 build）+ bridge 集中分配端口（`/poll-port/*` + session/new 注入 + close 回收）+ main.js stdio mcpServers + WpsPollClient 轮询分配端口；Python 侧端到端验证通过（见 §0 v0.17 实施记录）
+- 🚧 **端到端验收（路线 P）**：WPS 实机重开侧边栏 → 加载项分配端口 → 发消息 → ACP → AI 回复（人工：需 WPS + 打开文档 + acp-bridge 运行中）；验证多窗口并发各用独立端口、命令不串台
 
 **阶段 1 期间的实测发现（按时间顺序）**：
 

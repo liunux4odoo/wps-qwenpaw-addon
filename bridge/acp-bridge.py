@@ -12,12 +12,19 @@ acp-bridge — WebSocket/HTTP ↔ stdio 双向转发桥，连接 WPS 加载项�
     非 WPS 场景/调试使用。两者共享同一 qwenpaw acp 子进程与下行路由表。
 
 HTTP 端点（加载项侧 acp-client.js 使用）：
-  - GET  /status                    -> {"status":"running","agent":...}
+  - GET  /status                    -> {"status":"running","agent":...,"ports":{...}}
   - POST /acp/send?clientId=X       body=NDJSON ACP 请求（一行一条 JSON-RPC）-> 写 qwenpaw stdin
   - GET  /acp/poll?clientId=X       -> 该 clientId 的待下行 ACP 消息（JSONL，每行一条）
   - GET  /ui/*                      -> 加载项 UI 静态文件（CreateTaskPane 经此加载 taskpane.html，
                                        与 ACP 轮询同源，无 CORS 问题；根目录为插件仓库根，可 --ui-root 覆盖）
   - POST /debug/log                 -> 接收加载项侧调试日志（body={"tag","msg"}），统一落盘到 bridge 日志
+
+poll 端口集中分配（路线 P，ARCHITECTURE §13）：
+  - POST /poll-port/allocate?clientId=X   -> 分配唯一 WPS_POLL_PORT（59000+ 段），返回 {"port":N}
+  - GET  /poll-port?clientId=X            -> 查询已分配端口，返回 {"port":N|null}
+  - POST /poll-port/release?clientId=X    -> 释放该 client 的端口（session/close 时 bridge 也会自动回收）
+  加载项在 session/new 前先 allocate 拿端口，把它填入 mcpServers 的 env.WPS_POLL_PORT；
+  bridge 也会在 session/new 转发时强制注入该 client 的分配端口（权威值），保证唯一、防串台。
 
 WebSocket 端点：ws://127.0.0.1:8765（上行原样转发；下行按 sessionId/请求 id 路由）
 
@@ -47,6 +54,17 @@ from websockets.asyncio.server import ServerConnection, serve
 log = logging.getLogger("acp-bridge")
 
 MAX_POLL_BATCH = 200
+
+# ── 路线 P：poll 端口集中分配段（避开 :8766/:8765/:58891） ──────────
+POLL_PORT_START = 59000
+POLL_PORT_END = 59999
+# 端口释放后到可复用前的宽限期：残留 wps-mcp 进程可能仍占端口，立即复用会 EADDRINUSE。
+# 正常 session/close 链路 qwenpaw 2s 内清进程；异常残留需时间自然释放，取 60s 防碰撞。
+POLL_PORT_REUSE_GRACE = 60.0
+# 并发分配上限：远超真实多窗口规模（几十个以内），防止任意 clientId 把整段端口耗尽。
+POLL_PORT_POOL_CAP = 64
+# 端口租期：client 超过该时长无任何 ACP 流量则视为失联，分配时回收其端口（防泄漏）。
+POLL_PORT_LEASE = 3600.0
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -78,7 +96,15 @@ class AcpBridge:
         # HTTP 客户端（clientId -> 下行队列 deque[str]）
         self.http_clients: dict[str, deque] = {}
         self.http_session_client: dict[str, str] = {}
-        self.http_pending: dict[object, str] = {}
+        # 请求 id 归属队列（多窗口同 id 靠转发顺序去重，见 _pop_request_owner）
+        self._request_queue: deque[tuple[object, str]] = deque()
+        # 路线 P：集中分配 poll 端口（59000+ 段，poll port ↔ session id 映射）
+        self._port_allocated: dict[str, int] = {}     # client_id -> port
+        self._port_used: set[int] = set()             # 当前占用端口（O(1) 判占用）
+        self._port_last_seen: dict[str, float] = {}   # client_id -> 最近活动时间（租期）
+        self._session_port: dict[str, int] = {}       # session_id -> port
+        self._port_released_at: dict[int, float] = {} # port -> 释放时间戳（宽限期防碰撞）
+        self._next_port = POLL_PORT_START
         # 子进程
         self.proc: asyncio.subprocess.Process | None = None
         self._restart_delay = 1.0
@@ -139,6 +165,127 @@ class AcpBridge:
         except Exception:
             log.info("[js:raw] %s", body.decode("utf-8", "replace")[:500])
 
+    # ── 路线 P：集中分配 poll 端口 ──────────────────────────────────
+    def _touch_client(self, client_id: str) -> None:
+        """记录 client 最近活动时间（租期用）。"""
+        if client_id:
+            self._port_last_seen[client_id] = time.time()
+
+    def _grant_port(self, client_id: str, port: int) -> int:
+        self._port_allocated[client_id] = port
+        self._port_used.add(port)
+        self._port_released_at.pop(port, None)
+        self._touch_client(client_id)
+        log.info("poll port %d allocated -> client %s", port, client_id)
+        return port
+
+    def _reclaim_stale(self) -> None:
+        """回收超过租期仍无活动的 client 端口（失联/异常退出防泄漏）。"""
+        now = time.time()
+        for cid, last in list(self._port_last_seen.items()):
+            if now - last > POLL_PORT_LEASE:
+                self._release_port(cid)
+
+    def _allocate_port(self, client_id: str) -> int | None:
+        """为 client 分配唯一 poll 端口（幂等：已分配则返回原端口）。"""
+        if client_id in self._port_allocated:
+            return self._port_allocated[client_id]
+        # 池上限防护（先回收失联租期，再判满）
+        if len(self._port_allocated) >= POLL_PORT_POOL_CAP:
+            self._reclaim_stale()
+            if len(self._port_allocated) >= POLL_PORT_POOL_CAP:
+                log.error("poll port pool exhausted (cap %d)", POLL_PORT_POOL_CAP)
+                return None
+        now = time.time()
+        # pass 1：从游标起找「未占用且不在宽限期」的端口
+        for _ in range(POLL_PORT_END - POLL_PORT_START + 1):
+            port = self._next_port
+            self._next_port += 1
+            if self._next_port > POLL_PORT_END:
+                self._next_port = POLL_PORT_START
+            if port in self._port_used:
+                continue
+            released = self._port_released_at.get(port)
+            if released is not None and (now - released) < POLL_PORT_REUSE_GRACE:
+                continue
+            return self._grant_port(client_id, port)
+        # pass 2：整段都被宽限期占住 -> 复用最旧的释放端口（残留风险最低的兜底）
+        if self._port_released_at:
+            port = min(self._port_released_at, key=self._port_released_at.get)
+            if port not in self._port_used:
+                return self._grant_port(client_id, port)
+        log.error("no free poll port in %d-%d", POLL_PORT_START, POLL_PORT_END)
+        return None
+
+    def _release_port(self, client_id: str) -> None:
+        """释放 client 的端口（session/close 或显式 release 时调用）。"""
+        port = self._port_allocated.pop(client_id, None)
+        if port is None:
+            return
+        self._port_used.discard(port)
+        self._port_released_at[port] = time.time()
+        self._port_last_seen.pop(client_id, None)
+        for sid, p in list(self._session_port.items()):
+            if p == port:
+                del self._session_port[sid]
+        log.info("poll port %d released (client %s)", port, client_id)
+
+    def _inject_poll_port(self, raw: str, client_id: str | None) -> str:
+        """路线 P：session/new / session/load 转发前，把 wps mcpServer 的 env.WPS_POLL_PORT
+        设为该 client 的分配端口（权威值，覆盖加载项自带值，保证唯一防串台）。
+        返回（可能被修改的）raw。ACP schema：env 是 [{name,value}] 列表。"""
+        if not client_id:
+            return raw
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return raw
+        if not isinstance(msg, dict):
+            return raw  # 非对象 JSON（列表/字符串/数字）：不注入，原样透传
+        method = msg.get("method")
+        if method not in ("session/new", "session/load"):
+            return raw
+        params = msg.get("params") or {}
+        servers = params.get("mcpServers")
+        if not isinstance(servers, list):
+            return raw
+        modified = False
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            name = str(server.get("name", ""))
+            if name != "wps" and "wps" not in name.lower():
+                continue
+            if server.get("command") is None:
+                continue  # 非 stdio（http/sse）不注入，也不占用端口
+            # 只有确认要注入 wps stdio server 时才分配端口（避免 http 型 session 白白占端口）
+            port = self._port_allocated.get(client_id)
+            if port is None:
+                port = self._allocate_port(client_id)
+            if port is None:
+                return raw
+            self._touch_client(client_id)
+            env = server.get("env")
+            if not isinstance(env, list):
+                env = []
+                server["env"] = env
+            found = False
+            for item in env:
+                if isinstance(item, dict) and item.get("name") == "WPS_POLL_PORT":
+                    item["value"] = str(port)
+                    found = True
+                    break
+            if not found:
+                env.append({"name": "WPS_POLL_PORT", "value": str(port)})
+            modified = True
+            sid = params.get("sessionId")
+            if sid:
+                self._session_port[str(sid)] = port
+            break
+        if modified:
+            return json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
+        return raw
+
     # ── qwenpaw acp 子进程 ──────────────────────────────────────────
     def _qwenpaw_bin(self) -> str:
         found = shutil.which("qwenpaw")
@@ -195,6 +342,20 @@ class AcpBridge:
             log.exception("failed to restart qwenpaw acp")
 
     # ── 下行路由（stdio -> 前端） ──────────────────────────────────
+    def _pop_request_owner(self, rid: object) -> str | None:
+        """按转发顺序从请求队列弹出该 id 的归属 client。
+
+        每个窗口的 ACP 请求 id 都从 1 递增（js/acp-client.js `var id = ++seq`），
+        多窗口并发必然出现同 id 请求。qwenpaw 顺序处理 stdin、按请求顺序回响应，
+        因此这里用全局 FIFO 队列按顺序去重：谁先发该 id，响应就归谁。"""
+        while self._request_queue:
+            q_rid, cid = self._request_queue.popleft()
+            if q_rid == rid:
+                return cid
+            log.warning("request id %r response arrived but queue head was %r (order mismatch)",
+                        rid, q_rid)
+        return None
+
     async def _route_down(self, text: str) -> None:
         """把 qwenpaw stdout 的一条 ACP 消息路由到对应前端。
         优先 HTTP 客户端（WPS 实际使用的），其次 WebSocket。"""
@@ -206,8 +367,15 @@ class AcpBridge:
             params = msg.get("params")
             if isinstance(params, dict) and params.get("sessionId"):
                 sid = str(params["sessionId"])
-            elif "id" in msg:
-                target = self.http_pending.get(msg["id"])
+            elif "id" in msg and ("result" in msg or "error" in msg):
+                # 响应（无 params.sessionId）：按转发顺序取归属（多窗口同 id 去重）
+                target = self._pop_request_owner(msg["id"])
+            # 路线 P：session/new 响应带 result.sessionId -> 记录 session_id -> poll port
+            if isinstance(msg.get("result"), dict):
+                rid_sid = msg["result"].get("sessionId")
+                if rid_sid and target:
+                    if target in self._port_allocated:
+                        self._session_port[str(rid_sid)] = self._port_allocated[target]
         except Exception:
             target = None
 
@@ -259,22 +427,25 @@ class AcpBridge:
         if not self.proc or not self.proc.stdin or self.proc.stdin.is_closing():
             log.error("qwenpaw acp stdin unavailable, dropping message")
             return False
+        # 路线 P：session/new 注入 WPS_POLL_PORT；session/close 回收端口
+        raw = self._inject_poll_port(raw, client_id)
         log.info("upstream[%s]: %s", client_id or "ws", self._summarize_acp(raw))
-        # 记录请求 id -> 来源 client（用于下行响应路由）
+        # 记录请求归属（多窗口同 id 靠转发顺序去重，见 _pop_request_owner）
         try:
             msg = json.loads(raw)
             rid = msg.get("id")
-            if rid is not None:
-                if client_id:
-                    self.http_pending[rid] = client_id
-                else:
-                    # WebSocket 场景在 _ws_handler 里单独记录
-                    pass
+            if rid is not None and client_id and msg.get("method"):
+                # 只登记「客户端发起的请求」（带 method）；respond（id+result，无 method）
+                # 是对 qwenpaw 下行请求的应答，qwenpaw 不会回响应，不入队。
+                self._request_queue.append((rid, client_id))
             params = msg.get("params")
             if isinstance(params, dict) and params.get("sessionId"):
                 sid = str(params["sessionId"])
                 if client_id:
                     self.http_session_client[sid] = client_id
+                    self._touch_client(client_id)
+                    if msg.get("method") == "session/close":
+                        self._release_port(client_id)
         except Exception:
             pass
         payload = raw.rstrip("\n") + "\n"
@@ -351,11 +522,30 @@ class AcpBridge:
             log.info("http %s %s (client=%s)", method, path, client_id)
 
             if path == "/status":
-                await self._http_json(writer, 200, {
+                payload = {
                     "status": "running",
                     "agent": self.agent,
                     "proc": self.proc.pid if self.proc else None,
-                })
+                }
+                # 端口/session 映射只在 ?debug=1 时暴露（默认脱敏，防跨源读取内部路由状态）
+                if query_params.get("debug") == "1":
+                    payload["ports"] = dict(self._port_allocated)
+                    payload["session_ports"] = dict(self._session_port)
+                await self._http_json(writer, 200, payload)
+            elif path == "/poll-port/allocate" and method == "POST":
+                port = self._allocate_port(client_id)
+                if port is not None:
+                    self._touch_client(client_id)
+                await self._http_json(writer, 200 if port else 503,
+                                      {"port": port, "clientId": client_id} if port
+                                      else {"error": "no free poll port"})
+            elif path == "/poll-port" and method == "GET":
+                self._touch_client(client_id)
+                await self._http_json(writer, 200, {"port": self._port_allocated.get(client_id),
+                                                    "clientId": client_id})
+            elif path == "/poll-port/release" and method == "POST":
+                self._release_port(client_id)
+                await self._http_json(writer, 200, {"ok": True})
             elif method == "OPTIONS":
                 # CORS 预检：WPS taskpane 是 file:// 页面，跨源 XHR 必须放行
                 writer.write(b"HTTP/1.1 204 No Content\r\n")

@@ -52,7 +52,7 @@ wps-qwenpaw-addon/
 
 ## 当前状态
 
-**方案版本 v0.7**（阶段 0/0.5 完成；阶段 1 加载项代码完成，WPS 实机验证被环境阻塞）
+**方案版本 v0.17**（阶段 0/0.5/1 代码完成；wps MCP 路线 P 已落地，待 WPS 实机重开侧边栏端到端验证）
 
 **阶段 0：环境验证 ✅ 已完成（2026-08-28）**
 
@@ -68,10 +68,9 @@ wps-qwenpaw-addon/
 - ✅ 端到端验证通过：initialize → session/new → session/prompt 流式 → 断线重连 + session/load 会话不丢 → session/close → 子进程崩溃自动重启（§8.2）
 - ✅ ACP wire 协议实测定论：NDJSON 帧、`session/prompt` 发消息、`session/update` 通知流式（§3.4/§8.2）
 
-**阶段 1：加载项骨架 ⏸ 代码完成，WPS 实机验证被环境阻塞（2026-08-28）**
+**阶段 1：加载项骨架 ✅ 代码完成，路线 P 已落地，待 WPS 实机重开侧边栏验收（2026-08-28 → 2026-09-03）**
 
 - ✅ 加载项 8 文件 + index.html 入口页全部实现（manifest/ribbon/taskpane/css + 5 个 js 模块）
 - ✅ **架构实测发现**：WPS Linux 沙箱拦截 WebSocket（:8765），只放行 HTTP（:58891）→ ACP 传输层改 **HTTP 短轮询**（acp-bridge :8766），Python 侧端到端验证通过（§3.3/§3.4）
-- ⚠️ **阻塞**：WPS 加载项引擎（libjsapibrowser）无法启动（阶段 0 正常，清 CEF 缓存后损坏），加载项无法在 WPS 内加载 → 端到端验收待环境恢复后验证（§8.3）
-
-**下一步**：回 discuss agent 处理 WPS 环境阻塞（恢复加载项引擎），恢复后完成阶段 1 实机端到端验收。
+- ✅ **wps MCP 路线 P 落地（v0.17，2026-09-03）**：wps-mcp 支持 `WPS_POLL_PORT` env（1 行）+ bridge 集中分配 poll 端口（59000+，`/poll-port/*` + session/new 注入 + close 回收）+ 加载项 stdio mcpServers + 轮询分配端口；Python 端到端验证通过（详见 docs/ARCHITECTURE.md §0 v0.17）
+- 🚧 **待办**：WPS 实机重开侧边栏端到端验收（路线 P 多窗口并发）；noop 脚本部署确认（§5.1.1）

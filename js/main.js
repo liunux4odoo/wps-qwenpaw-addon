@@ -30,14 +30,20 @@
   }
   window.QPLog = QPLog;
 
-  // wps-office-mcp MCP 服务器（§5.1 + §13 v0.16）：http 化后 qwenpaw 通过 URL 连常驻 server，
-  // 不再 spawn 子进程（消除 stdio 残留问题）。server 手动常驻：node dist/index-http.js --port 18765
+  // wps-office-mcp MCP 服务器（§5.1 + §13 v0.17 路线 P）：
+  // 走 stdio（QwenPaw 每 ACP session spawn 独立 wps-mcp 子进程），bridge 集中分配独立 poll 端口
+  // （WPS_POLL_PORT env 注入，59000+ 段，多窗口并发不抢 :58891、不串台）。
+  // env 是 [{name,value}] 列表（ACP schema: McpServerStdio.env = List[EnvVariable]），
+  // 端口值由 bridge /poll-port/allocate 分配后覆盖（bridge 转发 session/new 时也会强制注入权威值）。
   var MCP_SERVERS = [{
-    type: 'http',
     name: 'wps',
-    url: 'http://127.0.0.1:18765/mcp',
-    headers: []
+    command: 'node',
+    args: ['/data/myrepo/opencode-wps/wps-office-mcp/dist/index.js'],
+    env: [{ name: 'WPS_POLL_PORT', value: '58891' }]
   }];
+
+  // 本窗口分配到的 poll 端口（路线 P；默认 58891 兜底，分配失败时回退旧行为）
+  var pollPort = 58891;
 
   // ── taskpane 上下文状态 ──
   var isTaskpane = !!document.getElementById('messages');
@@ -47,6 +53,88 @@
   var pendingRequests = {}; // requestId -> { method, text }
   var ribbonUI = null;
 
+  // ── 路线 P：从 bridge 集中分配 poll 端口 ──
+  // 异步 cb(result)：{port, ok}。失败/超时回退默认 58891（ok=false）。
+  // 注意：sync XHR 会忽略 timeout 属性（规范行为），阻塞主线程且无法超时回退，故用异步。
+  function allocatePollPort(cb) {
+    cb = cb || function () {};
+    var result = { port: pollPort, ok: false };
+    var done = false;
+    function finish() {
+      if (done) return;
+      done = true;
+      cb(result);
+    }
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', 'http://127.0.0.1:8766/poll-port/allocate?clientId=' + encodeURIComponent(AcpClient.getClientId()), true);
+      xhr.timeout = 3000;
+      xhr.onload = function () {
+        if (xhr.status === 200) {
+          try {
+            var r = JSON.parse(xhr.responseText);
+            if (r && r.port) {
+              pollPort = r.port;
+              MCP_SERVERS[0].env = [{ name: 'WPS_POLL_PORT', value: String(pollPort) }];
+              result = { port: pollPort, ok: true };
+              QPLog('main', 'poll port 分配成功: ' + pollPort);
+            }
+          } catch (e) {}
+        } else {
+          QPLog('main', 'poll port 分配失败 HTTP ' + xhr.status + '，回退默认 ' + pollPort);
+        }
+        finish();
+      };
+      xhr.onerror = function () {
+        QPLog('main', 'poll port 分配网络错误，回退默认 ' + pollPort);
+        finish();
+      };
+      xhr.ontimeout = function () {
+        QPLog('main', 'poll port 分配超时，回退默认 ' + pollPort);
+        finish();
+      };
+      xhr.send();
+    } catch (e) {
+      QPLog('main', 'poll port 分配异常: ' + (e && e.message ? e.message : e) + '，回退默认 ' + pollPort);
+      finish();
+    }
+  }
+
+  // 重连/初始化后同步权威 poll 端口：覆盖「初始分配失败回退 58891」与「bridge 重启后端口被重新分配」
+  // 导致 WpsPollClient 轮询端口与 bridge 注入端口不一致的场景。bridge 是唯一分配者且幂等，结果必一致。
+  function syncPollPort() {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', 'http://127.0.0.1:8766/poll-port?clientId=' + encodeURIComponent(AcpClient.getClientId()), true);
+      xhr.timeout = 3000;
+      xhr.onload = function () {
+        if (xhr.status === 200) {
+          try {
+            var r = JSON.parse(xhr.responseText);
+            if (r && r.port && r.port !== pollPort) {
+              pollPort = r.port;
+              MCP_SERVERS[0].env = [{ name: 'WPS_POLL_PORT', value: String(pollPort) }];
+              WpsPollClient.init({ serverUrl: 'http://127.0.0.1:' + pollPort });
+              QPLog('main', 'poll port 重同步: ' + pollPort);
+            }
+          } catch (e) {}
+        }
+      };
+      xhr.onerror = function () {};
+      xhr.ontimeout = function () {};
+      xhr.send();
+    } catch (e) {}
+  }
+
+  function releasePollPort() {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', 'http://127.0.0.1:8766/poll-port/release?clientId=' + encodeURIComponent(AcpClient.getClientId()), true);
+      xhr.timeout = 2000;
+      xhr.send();
+    } catch (e) {}
+  }
+
   // ══════════════════════════════════════════════
   // taskpane 上下文：聊天 + ACP + 轮询
   // ══════════════════════════════════════════════
@@ -55,24 +143,26 @@
     // 1. 聊天 UI
     ChatUi.init({ onSend: onUserSend });
 
-    // 2. ACP 客户端：连接 + 会话管理
+    // 2. 路线 P：异步分配 poll 端口（与 ACP 连接并行）。bridge 是唯一分配者且幂等：
+    //    即使 session/new 先于分配完成发出，bridge 也会按该 client 幂等分配同一端口，无竞态。
+    allocatePollPort(function (alloc) {
+      WpsPollClient.init({
+        serverUrl: 'http://127.0.0.1:' + alloc.port,
+        handler: onPollCommand,
+        onStatus: onPollStatus
+      });
+      WpsPollClient.start();
+      QPLog('main', 'initTaskpane: WpsPollClient.start() 已调用 (poll=' + alloc.port + ')');
+      ChatUi.setStatus('WPS 桥: 轮询中');
+    });
+
+    // 3. ACP 客户端：连接 + 会话管理
     AcpClient.onConnectionChange(onAcpConnChange);
     AcpClient.onResponse(onAcpResponse);
     AcpClient.onSessionUpdate(onAcpSessionUpdate);
     AcpClient.onRequest(onAcpRequest);
     AcpClient.connect();
     QPLog('main', 'initTaskpane: AcpClient.connect() 已调用');
-
-    // 3. 轮询客户端：WPS 操作执行端（角色 B）
-    WpsPollClient.init({
-      serverUrl: 'http://127.0.0.1:58891',
-      handler: onPollCommand,
-      onStatus: onPollStatus
-    });
-    WpsPollClient.start();
-    QPLog('main', 'initTaskpane: WpsPollClient.start() 已调用');
-
-    ChatUi.setStatus('WPS 桥: 轮询中');
   }
 
   // ── ACP 连接状态 ──
@@ -80,6 +170,7 @@
     QPLog('main', 'ACP 连接状态变化: ' + state);
     ChatUi.setConnState(state === 'connected');
     if (state === 'connected') {
+      syncPollPort();  // 重连时同步权威端口（覆盖初始分配失败/bridge 重启场景）
       ensureSession();
     } else if (state === 'disconnected') {
       acpSessionId = null;
@@ -393,6 +484,7 @@
     }
     WpsPollClient.stop();
     AcpClient.disconnect();
+    releasePollPort();
   }
 
   // taskpane 页面 DOM 就绪后初始化；ribbon 环境则只注册回调

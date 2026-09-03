@@ -1,5 +1,5 @@
 /**
- * wps-poll-client.js — 角色 B：连 :58891 拉取/回传命令（轮询桥）
+ * wps-poll-client.js — 角色 B：连轮询桥拉取/回传命令
  *
  * 模块边界（ARCHITECTURE §4.2）：只懂 wps-office-mcp 的轮询协议，不知道 ACP、不知道 UI。
  *
@@ -9,6 +9,9 @@
  *   - 需要：requestId 去重（poll 可能重复返回同一命令）、结果 POST 失败重试 3 次（500ms 退避）、
  *     poll 网络错误指数退避（500ms→5s 封顶）
  *
+ * serverUrl（路线 P）：默认 :58891；多实例场景由 main.js 传 bridge 分配的独立端口
+ * （http://127.0.0.1:<WPS_POLL_PORT>），各窗口轮询自己的端口，不抢单例、不串台（ARCHITECTURE §13）。
+ *
  * 对外接口（供 main.js 使用）：
  *   - init({ serverUrl, handler, onStatus })
  *   - start() / stop()
@@ -17,7 +20,7 @@ var WpsPollClient = (function () {
   'use strict';
 
   var CONFIG = {
-    SERVER_URL: 'http://127.0.0.1:58891',
+    SERVER_URL: 'http://127.0.0.1:58891', // 默认单实例端口；路线 P 下由 main.js 覆盖为分配端口
     POLL_INTERVAL: 500,
     POLL_TIMEOUT: 5000
   };
