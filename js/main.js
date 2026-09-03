@@ -347,11 +347,14 @@
       if (ok) {
         QPLog('P3', 'agent 切换成功，重建会话');
         ChatUi.addMessage('system', '已切换到 agent「' + agentId + '」，正在重建会话…');
-        // 旧 sessionId 随子进程重启失效：清当前会话状态 + 内存/缓存，重建
+        // 旧 sessionId 随子进程重启失效：清当前会话状态 + 内存/缓存，重建。
+        // 同步清 docStates 的 messages 与 localStorage 历史：新 agent = 全新会话无记忆，
+        // 若保留旧消息，切走再切回会显示死会话的旧记录（P15「用户看得见但 AI 不记得 = 误导」）。
         acpSessionId = null;
         saveCachedSessionId(currentDocId, null);
-        if (currentDocId && docStates[currentDocId]) {
-          docStates[currentDocId].acpSessionId = null; // P3：防止切走再切回恢复死 session
+        if (currentDocId) {
+          docStates[currentDocId] = { acpSessionId: null, messages: [] };
+          saveHistory(currentDocId, []);
         }
         ChatUi.clear();
         ChatUi.showEmptyHint();
@@ -537,9 +540,17 @@
   }
 
   function touchActivity() {
+    // 任何下行活动（文本 chunk / status_update / request_permission）都证明请求仍存活：
+    // 同时重置两个看门狗。尤其工具链场景（每次工具调用都有 request_permission 下行），
+    // 首个文本 chunk 可能晚于 60s 才到达——只重置 activityTimer 会让 noFirstChunkTimer
+    // 误报中断（P2 真实工具链假阳性）。
     if (activityTimer) {
       clearTimeout(activityTimer);
       activityTimer = setTimeout(onActivityTimeout, P2_ACTIVITY_MS);
+    }
+    if (noFirstChunkTimer) {
+      clearTimeout(noFirstChunkTimer);
+      noFirstChunkTimer = setTimeout(onNoFirstChunkTimeout, P2_NO_FIRST_CHUNK_MS);
     }
   }
 
