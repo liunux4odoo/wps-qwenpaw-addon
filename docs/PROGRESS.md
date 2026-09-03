@@ -54,6 +54,12 @@
   - **P13 快捷指令**：`/clear`（清空会话 + 重建）、`/help`、未知指令提示
   - **P14 清除对话历史**：工具栏"清空对话"按钮 + 确认弹窗（session/close + session/new，同步清前端缓存）
 - ✅ **批 2/3 审查加固（2026-09-03，本轮）**：修复 tryAutoExpand 可能缩小侧边栏（改屏幕宽度 + 只增不减）；agent 切换/重建会话后清 docStates 残留 sessionId；空状态引导在首条消息后移除；Markdown 行内代码内容保护（占位符防加粗/斜体误处理）；错误卡 snapshot 干净提取（不拼按钮文本）；bridge switch_agent 复位重启退避延迟；P8 doc 检测改用轻量 `WpsBridge.getDocIdentity`（避免每 3s 重计数卡 WPS）；session/load 回退文案优化 + ensureSession 防重入
+- ✅ **P2 v1.4 修复（2026-09-03，本轮，按 DEV-PLAN-Phase3.md v1.4）**：
+  - **bridge stdout reader 超长行修复**（`docs/plan-2026-09-03-bridge-stdout-reader-fix.md`）：自实现 `_BoundedLineReader`（行缓冲上限 4MB）替代 `StreamReader.readline` 的 64KB 限制——工具大返回值（如 `getActiveDocument` 文档全文单行 JSON >64KB）不再抛 `ValueError` 崩 reader，下行不再永久断；正常行语义/顺序不变，无换行超长行显式打日志跳过，stdout/stderr 同等处理；验证：8 边界用例 + 真实 asyncio.StreamReader 集成测试全过
+  - **看门狗阈值分层（实测结论）**：`P2_NO_FIRST_CHUNK_MS` 60s→**120s**，`P2_ACTIVITY_MS` 120s→**180s**（覆盖 qwenpaw 单次请求内 91s/104s thinking 完全静默窗口，不再误报）
+  - **thinking 心跳接入**：`onAcpSessionUpdate` 新增 `agent_thought_chunk` 分支 → `touchActivity()` 续命 + "正在思考…"打字指示器（qwenpaw 思考时每 0.1-0.2s 一条，长思考不触发看门狗）
+  - **自动延长不死判**：看门狗触发时进入"疑似中断"顺延态（UI 显示"AI 仍在处理…"，每次再等 60s，上限 3 次，总等待 ≤ 5min）；顺延期间任何下行回到正常态；顺延用尽才判定中断
+- ✅ **WPS 宏安全性检查（2026-09-03，本轮）**：实机验证结论——宏安全性未调到最低时 jsaddon 加载项不加载。新增 `scripts/check-wps-macro-security.sh`（检查 + `--apply` 自动调整 wps/wpp `VbaSecurityLevel` 与 et `KDESecurityLevel` 为 1，带备份 + WPS 运行中拦截），`scripts/install.sh` 步骤 7 调用检查并提示，`docs/INSTALL.md` 新增「宏安全性（必需）」章节 + FAQ
 - 🚧 **待 WPS 实机验证**：批 2/3 的 FE 改动（agent 切换、文档隔离切换、附件、自动展开）需 WPS 实机重开侧边栏端到端验收；P9（excel/ppt 加载）需实机确认 V4（manifest 已含 wps/et/wpp hosts）
 
 ## 部署配套（v0.17 路线 P 强制）

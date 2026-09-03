@@ -30,9 +30,43 @@ cd wps-qwenpaw-addon
 4. **打 POLL_PORT 补丁 + 重建**（幂等，见 [DEPENDENCIES.md](./DEPENDENCIES.md)）
 5. **部署 noop 脚本**：`scripts/wps-auto-noop.sh` → `third_party/opencode-wps/opencode-wps-linux/wps-auto.sh`
 6. **同步加载项**：仓库文件 → `~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/`
-7. **启动 acp-bridge** 并输出自检结果
+7. **检查 WPS 宏安全性**（必需：宏安全性必须调到最低，否则插件不加载，见 [§宏安全性](#宏安全性必需)）
+8. **启动 acp-bridge** 并输出自检结果
 
 安装完成后按 [§启动](#启动) 启动即可。
+
+> ⚠ **安装脚本只检查并提示宏安全性，不自动修改**（WPS 运行时修改会被其重启覆盖）。
+> 若提示宏安全性非最低，按 [§宏安全性](#宏安全性必需) 调整后再启动 WPS。
+
+## 宏安全性（必需）
+
+> **实机验证结论（2026-09-03）**：WPS 的**宏安全性**未调到最低时，jsaddon 加载项**不会加载**——
+> 功能区不出现「QwenPaw AI」标签、侧边栏打不开。这是本项目加载项能正常加载的**前置必要条件**。
+
+- **含义**：把 wps（Word）、et（Excel）、wpp（PPT）三个应用的宏安全性都设为「低」（允许所有宏）。
+- **最低值**：WPS 配置文件 `~/.config/Kingsoft/Office.conf` 中 `VbaSecurityLevel`（wps/wpp）与 `KDESecurityLevel`（et）均为 `1`。
+
+### 方式一：脚本一键调整（推荐）
+
+```bash
+./scripts/check-wps-macro-security.sh            # 只检查当前级别
+./scripts/check-wps-macro-security.sh --apply    # 自动调到最低（需先完全关闭 WPS）
+```
+
+> `--apply` 前必须**完全关闭 WPS**（关闭所有窗口），否则 WPS 退出时会用旧配置重写 `Office.conf`，
+> 修改会被覆盖。脚本会自动备份原配置（`Office.conf.bak-macrosecurity-*`）。
+
+### 方式二：WPS 界面设置
+
+1. 启动 WPS，打开任一应用（Word/Excel/PPT）
+2. 左上角「文件」→「选项」→「安全」（或「常规与保存」）→「宏安全性」
+3. 选「低（允许所有宏）」，确定
+4. 三个应用（wps/et/wpp）都要分别设置
+5. 完全退出并重启 WPS
+
+### 验证
+
+重启 WPS 后打开文档，功能区出现「QwenPaw AI」标签、点击「AI 侧边栏」能打开侧边栏，即宏安全性已满足。
 
 ## 手动安装
 
@@ -125,6 +159,8 @@ cp -r manifest.xml ribbon.xml index.html taskpane.html css js "$ADDON_DIR/"
 
 > WPS 通过目录名（含 manifest id）自动发现加载项。`manifest.xml` 的 `<id>` 为 `wps-qwenpaw-addon`，目录名即 `wps-qwenpaw-addon_`。
 
+> **必做**：同步加载项后，还要把 WPS 宏安全性调到最低（见 [§宏安全性](#宏安全性必需)），否则插件不加载。
+
 ## 启动
 
 1. **启动 acp-bridge**（若未运行）：
@@ -158,8 +194,8 @@ pkill -f "acp-bridge.py"
 
 | 现象 | 处理 |
 |---|---|
+| 功能区没有 QwenPaw AI 标签 / 侧边栏打不开 | **最常见原因：WPS 宏安全性未调到最低**（见 [§宏安全性](#宏安全性必需)）；或未打开文档 / 未完全重启 WPS / 加载项目录未同步（重跑 install.sh） |
 | 侧边栏显示「WPS 桥: 重连中」 | 预期行为：`:58891` 是 wps-office-mcp 懒启动端口，AI 首次调 WPS 工具后才监听；工具调用后自动连上 |
-| 功能区没有 QwenPaw AI 标签 | 未打开文档 / 未完全重启 WPS / 加载项目录未同步（重跑 install.sh） |
 | bridge 未启动 | `conda run -n py312 python bridge/acp-bridge.py`，看日志；确认 :8766 未被占用 |
 | 工具执行报 `Connection closed`/超时 | WPS 未打开文档（CEF 引擎未启动），打开文档重试 |
 

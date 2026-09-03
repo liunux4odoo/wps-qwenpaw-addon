@@ -9,7 +9,8 @@
 #   4. 打 POLL_PORT 补丁 + 重建（幂等，路线 P 必需）
 #   5. 部署 noop 脚本（防 WPS 被强杀）
 #   6. 同步加载项文件到 WPS jsaddons 目录
-#   7. 启动 acp-bridge 并自检
+#   7. WPS 宏安全性检查（必需：宏安全性调到最低，否则插件不加载）
+#   8. 启动 acp-bridge 并自检
 #
 # 用法：
 #   ./scripts/install.sh              # 完整安装
@@ -136,7 +137,22 @@ if [ "$BRIDGE_ONLY" -eq 0 ]; then
   warn "请完全重启 WPS（关闭所有窗口后重开），加载项才会重新加载"
 fi
 
-# ── 7. 启动 acp-bridge ─────────────────────────────────────
+# ── 7. WPS 宏安全性检查（插件加载必需） ──────────────────────
+# 实机验证结论（2026-09-03）：WPS 宏安全性未调到最低时，jsaddon 加载项不加载
+# （功能区不出现「QwenPaw AI」标签/侧边栏空白）。最低 = VbaSecurityLevel/KDESecurityLevel 为 1。
+# 调整细节见 scripts/check-wps-macro-security.sh。
+SEC_NEED_FIX=0
+if [ "$BRIDGE_ONLY" -eq 0 ]; then
+  say "== WPS 宏安全性检查（必需：宏安全性调到最低，否则插件不加载） =="
+  if bash "$REPO_ROOT/scripts/check-wps-macro-security.sh"; then
+    ok "宏安全性已为最低"
+  else
+    SEC_NEED_FIX=$?
+    warn "见 scripts/check-wps-macro-security.sh --apply（需先完全关闭 WPS）或 docs/INSTALL.md"
+  fi
+fi
+
+# ── 8. 启动 acp-bridge ─────────────────────────────────────
 if [ "$SKIP_BRIDGE" -eq 0 ]; then
   say "== 启动 acp-bridge =="
   # 端口占用检查
@@ -177,6 +193,12 @@ echo "  1. 启动 WPS 并打开一个文档"
 echo "  2. 功能区点击「QwenPaw AI」→「AI 侧边栏」"
 echo "  3. 输入指令（如：把第三段润色一下）"
 echo
+if [ "$SEC_NEED_FIX" != "0" ]; then
+  echo "  ⚠ 重要：本次检测到 WPS 宏安全性未调到最低（插件可能不加载）。"
+  echo "    请运行 ./scripts/check-wps-macro-security.sh --apply（先关闭 WPS）"
+  echo "    或按 docs/INSTALL.md 把 wps/et/wpp 的宏安全性调到「低」，然后完全重启 WPS。"
+  echo
+fi
 echo "  常用命令："
 echo "    ${PYTHON} ${REPO_ROOT}/bridge/acp-bridge.py --agent ${BRIDGE_AGENT}   # 手动前台启动 bridge"
 echo "    tail -f /tmp/acp-bridge.log                                            # bridge 日志"

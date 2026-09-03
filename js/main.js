@@ -60,8 +60,13 @@
   var ribbonUI = null;
 
   // ── 阶段 3 批 1：P1 状态合并 / P2 中断恢复 / P4 过程呈现 / P5 中止 ──
-  var P2_NO_FIRST_CHUNK_MS = 60000;  // 发送后 60s 无任何 chunk → 判定中断（P2）
-  var P2_ACTIVITY_MS = 120000;       // 连续 120s 无任何下行活动 → 判定卡死（P2）
+  // P2 v1.4（docs/DEV-PLAN-Phase3.md §1 P2）：看门狗阈值按实测分层——
+  // qwenpaw 单次请求内存在 78s/91s/104s 的 thinking 完全静默窗口，60s 阈值必然误报。
+  var P2_NO_FIRST_CHUNK_MS = 120000; // 发送后 120s 无任何 chunk → 疑似中断（覆盖 91s 静默 + 余量）
+  var P2_ACTIVITY_MS = 180000;       // 连续 180s 无任何下行活动 → 疑似中断
+  var P2_EXTEND_MS = 60000;          // 疑似中断后每次自动顺延时长（不死判）
+  var P2_MAX_EXTENDS = 3;            // 顺延上限：总等待 = 首阈值 + 3×60s ≤ 5min
+  var extendCount = 0;               // 当前已顺延次数（任何下行清零）
   var acpState = 'connecting';       // 'connecting' | 'connected' | 'disconnected'
   var wpsState = 'pending';          // 'pending'（未激活，预期）| 'connected'
   var lastAcpShown = null;           // 已渲染的 ACP 状态（避免 500ms 轮询重复写 DOM）
@@ -531,6 +536,7 @@
   function clearPromptTimers() {
     if (noFirstChunkTimer) { clearTimeout(noFirstChunkTimer); noFirstChunkTimer = null; }
     if (activityTimer) { clearTimeout(activityTimer); activityTimer = null; }
+    extendCount = 0;
   }
 
   function startPromptTimers() {
@@ -540,10 +546,13 @@
   }
 
   function touchActivity() {
-    // 任何下行活动（文本 chunk / status_update / request_permission）都证明请求仍存活：
-    // 同时重置两个看门狗。尤其工具链场景（每次工具调用都有 request_permission 下行），
-    // 首个文本 chunk 可能晚于 60s 才到达——只重置 activityTimer 会让 noFirstChunkTimer
-    // 误报中断（P2 真实工具链假阳性）。
+    // 任何下行活动（thinking 心跳 / 文本 chunk / status_update / request_permission）
+    // 都证明请求仍存活：
+    // 1) 退出"疑似中断"顺延态（extendCount 清零，回到正常等待）
+    // 2) 同时重置两个看门狗。尤其工具链场景（每次工具调用都有 request_permission 下行），
+    //    首个文本 chunk 可能晚于阈值到达——只重置 activityTimer 会让 noFirstChunkTimer
+    //    误报中断（P2 真实工具链假阳性）。
+    extendCount = 0;
     if (activityTimer) {
       clearTimeout(activityTimer);
       activityTimer = setTimeout(onActivityTimeout, P2_ACTIVITY_MS);
@@ -554,17 +563,28 @@
     }
   }
 
-  // P2：prompt 发出后 60s 无任何 chunk → 中断恢复
-  function onNoFirstChunkTimeout() {
-    QPLog('P2', 'prompt 发出 ' + (P2_NO_FIRST_CHUNK_MS / 1000) + 's 无任何 chunk，触发中断恢复');
-    recoverFromInterruption('长时间未收到 AI 响应，连接可能已中断');
+  // P2 v1.4：看门狗触发时不死判——先进入"疑似中断"自动顺延（UI 提示"AI 仍在处理…"），
+  // 顺延期间任何下行 → 回到正常状态（touchActivity 清零 extendCount）；顺延次数用尽
+  // 仍无下行 → 才判定中断。覆盖 qwenpaw 单次请求内 91s+ 的 thinking 完全静默窗口。
+  function onWatchdogTimeout(kind) {
+    if (extendCount < P2_MAX_EXTENDS) {
+      extendCount++;
+      QPLog('P2', kind + ' 看门狗触发，第 ' + extendCount + '/' + P2_MAX_EXTENDS
+        + ' 次自动顺延（AI 仍在处理，再等 ' + (P2_EXTEND_MS / 1000) + 's）');
+      ChatUi.showTyping('AI 仍在处理…');
+      ChatUi.setStatus('AI 仍在处理…（' + extendCount + '/' + P2_MAX_EXTENDS + '）');
+      if (noFirstChunkTimer) { clearTimeout(noFirstChunkTimer); noFirstChunkTimer = setTimeout(onNoFirstChunkTimeout, P2_EXTEND_MS); }
+      if (activityTimer) { clearTimeout(activityTimer); activityTimer = setTimeout(onActivityTimeout, P2_EXTEND_MS); }
+      return;
+    }
+    QPLog('P2', kind + ' 看门狗触发，顺延次数已用尽，判定中断');
+    recoverFromInterruption(kind === 'noFirstChunk'
+      ? '长时间未收到 AI 响应，连接可能已中断'
+      : 'AI 响应中断（长时间无数据）');
   }
 
-  // P2：连续 120s 无任何下行活动（流式丢失/工具卡死）→ 中断恢复
-  function onActivityTimeout() {
-    QPLog('P2', '连续 ' + (P2_ACTIVITY_MS / 1000) + 's 无下行活动，触发中断恢复');
-    recoverFromInterruption('AI 响应中断（长时间无数据）');
-  }
+  function onNoFirstChunkTimeout() { onWatchdogTimeout('noFirstChunk'); }
+  function onActivityTimeout() { onWatchdogTimeout('activity'); }
 
   // P2：恢复 UI 状态 + 可操作错误卡片（重试/重建会话）
   function recoverFromInterruption(reason) {
@@ -806,6 +826,16 @@
         streamBuffer += text;
         ChatUi.appendAssistantChunk(text);
         schedulePersist(); // P15：流式过程中防抖落盘
+      }
+    } else if (update.sessionUpdate === 'agent_thought_chunk') {
+      // P2 v1.4：thinking 心跳——qwenpaw 思考时密集下发 agent_thought_chunk
+      //（实测每 0.1-0.2s 一条），作为续命信号重置看门狗：即使无文本 chunk，
+      // 长思考/静默期间看门狗也不触发（覆盖 91s+ thinking 完全静默窗口）。
+      touchActivity();
+      // 可选的"正在思考…"打字指示器：仅进行中请求 + 尚无首文本 chunk + 无工具卡片时提示
+      //（避免覆盖 tool_call 阶段设置的"正在调用工具…"标签，见审查 finding）
+      if (waitingResponse && !gotFirstChunk && pendingToolCards.length === 0) {
+        ChatUi.showTyping('正在思考…');
       }
     } else if (update.sessionUpdate === 'status_update') {
       // P4：阶段/工具调用状态（qwenpaw 若下发 status_update）；仅进行中请求时处理

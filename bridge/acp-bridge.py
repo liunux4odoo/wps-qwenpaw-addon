@@ -59,6 +59,13 @@ log = logging.getLogger("acp-bridge")
 
 MAX_POLL_BATCH = 200
 
+# ── stdio reader 行缓冲（docs/plan-2026-09-03-bridge-stdout-reader-fix.md）──────────────────
+# asyncio StreamReader.readline 默认行缓冲上限 64KB：qwenpaw 工具大返回值（如 getActiveDocument
+# 文档全文）作为单行 JSON 超限时 readline 抛 ValueError → reader 任务崩溃 → 下行永久断。
+# 修复：自实现 _BoundedLineReader，正常行语义与 readline 一致；超长行显式打日志跳过、reader 不崩溃。
+READ_CHUNK = 65536                # 每次从子进程读取的块大小
+MAX_LINE_BYTES = 4 * 1024 * 1024  # 单行缓冲上限（覆盖真实工具大返回值；无换行单行防无限占内存）
+
 # ── 路线 P：poll 端口集中分配段（避开 :8766/:8765/:58891） ──────────
 POLL_PORT_START = 59000
 POLL_PORT_END = 59999
@@ -80,6 +87,57 @@ MIME_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+
+
+class _BoundedLineReader:
+    """带行缓冲上限的逐行读取器（替代 StreamReader.readline 的 64KB 行缓冲上限）。
+
+    修复目标（docs/plan-2026-09-03-bridge-stdout-reader-fix.md §3/§5）：
+      - 正常行（< MAX_LINE_BYTES）：语义与 readline 一致，顺序不变
+      - 超长行（无换行 > MAX_LINE_BYTES）：不崩溃；显式打日志"跳过"，继续读下一行
+      - EOF：返回 b""（与 readline 一致）；EOF 前最后不完整行按半行 flush（§5 边界 #8）
+
+    readline() 返回值：
+      - bytes：一行（含 \n；EOF 前最后一行可能不含 \n）
+      - None：遇到超长行（已打日志跳过，调用方应 continue）
+      - b""：EOF
+    """
+
+    def __init__(self, stream, name: str):
+        self._stream = stream
+        self._name = name
+        self._buf = bytearray()
+
+    async def readline(self):
+        while True:
+            idx = self._buf.find(b"\n")
+            if idx != -1:
+                line = bytes(self._buf[:idx + 1])
+                del self._buf[:idx + 1]
+                return line
+            # 缓冲中已无完整行，且长度超限（无换行的超长单行）：跳过该行防内存爆
+            if len(self._buf) >= MAX_LINE_BYTES:
+                log.warning("qwenpaw %s: 单行超过 %d 字节（无换行），跳过该行内容（reader 不崩溃）",
+                            self._name, MAX_LINE_BYTES)
+                self._buf.clear()
+                while True:
+                    chunk = await self._stream.read(READ_CHUNK)
+                    if not chunk:
+                        return None  # 跳过过程中 EOF
+                    n = chunk.find(b"\n")
+                    if n != -1:
+                        # 保留换行之后的残余（可能含后续完整行）
+                        self._buf.extend(chunk[n + 1:])
+                        break
+                continue  # 重新进入循环，优先切出残余中的完整行
+            chunk = await self._stream.read(READ_CHUNK)
+            if not chunk:
+                if self._buf:
+                    line = bytes(self._buf)
+                    self._buf.clear()
+                    return line  # EOF 前最后不完整行（与 readline 语义一致）
+                return b""
+            self._buf.extend(chunk)
 
 
 class AcpBridge:
@@ -149,6 +207,9 @@ class AcpBridge:
                 if upd.get("sessionUpdate") == "agent_message_chunk":
                     t = (upd.get("content") or {}).get("text") or ""
                     parts.append(f"chunk={t[:120]!r}")
+                elif upd.get("sessionUpdate") == "agent_thought_chunk":
+                    t = (upd.get("content") or {}).get("text") or ""
+                    parts.append(f"thought={t[:60]!r}")
                 else:
                     parts.append(f"update={upd.get('sessionUpdate')}")
             if msg.get("method") == "session/request_permission":
@@ -377,8 +438,11 @@ class AcpBridge:
 
     async def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
+        reader = _BoundedLineReader(self.proc.stdout, "stdout")
         while True:
-            line = await self.proc.stdout.readline()
+            line = await reader.readline()
+            if line is None:
+                continue  # 超长行已显式打日志跳过，继续读下一行
             if not line:
                 log.info("qwenpaw acp stdout EOF")
                 break
@@ -388,8 +452,11 @@ class AcpBridge:
 
     async def _stderr_reader(self) -> None:
         assert self.proc and self.proc.stderr
+        reader = _BoundedLineReader(self.proc.stderr, "stderr")
         while True:
-            line = await self.proc.stderr.readline()
+            line = await reader.readline()
+            if line is None:
+                continue  # 超长行已显式打日志跳过，继续读下一行
             if not line:
                 break
             log.debug("qwenpaw stderr: %s", line.decode("utf-8", "replace").rstrip("\n"))
