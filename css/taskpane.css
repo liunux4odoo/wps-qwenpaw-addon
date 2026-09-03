@@ -93,6 +93,13 @@ html, body {
     line-height: 1.5;
     word-wrap: break-word;
     white-space: pre-wrap;
+    animation: msg-in 0.18s ease-out;
+}
+
+/* P12：消息出现动画（轻量，不干扰操作） */
+@keyframes msg-in {
+    from { opacity: 0; transform: translateY(3px); }
+    to { opacity: 1; transform: none; }
 }
 
 .msg.user {
@@ -293,6 +300,34 @@ html, body {
 
 .toggle input { cursor: pointer; }
 
+/* P3：agent 下拉选择 */
+.agent-select {
+    max-width: 120px;
+    font-size: 11px;
+    padding: 2px 4px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    color: #333;
+}
+
+/* P14：清空对话按钮 */
+.clear-btn {
+    padding: 2px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    color: #666;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.clear-btn:hover {
+    border-color: #c0392b;
+    color: #c0392b;
+    background: #fdecea;
+}
+
 .tool-status {
     font-size: 11px;
     color: #888;
@@ -326,6 +361,24 @@ html, body {
     border-color: #2b579a;
 }
 
+/* P6：附件按钮 */
+.attach-btn {
+    align-self: flex-end;
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #fff;
+    color: #666;
+    font-size: 13px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.attach-btn:hover {
+    border-color: #2b579a;
+    color: #2b579a;
+}
+
 .send-btn {
     align-self: flex-end;
     padding: 8px 16px;
@@ -356,4 +409,131 @@ html, body {
 
 .stop-btn:hover {
     background: #fdecea;
+}
+
+/* ── P12：空状态引导 ── */
+.empty-hint {
+    align-self: center;
+    margin-top: 24px;
+    text-align: center;
+    color: #999;
+    max-width: 80%;
+}
+
+.empty-hint .empty-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #bbb;
+    margin-bottom: 12px;
+}
+
+.empty-hint .empty-tip {
+    font-size: 12px;
+    padding: 4px 12px;
+    margin: 4px auto;
+    background: #fff;
+    border: 1px dashed #ddd;
+    border-radius: 12px;
+    display: inline-block;
+    color: #888;
+}
+
+/* ── P10：Markdown 渲染（assistant 消息内容） ── */
+.msg.assistant {
+    white-space: normal;
+    overflow-wrap: break-word;
+}
+
+.msg.assistant p {
+    margin: 4px 0;
+}
+
+.msg.assistant h1, .msg.assistant h2, .msg.assistant h3,
+.msg.assistant h4, .msg.assistant h5, .msg.assistant h6 {
+    margin: 8px 0 4px;
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+.msg.assistant h1 { font-size: 16px; }
+.msg.assistant h2 { font-size: 15px; }
+.msg.assistant h3 { font-size: 14px; }
+.msg.assistant h4, .msg.assistant h5, .msg.assistant h6 { font-size: 13px; }
+
+.msg.assistant ul, .msg.assistant ol {
+    margin: 4px 0;
+    padding-left: 20px;
+}
+
+.msg.assistant li {
+    margin: 2px 0;
+}
+
+.msg.assistant code {
+    background: #f0f0f0;
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+}
+
+.msg.assistant pre.code {
+    background: #f6f8fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 8px 0;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.msg.assistant pre.code code {
+    background: transparent;
+    padding: 0;
+    font-size: 12px;
+}
+
+.msg.assistant blockquote {
+    margin: 6px 0;
+    padding: 4px 12px;
+    border-left: 3px solid #2b579a;
+    color: #555;
+    background: #f7f9fc;
+    border-radius: 0 4px 4px 0;
+}
+
+.msg.assistant a {
+    color: #2b579a;
+    text-decoration: underline;
+}
+
+.msg.assistant table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 12px;
+    max-width: 100%;
+}
+
+.msg.assistant th, .msg.assistant td {
+    border: 1px solid #e0e0e0;
+    padding: 4px 8px;
+    text-align: left;
+}
+
+.msg.assistant th {
+    background: #f5f7fa;
+    font-weight: 600;
+}
+
+.msg.assistant .md-table-wrap {
+    overflow-x: auto;
+}
+
+.msg.assistant hr {
+    border: none;
+    border-top: 1px solid #e0e0e0;
+    margin: 10px 0;
 }

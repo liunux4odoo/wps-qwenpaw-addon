@@ -13,6 +13,9 @@ acp-bridge — WebSocket/HTTP ↔ stdio 双向转发桥，连接 WPS 加载项�
 
 HTTP 端点（加载项侧 acp-client.js 使用）：
   - GET  /status                    -> {"status":"running","agent":...,"ports":{...}}
+  - GET  /config                    -> {"wpsMcpEntry":...,"pollPortStart":...,"pollPortEnd":...}
+  - GET  /agents                    -> {"agents":[{id,name,description}],"current":agent}（P3 agent 列表）
+  - POST /agent/set?agent=X         -> 切换 agent（重启 qwenpaw acp 子进程，P3）
   - POST /acp/send?clientId=X       body=NDJSON ACP 请求（一行一条 JSON-RPC）-> 写 qwenpaw stdin
   - GET  /acp/poll?clientId=X       -> 该 clientId 的待下行 ACP 消息（JSONL，每行一条）
   - GET  /ui/*                      -> 加载项 UI 静态文件（CreateTaskPane 经此加载 taskpane.html，
@@ -302,6 +305,62 @@ class AcpBridge:
             return here
         return "qwenpaw"
 
+    async def list_agents(self) -> list[dict]:
+        """查询可用 agent 列表（qwenpaw agent list），供加载项侧选择（P3）。
+
+        返回 [{id, name, description}]；命令失败/解析失败返回空列表（不抛异常）。
+        注：这是配置面查询（类似 /status），不实现任何 ACP 业务逻辑（守 §6.1 铁律）。
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._qwenpaw_bin(), "agent", "list",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(os.environ, PYTHONUNBUFFERED="1"),
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            obj = json.loads(stdout.decode("utf-8", "replace"))
+            agents = obj.get("agents") or []
+            out = []
+            for a in agents:
+                if not isinstance(a, dict):
+                    continue
+                if not a.get("id"):
+                    continue
+                out.append({
+                    "id": str(a["id"]),
+                    "name": str(a.get("name") or a["id"]),
+                    "description": str(a.get("description") or ""),
+                })
+            return out
+        except Exception as e:
+            log.warning("list_agents 失败: %s", e)
+            return []
+
+    async def switch_agent(self, agent_id: str) -> tuple[bool, str]:
+        """切换到指定 agent：杀掉当前 qwenpaw acp 子进程，_wait_proc 会用新 agent 自动重启。
+
+        返回 (ok, err)。agent 列表以 qwenpaw agent list 为准；未找到返回失败。
+        """
+        if not agent_id:
+            return False, "agent 为空"
+        if agent_id == self.agent:
+            return True, "已是指定 agent"
+        known = await self.list_agents()
+        if known and not any(a["id"] == agent_id for a in known):
+            return False, f"未知 agent: {agent_id}"
+        log.info("switching agent: %s -> %s", self.agent, agent_id)
+        self.agent = agent_id
+        # 主动切换 = 有意重启：复位退避延迟，避免此前多次崩溃把 _restart_delay 推到 30s，
+        # 导致 agent 切换后 qwenpaw acp 迟迟不拉起来。
+        self._restart_delay = 1.0
+        if self.proc:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        return True, ""
+
     async def start_proc(self) -> None:
         cmd = [self._qwenpaw_bin(), "acp", "--agent", self.agent]
         log.info("spawning qwenpaw acp: %s", " ".join(cmd))
@@ -545,6 +604,22 @@ class AcpBridge:
                     "wpsMcpEntry": self.wps_mcp_entry,
                     "pollPortStart": POLL_PORT_START,
                     "pollPortEnd": POLL_PORT_END,
+                })
+            elif path == "/agents" and method == "GET":
+                # P3：可用 agent 列表（qwenpaw agent list），供加载项侧下拉选择
+                agents = await self.list_agents()
+                await self._http_json(writer, 200, {
+                    "agents": agents,
+                    "current": self.agent,
+                })
+            elif path == "/agent/set" and method == "POST":
+                # P3：切换 agent（重启 qwenpaw acp 子进程）
+                target = query_params.get("agent", "")
+                ok, err = await self.switch_agent(target)
+                await self._http_json(writer, 200 if ok else 400, {
+                    "ok": ok,
+                    "agent": self.agent,
+                    "error": err or None,
                 })
             elif path == "/poll-port/allocate" and method == "POST":
                 port = self._allocate_port(client_id)

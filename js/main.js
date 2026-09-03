@@ -73,6 +73,134 @@
   var noFirstChunkTimer = null;      // P2：无首 chunk 看门狗
   var activityTimer = null;          // P2：无下行活动看门狗
 
+  // ── 阶段 3 批 2：P8 文档隔离 / P15 历史缓存 / P3 agent 选择 ──
+  var currentDocId = null;           // 当前活动文档 id（会话隔离 key）
+  var docStates = {};                // docId -> {acpSessionId, messages}
+  var persistTimer = null;           // P15：历史落盘防抖
+  var agentList = [];                // P3：可用 agent 列表
+  var agentCached = null;            // P3：localStorage 记住的上次 agent
+  var docCheckTimer = null;          // P8：活动文档检测间隔
+  var DOC_CHECK_MS = 3000;           // P8：活动文档检测周期
+  var pendingAttachments = [];       // P6：待发送附件 [{name, text}]（文本提取；图片为 {name, image:true} 占位）
+  var MAX_ATTACH_TEXT = 60000;       // P6：单个附件文本上限（超出截断）
+
+  // P8 文档隔离 key：优先用轻量 getDocIdentity（只读 Name/Path，不触发 Paragraphs 计数，
+  // 因为 startDocCheck 每 3s 调用一次，重计数会卡 WPS）；回退默认 'default'。
+  function getDocId() {
+    try {
+      if (typeof WpsBridge !== 'undefined' && WpsBridge.getDocIdentity) {
+        var info = WpsBridge.getDocIdentity();
+        if (info && info.name) {
+          return ((info.appType || 'doc') + ':' + (info.path || '') + ':' + info.name);
+        }
+      } else if (typeof WpsBridge !== 'undefined' && WpsBridge.getActiveDocumentInfo) {
+        var info2 = WpsBridge.getActiveDocumentInfo();
+        if (info2 && info2.name) {
+          return ((info2.appType || 'doc') + ':' + (info2.path || '') + ':' + info2.name);
+        }
+      }
+    } catch (e) {}
+    return 'default';
+  }
+
+  function historyKey(docId) { return 'qp.history.' + (docId || 'default'); }
+  function sessionKey(docId) { return 'qp.session.' + (docId || 'default'); }
+  function agentKey() { return 'qp.agent'; }
+
+  function loadHistory(docId) {
+    try {
+      var raw = localStorage.getItem(historyKey(docId));
+      return (raw && JSON.parse(raw)) || [];
+    } catch (e) { return []; }
+  }
+
+  function saveHistory(docId, msgs) {
+    try {
+      localStorage.setItem(historyKey(docId), JSON.stringify((msgs || []).slice(-200)));
+    } catch (e) {}
+  }
+
+  function loadCachedSessionId(docId) {
+    try { return localStorage.getItem(sessionKey(docId)) || null; } catch (e) { return null; }
+  }
+
+  function saveCachedSessionId(docId, sid) {
+    try {
+      if (sid) localStorage.setItem(sessionKey(docId), sid);
+      else localStorage.removeItem(sessionKey(docId));
+    } catch (e) {}
+  }
+
+  // P15：消息变更后防抖落盘（localStorage，按 docId）
+  function schedulePersist() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(function () {
+      persistTimer = null;
+      if (!currentDocId) return;
+      saveHistory(currentDocId, ChatUi.snapshot());
+    }, 600);
+  }
+
+  // P8：保存当前文档状态到内存
+  function saveDocState() {
+    if (!currentDocId) return;
+    docStates[currentDocId] = {
+      acpSessionId: acpSessionId,
+      messages: ChatUi.snapshot()
+    };
+    saveHistory(currentDocId, ChatUi.snapshot());
+  }
+
+  // P8：切换到目标文档（保存当前状态 → 恢复目标状态 → 重建/复用会话）
+  function switchToDoc(docId) {
+    if (docId === currentDocId) return;
+    QPLog('P8', '文档切换: ' + currentDocId + ' -> ' + docId);
+    saveDocState();
+    // 清理当前进行中的请求（与 P5 停止逻辑一致）
+    if (waitingResponse) {
+      var reqId = lastPromptReqId;
+      if (reqId !== null && pendingRequests[reqId]) delete pendingRequests[reqId];
+      lastPromptReqId = null;
+      waitingResponse = false;
+      gotFirstChunk = false;
+      clearPromptTimers();
+      var cards = pendingToolCards.slice();
+      pendingToolCards = [];
+      for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
+      ChatUi.hideTyping();
+      ChatUi.setInputEnabled(true);
+      ChatUi.setBusy(false);
+      streamBuffer = '';
+    }
+    currentDocId = docId;
+    pendingAttachments = []; // P8：切换文档时清空未发送的待选附件（不串台）
+    var st = docStates[docId];
+    if (st && st.messages && st.messages.length) {
+      ChatUi.restore(st.messages);
+      acpSessionId = st.acpSessionId || null;
+    } else {
+      var hist = loadHistory(docId);
+      ChatUi.restore(hist);
+      if (!hist.length) ChatUi.showEmptyHint();
+      acpSessionId = null;
+    }
+    QPLog('P8', '切换到文档 ' + docId + '，恢复会话=' + acpSessionId + ' 历史条数=' + (ChatUi.snapshot().length));
+    ChatUi.setStatus(acpSessionId ? '就绪' : '加载会话…');
+    if (acpState === 'connected') {
+      if (!acpSessionId) ensureSession();
+    }
+  }
+
+  // P8：周期检测活动文档变化（同一 taskpane 实例内多文档隔离；每文档独立 taskpane 时是 no-op）
+  function startDocCheck() {
+    if (docCheckTimer) return;
+    docCheckTimer = setInterval(function () {
+      var id;
+      try { id = getDocId(); } catch (e) { return; }
+      if (id && id !== currentDocId) switchToDoc(id);
+    }, DOC_CHECK_MS);
+  }
+
   // ── 路线 P：从 bridge 集中分配 poll 端口 ──
   // 异步 cb(result)：{port, ok}。失败/超时回退默认 58891（ok=false）。
   // 注意：sync XHR 会忽略 timeout 属性（规范行为），阻塞主线程且无法超时回退，故用异步。
@@ -155,6 +283,101 @@
     } catch (e) {}
   }
 
+  // ── P3：agent 列表加载与切换 ──
+  // bridge /agents 返回可用 agent 列表（qwenpaw agent list）；/agent/set 切换（重启 qwenpaw acp 子进程）。
+  // 前端 localStorage 记住上次选择，刷新/重启自动回填。agent 切换后旧 sessionId 失效 → 重建会话。
+  function loadAgentList() {
+    var el = document.getElementById('agentSelect');
+    if (!el) return;
+    try { agentCached = localStorage.getItem(agentKey()) || null; } catch (e) {}
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', 'http://127.0.0.1:8766/agents', true);
+      xhr.timeout = 5000;
+      xhr.onload = function () {
+        if (xhr.status !== 200) return;
+        try {
+          var r = JSON.parse(xhr.responseText);
+          agentList = r.agents || [];
+          var cur = r.current || null;
+          // 记住的上次选择优先；否则用 bridge 当前 agent
+          var target = agentCached || cur;
+          populateAgentSelect(el, agentList, target);
+          if (agentCached && agentCached !== cur) {
+            QPLog('P3', '上次选择 agent=' + agentCached + ' 与 bridge 当前=' + cur + ' 不一致，请求切换');
+            switchAgent(agentCached);
+          }
+        } catch (e) {}
+      };
+      xhr.onerror = function () {};
+      xhr.ontimeout = function () {};
+      xhr.send();
+    } catch (e) {}
+  }
+
+  function populateAgentSelect(el, agents, selected) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    if (!agents || !agents.length) {
+      var none = document.createElement('option');
+      none.value = '';
+      none.textContent = '(无可用 agent)';
+      el.appendChild(none);
+      return;
+    }
+    for (var i = 0; i < agents.length; i++) {
+      var opt = document.createElement('option');
+      opt.value = agents[i].id;
+      opt.textContent = agents[i].name + (agents[i].id !== agents[i].name ? ' (' + agents[i].id + ')' : '');
+      opt.title = agents[i].description || '';
+      if (selected && selected === agents[i].id) opt.selected = true;
+      el.appendChild(opt);
+    }
+  }
+
+  function switchAgent(agentId) {
+    if (!agentId) return;
+    QPLog('P3', '切换 agent: ' + agentId);
+    try { localStorage.setItem(agentKey(), agentId); } catch (e) {}
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', 'http://127.0.0.1:8766/agent/set?agent=' + encodeURIComponent(agentId), true);
+    xhr.timeout = 10000;
+    xhr.onload = function () {
+      var ok = false;
+      try { ok = xhr.status === 200 && JSON.parse(xhr.responseText).ok; } catch (e) {}
+      if (ok) {
+        QPLog('P3', 'agent 切换成功，重建会话');
+        ChatUi.addMessage('system', '已切换到 agent「' + agentId + '」，正在重建会话…');
+        // 旧 sessionId 随子进程重启失效：清当前会话状态 + 内存/缓存，重建
+        acpSessionId = null;
+        saveCachedSessionId(currentDocId, null);
+        if (currentDocId && docStates[currentDocId]) {
+          docStates[currentDocId].acpSessionId = null; // P3：防止切走再切回恢复死 session
+        }
+        ChatUi.clear();
+        ChatUi.showEmptyHint();
+        if (acpState === 'connected') ensureSession();
+      } else {
+        QPLog('P3', 'agent 切换失败 HTTP ' + xhr.status);
+        ChatUi.addMessage('error', 'agent 切换失败');
+      }
+    };
+    xhr.onerror = function () {
+      ChatUi.addMessage('error', 'agent 切换失败（bridge 不可达）');
+    };
+    xhr.send();
+  }
+
+  // P14：清空对话按钮（确认弹窗）
+  function bindClearButton() {
+    var btn = document.getElementById('clearBtn');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      if (window.confirm('确定要清空当前对话历史吗？此操作不可恢复。')) {
+        clearCurrentSession();
+      }
+    });
+  }
+
   // 从 bridge /config 拉取确定性配置（wps-mcp 入口等），异步回调；失败时保留兜底值
   function loadBridgeConfig(cb) {
     cb = cb || function () {};
@@ -195,10 +418,34 @@
       onSend: onUserSend,
       onStop: onStop,
       onRetry: onRetry,
-      onRebuild: onRebuild
+      onRebuild: onRebuild,
+      onClearCommand: clearCurrentSession
     });
+    // P3：agent 下拉切换（localStorage 记住）；P14：清空对话按钮
+    var agentSelect = document.getElementById('agentSelect');
+    if (agentSelect) {
+      agentSelect.addEventListener('change', function () {
+        if (agentSelect.value && agentSelect.value !== agentCached) {
+          switchAgent(agentSelect.value);
+        }
+      });
+    }
+    bindClearButton();
+    bindAttachButton(); // P6：附件上传
+    tryAutoExpand();    // P7：自动展开侧边栏（尽力而为）
     // P1：初始状态（启动握手：ACP 连接中 + WPS 未激活）
     updateStatus();
+
+    // P8/P15：确定当前文档 id，恢复该文档的历史消息（前端缓存）
+    currentDocId = getDocId();
+    var cachedMsgs = loadHistory(currentDocId);
+    if (cachedMsgs && cachedMsgs.length) {
+      ChatUi.restore(cachedMsgs);
+      QPLog('P15', '恢复文档 ' + currentDocId + ' 历史 ' + cachedMsgs.length + ' 条');
+    } else {
+      ChatUi.showEmptyHint();
+    }
+    startDocCheck();
 
     // 2. 从 bridge 拉取确定性配置（wps-mcp 入口），完成后再分配 poll 端口 + 连接 ACP，
     //    保证 ensureSession 用到的 MCP_SERVERS 路径已就绪
@@ -214,6 +461,9 @@
         WpsPollClient.start();
         QPLog('main', 'initTaskpane: WpsPollClient.start() 已调用 (poll=' + alloc.port + ')');
       });
+
+      // P3：加载可用 agent 列表（从 bridge /agents），初始化下拉选择
+      loadAgentList();
 
       // 4. ACP 客户端：连接 + 会话管理
       AcpClient.onConnectionChange(onAcpConnChange);
@@ -249,6 +499,28 @@
         // P1：懒启动端口连不上 = 预期行为（首次工具调用后才监听），显示"未激活"，不显示红色"错误"
         ChatUi.setWpsState('pending', 'WPS 未激活');
       }
+    }
+  }
+
+  // ── P7：自动展开侧边栏（尽力而为） ──
+  // WPS 无官方文档化"自动展开 taskpane 到最大宽度" API；CreateTaskPane 不接收宽高参数。
+  // 尽力尝试 ResizeWindow（若存在）。注意：taskpane 的 window.innerWidth 是侧边栏自身宽度，
+  // 不能作为目标宽度参考（否则 30% 会把侧边栏缩得更小）——用屏幕可用宽度估算，且只增不减。
+  function tryAutoExpand() {
+    try {
+      if (typeof window !== 'undefined' && window.Application && typeof window.Application.ResizeWindow === 'function') {
+        var screenW = (typeof window.screen !== 'undefined' && window.screen.availWidth) ? window.screen.availWidth : 1440;
+        var currentW = (typeof window.innerWidth === 'number') ? window.innerWidth : 0;
+        // 目标 = 屏幕的 30%（合理侧边栏宽度），且不小于当前宽度（只展开不缩小）
+        var target = Math.max(320, Math.floor(screenW * 0.3), currentW || 0);
+        var h = window.innerHeight || 800;
+        window.Application.ResizeWindow(target, h);
+        QPLog('P7', '自动展开侧边栏: ' + target + 'x' + h + '（当前 ' + currentW + '）');
+      } else {
+        QPLog('P7', 'WPS 不支持 ResizeWindow，跳过自动展开（平台限制）');
+      }
+    } catch (e) {
+      QPLog('P7', '自动展开失败（平台限制）: ' + (e && e.message ? e.message : e));
     }
   }
 
@@ -304,6 +576,7 @@
     ChatUi.addErrorCard('连接中断', reason + '。可重试当前消息或重建会话。', { retry: true, rebuild: true });
     ChatUi.setStatus('对话中断');
     streamBuffer = '';
+    schedulePersist(); // P15：中断时保留已收到的部分回复
   }
 
   // ── P2：错误卡片按钮动作 ──
@@ -319,7 +592,40 @@
       if (cid !== null) pendingRequests[cid] = { method: 'session/close' };
     }
     acpSessionId = null;
+    saveCachedSessionId(currentDocId, null);
+    if (currentDocId && docStates[currentDocId]) {
+      docStates[currentDocId].acpSessionId = null; // 防切走再切回恢复死 session
+    }
     ensureSession();
+  }
+
+  // ── P13/P14：清空当前会话（/clear 指令 + "清空对话"按钮共用） ──
+  function clearCurrentSession() {
+    QPLog('P14', '清空当前会话 docId=' + currentDocId);
+    if (acpSessionId) {
+      var cid = AcpClient.send('session/close', { sessionId: acpSessionId });
+      if (cid !== null) pendingRequests[cid] = { method: 'session/close' };
+    }
+    acpSessionId = null;
+    saveCachedSessionId(currentDocId, null);
+    ChatUi.clear();
+    ChatUi.showEmptyHint();
+    ChatUi.setStatus('会话已清空');
+    streamBuffer = '';
+    pendingAttachments = []; // P14：清空未发送的待选附件
+    waitingResponse = false;
+    gotFirstChunk = false;
+    clearPromptTimers();
+    lastPromptReqId = null;
+    var cards = pendingToolCards.slice();
+    pendingToolCards = [];
+    for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
+    ChatUi.hideTyping();
+    ChatUi.setInputEnabled(true);
+    ChatUi.setBusy(false);
+    docStates[currentDocId] = { acpSessionId: null, messages: [] };
+    saveHistory(currentDocId, []);
+    if (acpState === 'connected') ensureSession();
   }
 
   // ── P5：中止执行 ──
@@ -343,6 +649,7 @@
     ChatUi.addMessage('system', '已停止');
     ChatUi.setStatus('已停止');
     streamBuffer = '';
+    schedulePersist(); // P15：停止时保留已收到的部分回复
     if (acpSessionId) {
       // qwenpaw acp 支持 cancel 方法（ACP 协议 session/cancel）；若协议不支持也无妨：
       // 已置 waitingResponse=false，后续流式输出一律丢弃（P5 退化路径）。
@@ -365,19 +672,31 @@
     }
   }
 
-  // 连接后创建会话（initialize 由 acp-bridge 无需显式，直接 session/new）
+  // 连接后创建/复用会话（initialize 由 acp-bridge 无需显式）。
+  // P15：同一文档重开时优先 session/load 复用缓存的 sessionId（恢复 AI 上下文记忆），
+  // 无缓存才 session/new。sessionId 按 docId 持久化在 localStorage（qp.session.<docId>）。
   function ensureSession() {
     if (acpSessionId) return;
-    var id = AcpClient.send('session/new', {
+    // 已有在途的 session/new 或 session/load：不重复发送（防 onAcpConnChange 重入/onUserSend 竞态）
+    for (var k in pendingRequests) {
+      if (pendingRequests[k] && (pendingRequests[k].method === 'session/new' || pendingRequests[k].method === 'session/load')) {
+        return;
+      }
+    }
+    var cachedSid = loadCachedSessionId(currentDocId);
+    var method = cachedSid ? 'session/load' : 'session/new';
+    var params = {
       cwd: SESSION_CWD,
       mcpServers: MCP_SERVERS
-    });
+    };
+    if (cachedSid) params.sessionId = cachedSid;
+    var id = AcpClient.send(method, params);
     if (id !== null) {
-      pendingRequests[id] = { method: 'session/new' };
-      QPLog('main', 'ensureSession: 发送 session/new id=' + id + ' (cwd=' + SESSION_CWD + ', mcpServers=' + MCP_SERVERS.length + ')');
-      ChatUi.setStatus('ACP: 创建会话…');
+      pendingRequests[id] = { method: method };
+      QPLog('main', 'ensureSession: 发送 ' + method + ' id=' + id + ' (cwd=' + SESSION_CWD + ', mcpServers=' + MCP_SERVERS.length + (cachedSid ? ', cachedSid=' + cachedSid : '') + ')');
+      ChatUi.setStatus(cachedSid ? 'ACP: 恢复会话…' : 'ACP: 创建会话…');
     } else {
-      QPLog('main', 'ensureSession: session/new 发送失败（未连接）');
+      QPLog('main', 'ensureSession: ' + method + ' 发送失败（未连接）');
     }
   }
 
@@ -387,13 +706,27 @@
     if (!req) return;
     QPLog('main', 'ACP 响应 id=' + id + ' method=' + req.method + (error ? ' error=' + JSON.stringify(error).slice(0, 200) : ''));
 
-    if (req.method === 'session/new') {
+    if (req.method === 'session/new' || req.method === 'session/load') {
       if (error) {
-        ChatUi.setStatus('ACP: 会话创建失败');
-        ChatUi.addMessage('error', '会话创建失败: ' + (error.message || JSON.stringify(error)));
+        if (req.method === 'session/load') {
+          // 旧 sessionId 失效（bridge/qwenpaw 重启）：清缓存回退 session/new，这是预期降级
+          QPLog('P15', 'session/load 失败，清缓存重建: ' + JSON.stringify(error).slice(0, 150));
+          saveCachedSessionId(currentDocId, null);
+          ChatUi.addMessage('system', '上次会话已失效，正在创建新会话…');
+          if (!acpSessionId) ensureSession(); // 回退 session/new
+        } else {
+          ChatUi.setStatus('ACP: 会话创建失败');
+          ChatUi.addMessage('error', '会话创建失败: ' + (error.message || JSON.stringify(error)));
+        }
       } else if (result && result.sessionId) {
         acpSessionId = result.sessionId;
-        QPLog('main', 'session/new 成功 sessionId=' + acpSessionId);
+        saveCachedSessionId(currentDocId, acpSessionId);
+        QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId);
+        ChatUi.setStatus('就绪');
+      } else if (req.method === 'session/load' && loadCachedSessionId(currentDocId)) {
+        // session/load 成功但未返回 sessionId：复用请求时用的缓存 id
+        acpSessionId = loadCachedSessionId(currentDocId);
+        QPLog('P15', 'session/load 成功（未回 sessionId，复用缓存）=' + acpSessionId);
         ChatUi.setStatus('就绪');
       }
     } else if (req.method === 'session/prompt') {
@@ -429,8 +762,10 @@
         }
       }
       streamBuffer = '';
+      schedulePersist(); // P15：本轮结束落盘历史
     } else if (req.method === 'session/close') {
       acpSessionId = null;
+      saveCachedSessionId(currentDocId, null); // P15：关闭会话同步清 sessionId 缓存
       ChatUi.setStatus('ACP: 会话已关闭');
     }
     delete pendingRequests[id];
@@ -459,6 +794,7 @@
         }
         streamBuffer += text;
         ChatUi.appendAssistantChunk(text);
+        schedulePersist(); // P15：流式过程中防抖落盘
       }
     } else if (update.sessionUpdate === 'status_update') {
       // P4：阶段/工具调用状态（qwenpaw 若下发 status_update）；仅进行中请求时处理
@@ -525,8 +861,80 @@
   }
 
   // ── 用户发送 ──
+  // ── P6：附件上传（文件/图片）──
+  // V1 已核实：QwenPaw ACP session/prompt 只提取 prompt 块的 text（_extract_text 无多模态）。
+  // → 文本文件提取为文本原样传给 qwenpaw；图片/二进制暂不支持（占位提示，不假装能看）。
+  function bindAttachButton() {
+    var btn = document.getElementById('attachBtn');
+    var fileInput = document.getElementById('attachFile');
+    if (!btn || !fileInput) return;
+    btn.addEventListener('click', function () {
+      fileInput.click();
+    });
+    fileInput.addEventListener('change', function () {
+      handleAttachFiles(fileInput.files);
+      fileInput.value = '';
+    });
+    // P6-G：粘贴图片识别（剪贴板有图片时提示占位；文本粘贴走默认行为）
+    var input = document.getElementById('input');
+    if (input) {
+      input.addEventListener('paste', function (e) {
+        var items = (e.clipboardData && e.clipboardData.items) || [];
+        for (var i = 0; i < items.length; i++) {
+          if (items[i].type && items[i].type.indexOf('image') === 0) {
+            e.preventDefault();
+            ChatUi.addMessage('system', '已检测到剪贴板图片，但当前 ACP 仅支持文本，暂不能上传图片。请把图片内容粘贴为文字。');
+            return;
+          }
+        }
+      });
+    }
+  }
+
+  function handleAttachFiles(files) {
+    if (!files || !files.length) return;
+    for (var i = 0; i < files.length; i++) {
+      (function (file) {
+        var name = file.name || '附件';
+        if (/\.(png|jpe?g|gif|bmp|webp)$/i.test(name)) {
+          // V1：图片无法原样传 qwenpaw（ACP 无多模态），占位提示
+          ChatUi.addMessage('system', '图片「' + name + '」暂不支持上传（当前 ACP 仅支持文本），请把内容粘贴为文字。');
+          return;
+        }
+        var reader = new FileReader();
+        reader.onload = function () {
+          var text = String(reader.result || '');
+          if (text.length > MAX_ATTACH_TEXT) {
+            text = text.slice(0, MAX_ATTACH_TEXT) + '\n…[内容过长已截断]';
+          }
+          pendingAttachments.push({ name: name, text: text });
+          ChatUi.addMessage('system', '已添加附件：' + name + '（' + text.length + ' 字符）');
+          QPLog('P6', '附件已就绪: ' + name + ' len=' + text.length);
+        };
+        reader.onerror = function () {
+          ChatUi.addMessage('system', '读取附件「' + name + '」失败');
+        };
+        reader.readAsText(file);
+      })(files[i]);
+    }
+  }
+
+  // P6：把主文本 + 附件组装成 prompt blocks（[{"type":"text","text":...}]）
+  function buildPromptBlocks(text) {
+    var blocks = [{ type: 'text', text: text }];
+    for (var i = 0; i < pendingAttachments.length; i++) {
+      var att = pendingAttachments[i];
+      if (!att || att.image) continue;
+      blocks.push({
+        type: 'text',
+        text: '【附件：' + att.name + '】\n' + att.text
+      });
+    }
+    return blocks;
+  }
+
   function onUserSend(text) {
-    QPLog('P2', '用户发送: ' + text.slice(0, 100));
+    QPLog('P2', '用户发送: ' + text.slice(0, 100) + (pendingAttachments.length ? '（附件 ' + pendingAttachments.length + ' 个）' : ''));
     if (!acpSessionId) {
       // 会话未就绪/失效（可能是 bridge 重启导致旧 sessionId 失效）：
       // 主动重建会话并提示用户重发
@@ -540,6 +948,15 @@
     }
     lastUserText = text;
     ChatUi.addMessage('user', text);
+    if (pendingAttachments.length) {
+      for (var a = 0; a < pendingAttachments.length; a++) {
+        if (!pendingAttachments[a].image) {
+          ChatUi.addMessage('system', '附件已随消息发送：' + pendingAttachments[a].name);
+        }
+      }
+      pendingAttachments = [];
+    }
+    schedulePersist();
     waitingResponse = true;
     gotFirstChunk = false;
     ChatUi.setInputEnabled(false);
@@ -550,7 +967,7 @@
     streamBuffer = '';
     var id = AcpClient.send('session/prompt', {
       sessionId: acpSessionId,
-      prompt: [{ type: 'text', text: text }]
+      prompt: buildPromptBlocks(text)
     });
     if (id !== null) {
       lastPromptReqId = id;
@@ -613,6 +1030,32 @@
     getActivePresentation: 'getActivePresentation'
   };
 
+  // P11：需要结构化结果反馈的命令（写操作/有结果的操作；只读查询不刷屏）
+  var FEEDBACK_ACTIONS = {
+    setSelectedText: '替换选中文本',
+    insertText: '插入文本',
+    findReplace: '查找替换',
+    findInDocument: '查找',
+    setFont: '设置字体',
+    setTextColor: '设置文字颜色',
+    setParagraph: '设置段落格式',
+    setLineSpacing: '设置行距',
+    applyStyle: '应用样式',
+    insertTable: '插入表格',
+    insertPageBreak: '插入分页符',
+    insertImage: '插入图片',
+    addComment: '添加批注',
+    insertBookmark: '插入书签',
+    insertHeader: '插入页眉',
+    insertFooter: '插入页脚',
+    generateTOC: '生成目录',
+    insertSectionBreak: '插入分节符',
+    setPageSetup: '设置页面',
+    setCellValue: '写入单元格',
+    save: '保存文档',
+    saveAs: '另存为'
+  };
+
   function onPollCommand(action, params) {
     QPLog('poll', '收到命令 action=' + action + ' params=' + JSON.stringify(params).slice(0, 300));
     var t0 = Date.now();
@@ -632,6 +1075,19 @@
       QPLog('poll', '命令执行抛异常 action=' + action + ' err=' + (e && e.message ? e.message : e));
     }
     QPLog('poll', '命令完成 action=' + action + ' 耗时=' + (Date.now() - t0) + 'ms success=' + result.success + ' error=' + (result.error || ''));
+    // P11：写操作/有结果操作给结构化侧边栏反馈（操作类型 + 结果摘要），只读查询不刷屏
+    if (FEEDBACK_ACTIONS[action] && isTaskpane) {
+      try {
+        if (result && result.success) {
+          var summary = result.data && result.data.summary ? result.data.summary : '';
+          var detail = result.data && result.data.count !== undefined ? '（' + result.data.count + ' 处）' : '';
+          ChatUi.addMessage('system', '✅ ' + FEEDBACK_ACTIONS[action] + (summary ? '：' + summary : '') + detail);
+        } else {
+          ChatUi.addMessage('system', '❌ ' + FEEDBACK_ACTIONS[action] + '失败：' + ((result && result.error) || '未知错误'));
+        }
+        schedulePersist();
+      } catch (e) {}
+    }
     return result;
   }
 

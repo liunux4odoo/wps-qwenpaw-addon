@@ -23,6 +23,7 @@
     <scripts>
         <script src="js/wps-bridge.js"/>
         <script src="js/chat-ui.js"/>
+        <script src="js/markdown.js"/>
         <script src="js/acp-client.js"/>
         <script src="js/wps-poll-client.js"/>
         <script src="js/main.js"/>

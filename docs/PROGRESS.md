@@ -40,6 +40,22 @@
 
 方案见 `docs/DEV-PLAN-Phase3.md`（P1-P15 + UX 验收标准 + 三批优先级）。
 
+- ✅ **批 1（2026-09-03，commit e2733b6）**：P1（状态误报/合并）、P2（中断恢复 + 错误恢复）、P4（过程呈现 + 思考反馈）、P5（中止）
+- ✅ **批 2（2026-09-03，本轮）**：
+  - **P3 agent 选择**：bridge 新增 `/agents`（qwenpaw agent list）+ `/agent/set`（切换重启子进程）；前端下拉选择 + localStorage 记住 + 切换重建会话
+  - **P8 文档隔离**：按 docId 隔离会话状态（`getDocId` 来自 WpsBridge.getActiveDocumentInfo + 周期检测切换）
+  - **P10 Markdown 渲染**：自写 `js/markdown.js` 轻量渲染器（转义安全，子集：标题/加粗/斜体/列表/代码块/行内代码/表格/链接/引用/分隔线），单元测试 14 项全过 + 真实浏览器 XSS 验证通过
+  - **P15 历史对话加载**：localStorage 按 docId 缓存消息历史 + 缓存 sessionId（session/load 恢复 AI 记忆，失败回退 session/new）
+  - **P12 视觉打磨**：空状态引导、消息/工具卡动画、agent 下拉/清空按钮/附件按钮样式、Markdown 内容样式
+- ✅ **批 3（2026-09-03，本轮）**：
+  - **P6 上传/粘贴**：附件按钮（文本提取降级，V1 已核实 ACP 无多模态）+ 粘贴图片占位提示
+  - **P7 自动展开**：尽力 ResizeWindow（WPS 无官方 API，失败静默，记录平台边界）
+  - **P11 操作结果反馈**：写操作后结构化侧边栏反馈（✅/❌ + 结果摘要）
+  - **P13 快捷指令**：`/clear`（清空会话 + 重建）、`/help`、未知指令提示
+  - **P14 清除对话历史**：工具栏"清空对话"按钮 + 确认弹窗（session/close + session/new，同步清前端缓存）
+- ✅ **批 2/3 审查加固（2026-09-03，本轮）**：修复 tryAutoExpand 可能缩小侧边栏（改屏幕宽度 + 只增不减）；agent 切换/重建会话后清 docStates 残留 sessionId；空状态引导在首条消息后移除；Markdown 行内代码内容保护（占位符防加粗/斜体误处理）；错误卡 snapshot 干净提取（不拼按钮文本）；bridge switch_agent 复位重启退避延迟；P8 doc 检测改用轻量 `WpsBridge.getDocIdentity`（避免每 3s 重计数卡 WPS）；session/load 回退文案优化 + ensureSession 防重入
+- 🚧 **待 WPS 实机验证**：批 2/3 的 FE 改动（agent 切换、文档隔离切换、附件、自动展开）需 WPS 实机重开侧边栏端到端验收；P9（excel/ppt 加载）需实机确认 V4（manifest 已含 wps/et/wpp hosts）
+
 ## 部署配套（v0.17 路线 P 强制）
 
 - **POLL_PORT 补丁**：submodule 的 wps-office-mcp 需打 `WPS_POLL_PORT` env 支持补丁后 rebuild（`scripts/install.sh` 自动完成）

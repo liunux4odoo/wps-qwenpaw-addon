@@ -197,6 +197,34 @@ var WpsBridge = (function () {
     }
   }
 
+  /**
+   * 轻量文档标识（P8 文档隔离用）：只读 Name/Path/appType，不读段落/字数等计数。
+   * 供 main.js 周期检测活动文档变化（每 3s 一次），避免在长文档上反复触发昂贵的
+   * Paragraphs/Words/Characters 计数（会卡 WPS）。
+   * @returns {object|null} {name, path, appType}
+   */
+  function getDocIdentity() {
+    try {
+      if (typeof Application === 'undefined' || !Application) return null;
+      var doc = null;
+      try { doc = Application.ActiveDocument; } catch (e) {}
+      if (doc) {
+        try { return { name: doc.Name || '', path: doc.Path || '', appType: 'wps' }; } catch (e) { return null; }
+      }
+      try { doc = Application.ActiveWorkbook; } catch (e) {}
+      if (doc) {
+        try { return { name: doc.Name || '', path: doc.Path || '', appType: 'et' }; } catch (e) { return null; }
+      }
+      try { doc = Application.ActivePresentation; } catch (e) {}
+      if (doc) {
+        try { return { name: doc.Name || '', path: doc.Path || '', appType: 'wpp' }; } catch (e) { return null; }
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // ══════════════════════════════════════════════
   // 阶段 2：编辑命令（Word/WPS 文字为主）
   // ══════════════════════════════════════════════
@@ -1099,6 +1127,7 @@ var WpsBridge = (function () {
     getAppInfo: getAppInfo,
     getAppType: getAppType,
     getActiveDocumentInfo: getActiveDocumentInfo,
+    getDocIdentity: getDocIdentity,
 
     // 阶段 2 编辑命令（轮询命令分发用）
     getActiveDocument: getActiveDocument,

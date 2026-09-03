@@ -838,7 +838,13 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 - **任务清单**：见 `docs/DEV-PLAN-Phase3.md` §1（P1-P15）+ §4 优先级
 - **停止门**：§2.1 的 G1-G6 全部满足 + DEV-PLAN-Phase3.md §5 的 UX1-UX15
-- **进度**：🚧 方案已定（2026-09-03），待实施
+- **进度**（2026-09-03）：
+  - ✅ **批 1**（commit e2733b6）：P1/P2/P4/P5（状态合并/中断恢复/过程呈现/中止）
+  - ✅ **批 2**：P3（agent 选择，bridge `/agents`+`/agent/set`）、P8（文档隔离 docId）、P10（Markdown 渲染，`js/markdown.js`）、P12（视觉）、P15（历史缓存 + session/load）
+  - ✅ **批 3**：P6（附件文本降级 + 粘贴占位，V1 已核实无多模态）、P7（尽力自动展开）、P11（操作结果反馈）、P13（/clear）、P14（清空对话按钮）
+  - ✅ **批 2/3 审查加固**：P8 doc 检测改轻量 `WpsBridge.getDocIdentity`（§3.2 会话按文档隔离的实现配套，避免周期检测触发重计数）；P7 自动展开只增不减；agent 切换清理 docStates 残留 sessionId；桥 switch_agent 复位重启退避
+  - 🚧 **待 WPS 实机验收**：批 2/3 FE 改动端到端；P9 实机确认 V4（manifest 已含 wps/et/wpp hosts）
+- **待验证项更新（2026-09-03 批 2/3 实施中核实）**：V1（QwenPaw ACP 无多模态，`_extract_text` 只取 text 块）→ P6 已按文本提取降级落地；V7（ACP 无 `session/clear`）→ P14 用 `session/close`+`session/new`；P3 用 `qwenpaw agent list` 作为 agent 列表来源
 
 ---
 

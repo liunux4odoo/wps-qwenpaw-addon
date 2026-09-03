@@ -18,7 +18,9 @@ var ChatUi = (function () {
   var onStop = null;
   var onRetry = null;
   var onRebuild = null;
+  var onClearCommand = null;
   var showProcess = true;
+  var md = (typeof MarkdownRenderer !== 'undefined') ? MarkdownRenderer : null;
 
   /**
    * 初始化 UI：缓存 DOM 元素、绑定事件
@@ -42,6 +44,7 @@ var ChatUi = (function () {
       if (opts.onStop) onStop = opts.onStop;
       if (opts.onRetry) onRetry = opts.onRetry;
       if (opts.onRebuild) onRebuild = opts.onRebuild;
+      if (opts.onClearCommand) onClearCommand = opts.onClearCommand;
     }
 
     // P4：显示过程开关（localStorage 持久化，默认开启）
@@ -80,6 +83,8 @@ var ChatUi = (function () {
     var text = els.input.value.trim();
     if (!text) return;
     els.input.value = '';
+    // P13：/ 开头快捷指令由 UI 层消费（/clear 等），不发给 AI
+    if (isCommand(text)) return;
     onSend(text);
   }
 
@@ -96,10 +101,131 @@ var ChatUi = (function () {
   function addMessage(role, text) {
     var el = document.createElement('div');
     el.className = 'msg ' + (role === 'assistant' ? 'assistant' : role === 'user' ? 'user' : role);
-    el.textContent = text;
+    if (role === 'assistant' && md) {
+      // P10：assistant 消息渲染 Markdown（转义安全）；data-raw 存原文供 P15 快照/历史复用
+      el.setAttribute('data-raw', text);
+      el.innerHTML = md.render(text);
+    } else {
+      el.textContent = text;
+    }
+    // P12：首条真实消息到达后移除空状态引导（避免常驻顶部）
+    var hints = els.messages.querySelectorAll('.empty-hint');
+    for (var h = 0; h < hints.length; h++) {
+      var hint = hints[h];
+      if (hint.parentNode) hint.parentNode.removeChild(hint);
+    }
     els.messages.appendChild(el);
     scrollBottom();
     return el;
+  }
+
+  /**
+   * P8/P15：快照当前消息列表（供按 docId 保存/切换）
+   * @returns {Array<{role:string,text:string}>} role: 'user'|'assistant'|'error'|'system'
+   */
+  function snapshot() {
+    var msgs = [];
+    if (!els.messages) return msgs;
+    var nodes = els.messages.querySelectorAll('.msg');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var role = 'system';
+      if (el.className.indexOf('assistant') !== -1) role = 'assistant';
+      else if (el.className.indexOf('user') !== -1) role = 'user';
+      else if (el.className.indexOf('error') !== -1) role = 'error';
+      var text;
+      // P2 错误卡：只取标题+正文（不含按钮文本），避免 textContent 拼出按钮标签
+      if (el.className.indexOf('error-card') !== -1) {
+        var t = el.querySelector('.error-card-title');
+        var b = el.querySelector('.error-card-text');
+        text = (t ? t.textContent : '') + (b && b.textContent ? '：' + b.textContent : '');
+      } else {
+        text = el.getAttribute('data-raw');
+        if (text === null || text === undefined) text = el.textContent;
+      }
+      if (text) msgs.push({ role: role, text: text });
+    }
+    return msgs;
+  }
+
+  /**
+   * P8/P15：恢复消息列表（清空并重渲染）
+   * @param {Array<{role:string,text:string}>} msgs
+   */
+  function restore(msgs) {
+    if (!els.messages) return;
+    els.messages.innerHTML = '';
+    var list = msgs || [];
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (m.role === 'assistant' && md) {
+        var el = document.createElement('div');
+        el.className = 'msg assistant';
+        el.setAttribute('data-raw', m.text);
+        el.innerHTML = md.render(m.text);
+        els.messages.appendChild(el);
+      } else {
+        addMessage(m.role || 'system', m.text);
+      }
+    }
+    scrollBottom();
+  }
+
+  /**
+   * P8/P15：清空消息列表
+   */
+  function clear() {
+    if (els.messages) els.messages.innerHTML = '';
+  }
+
+  /**
+   * P12：空状态引导（无消息时显示，帮助用户上手）
+   */
+  function showEmptyHint() {
+    if (!els.messages) return;
+    if (els.messages.querySelector('.msg')) return;
+    var box = document.createElement('div');
+    box.className = 'empty-hint';
+    var title = document.createElement('div');
+    title.className = 'empty-title';
+    title.textContent = '开始对话';
+    box.appendChild(title);
+    var tips = [
+      '把「foo」改成「bar」',
+      '把第三段润色一下',
+      '给全文加标题',
+      '插入一个 3×4 表格'
+    ];
+    for (var i = 0; i < tips.length; i++) {
+      var tip = document.createElement('div');
+      tip.className = 'empty-tip';
+      tip.textContent = '试试：' + tips[i];
+      box.appendChild(tip);
+    }
+    els.messages.appendChild(box);
+    scrollBottom();
+    return box;
+  }
+
+  /**
+   * P13：处理快捷指令文本（如 /clear）。返回 true 表示已消费（不再作为普通消息发送）。
+   * @param {string} text
+   * @returns {boolean}
+   */
+  function isCommand(text) {
+    if (!text || text.charAt(0) !== '/') return false;
+    var parts = text.trim().split(/\s+/);
+    var cmd = (parts[0] || '').toLowerCase();
+    if (cmd === '/clear') {
+      if (onClearCommand) onClearCommand();
+      return true;
+    }
+    if (cmd === '/help') {
+      addMessage('system', '可用指令：/clear 清空当前会话；/help 帮助');
+      return true;
+    }
+    addMessage('system', '未知指令：' + parts[0] + '（可用 /help 查看）');
+    return true;
   }
 
   /**
@@ -148,7 +274,8 @@ var ChatUi = (function () {
   }
 
   /**
-   * 流式追加：更新最后一条 assistant 消息（无则新建）
+   * 流式追加：更新最后一条 assistant 消息（无则新建）。
+   * P10：流式过程中重新渲染完整累积文本（Markdown 随内容增长实时生效）。
    * @param {string} chunk - 文本增量
    */
   function appendAssistantChunk(chunk) {
@@ -156,7 +283,15 @@ var ChatUi = (function () {
     if (!last || last.className.indexOf('assistant') === -1) {
       last = addMessage('assistant', '');
     }
-    last.textContent += chunk;
+    if (md) {
+      // 累积纯文本（存于 last 的 data-raw 属性），每次重新渲染
+      var raw = last.getAttribute('data-raw') || '';
+      raw += chunk;
+      last.setAttribute('data-raw', raw);
+      last.innerHTML = md.render(raw);
+    } else {
+      last.textContent += chunk;
+    }
     scrollBottom();
   }
 
@@ -316,6 +451,11 @@ var ChatUi = (function () {
     setConnStateText: setConnStateText,
     setWpsState: setWpsState,
     setInputEnabled: setInputEnabled,
-    setBusy: setBusy
+    setBusy: setBusy,
+    snapshot: snapshot,
+    restore: restore,
+    clear: clear,
+    showEmptyHint: showEmptyHint,
+    isCommand: isCommand
   };
 })();
