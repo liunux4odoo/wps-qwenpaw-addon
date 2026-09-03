@@ -58,6 +58,21 @@
 
 ### 变更历史
 
+- **v0.18（code 实施，2026-09-03 已落地，待 WPS 实机验证）**：
+  - **背景**：路线 P 端到端链路已通（qwenpaw 给工具调用建议、审批自动批准、命令推送到加载项角色 B），但所有编辑类工具执行失败——调试日志定位：加载项 `onPollCommand` 只实现 `ping/getActiveDocument/getSelectedText`，其余命令全部回 `未支持的命令: <action>`（§8.3 阶段 1 只读骨架，阶段 2 编辑命令未实施）
+  - **加载项 wps-bridge.js 全面扩展**（阶段 2 编辑能力落地）：
+    - 新增统一响应封装 `ok()/fail()/invalidParam()`（与轮询协议 `/result` 契约一致）
+    - Word 编辑命令：`insertText`（cursor/start/end + 数字位置）、`getDocumentText`（start/end/maxLength）、`getDocumentTextByRange`、`getDocumentParagraphs`、`findReplace`（查找计数 + 批量替换，返回 count）、`findInDocument`（返回位置/段落/上下文）、`smartFillField`、`replaceBookmarkContent`、`setFont`、`setTextColor`、`setParagraph`、`setLineSpacing`、`applyStyle`、`insertTable`、`insertPageBreak`、`insertImage`、`addComment`、`insertBookmark`、`insertHeader`、`insertFooter`、`generateTOC`、`insertSectionBreak`、`setPageSetup`、`getOpenDocuments`、`switchDocument`、`openDocument`、`createDocument`
+    - 通用命令：`save`、`saveAs`、`openFile`、`setSelectedText`（Word 选区替换 + ET 单元格）、`getAppInfo`、`wireCheck`、`getActiveWorkbook`、`getCellValue`、`setCellValue`、`getActivePresentation`
+    - `executeMethod`：wps_execute_method 白名单 `Application.*` 路径解析（与 mcp-server 侧同白名单/黑名单防护）
+  - **加载项 main.js `onPollCommand` 改为分发器**：`POLL_ACTION_MAP`（action → WpsBridge 方法）+ `Application.*` 前缀走 `executeMethod`；未知命令仍回 `未支持的命令`
+  - **数据契约对齐 wps-office-mcp 工具**：`insertText` 回 `{success,message,position,textLength}`、`getDocumentText` 回 `{text,length,truncated,maxLength}`、`findReplace` 回 `{count,findText,replaceText,message}` 等，与 `wps-office-mcp` 各 tool handler 读取字段一一对应（§8.4）
+  - **验证**：Node 模拟 WPS jsapi 环境跑 43 项命令契约测试全过（含 execute_method 白名单/黑名单）；`node --check` 语法通过
+  - **审查加固（2026-09-03，code review 后）**：①`findReplace` Wrap 参数 bug——Replace 模式改 `Replace=1(wdReplaceOne)` + `Wrap=0(wdFindStop)` 逐次替换计数（原先 `wdReplaceAll` 只回布尔导致 count 恒为 1）；查找计数模式 `Wrap` 位置参数改传 0（原先传 1=wdFindContinue 到文末回卷导致死循环冻结 + 计数错误）；②`executeMethod` 收紧——新增 `.Application`/`.Parent` 回引段与 `__proto__`/`constructor`/`prototype` 原型链段拒绝（addon 侧是实际解析执行点，前缀白名单可被 `Application.ActiveDocument.Application.*` 绕过）；③`findInDocument` 段落索引改增量统计（原先每命中从 0 重扫 O(n·m)）；④删除遗留无调用的 `getSelectedText()`
+  - **⚠️ 部署配套（必须）**：`js/main.js` 与 `js/wps-bridge.js` **必须一起**同步到已安装 addon 目录并**完全重启 WPS** 才生效（两者原子耦合：只同步其一会出现 `未支持的命令` 或返回形状错位）：
+    `cp js/main.js js/wps-bridge.js ~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`
+  - **待办**：WPS 实机重开侧边栏端到端验证编辑命令（§8.4 停止门：把"foo"改成"bar"真能改成功）
+
 - **v0.17（code 实施，2026-09-03 已落地，待实机重开侧边栏验证）**：
   - **wps-office-mcp 1 行改动**：`wps-client.ts:46` `const POLL_PORT = Number(process.env.WPS_POLL_PORT) || 58891;`（已 build 到 dist，默认行为不变）
   - **bridge 集中分配端口**（acp-bridge.py 新增职责）：`POST /poll-port/allocate` / `GET /poll-port` / `POST /poll-port/release`（59000+ 段，60s 释放宽限期防残留碰撞）；`session/new`/`session/load` 转发前强制注入 `env.WPS_POLL_PORT`（权威值，ACP schema env 为 `[{name,value}]` 列表）；`session/close` 自动回收；`session/new` 响应补记 `session_id → poll_port`；`/status` 暴露 `ports`/`session_ports`
@@ -786,7 +801,8 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 ### 8.4 阶段 2：编辑能力（核心功能）
 
-- 任务清单：
+- **加载项编辑命令已实现（v0.18，2026-09-03）**：`wps-bridge.js` 新增完整编辑命令集（插入/查找替换/取文本/取段落/字体/颜色/段落/行距/表格/页眉页脚/分节符/页面设置/书签/批注/图片/样式/目录/文档管理/保存/另存/打开/选区替换/单元格读写/演示信息/execute_method 白名单路径），`onPollCommand` 改为分发器；数据契约与 wps-office-mcp 工具对齐（Node 模拟测试 43 项通过）
+- 任务清单（待 WPS 实机验证）：
   1. 验证 wps-office-mcp 的 find_replace 工具能跑通
   2. 验证 set_selected_text 工具能跑通
   3. 验证选区感知链路（用户在 WPS 选中文字 → QwenPaw 知道）

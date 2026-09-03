@@ -310,27 +310,64 @@
   }
 
   // ── 轮询命令处理（角色 B：WPS 操作执行） ──
-  // 阶段 1：只支持只读查询（getActiveDocument / getSelectedText / ping）。
-  // 阶段 2 起扩展编辑动作（findReplace / setSelectedText 等）。
+  // 阶段 2：action -> WpsBridge 方法分发（WPS 操作全部在 wps-bridge.js，此处不写业务逻辑）。
+  // 覆盖 wps-office-mcp 轮询命令契约全集（word/common/excel/ppt + execute_method 白名单路径）。
+  var POLL_ACTION_MAP = {
+    ping: 'ping',
+    wireCheck: 'wireCheck',
+    getAppInfo: 'getAppInfo',
+    getActiveDocument: 'getActiveDocument',
+    getSelectedText: 'getSelectedText',
+    setSelectedText: 'setSelectedText',
+    insertText: 'insertText',
+    getDocumentText: 'getDocumentText',
+    getDocumentTextByRange: 'getDocumentTextByRange',
+    getDocumentParagraphs: 'getDocumentParagraphs',
+    findReplace: 'findReplace',
+    findInDocument: 'findInDocument',
+    smartFillField: 'smartFillField',
+    replaceBookmarkContent: 'replaceBookmarkContent',
+    setFont: 'setFont',
+    setTextColor: 'setTextColor',
+    setParagraph: 'setParagraph',
+    setLineSpacing: 'setLineSpacing',
+    applyStyle: 'applyStyle',
+    insertTable: 'insertTable',
+    insertPageBreak: 'insertPageBreak',
+    insertImage: 'insertImage',
+    addComment: 'addComment',
+    insertBookmark: 'insertBookmark',
+    insertHeader: 'insertHeader',
+    insertFooter: 'insertFooter',
+    generateTOC: 'generateTOC',
+    insertSectionBreak: 'insertSectionBreak',
+    setPageSetup: 'setPageSetup',
+    getOpenDocuments: 'getOpenDocuments',
+    switchDocument: 'switchDocument',
+    openDocument: 'openDocument',
+    createDocument: 'createDocument',
+    save: 'save',
+    saveAs: 'saveAs',
+    openFile: 'openFile',
+    getActiveWorkbook: 'getActiveWorkbook',
+    getCellValue: 'getCellValue',
+    setCellValue: 'setCellValue',
+    getActivePresentation: 'getActivePresentation'
+  };
+
   function onPollCommand(action, params) {
     QPLog('poll', '收到命令 action=' + action + ' params=' + JSON.stringify(params).slice(0, 300));
     var t0 = Date.now();
     var result;
     try {
-      switch (action) {
-        case 'ping':
-          result = { success: true, data: 'pong', error: null };
-          break;
-        case 'getActiveDocument':
-          var doc = WpsBridge.getActiveDocumentInfo();
-          if (!doc) result = { success: false, data: null, error: '无活动文档' };
-          else result = { success: true, data: doc, error: null };
-          break;
-        case 'getSelectedText':
-          result = { success: true, data: WpsBridge.getSelectedText(), error: null };
-          break;
-        default:
-          result = { success: false, data: null, error: '未支持的命令: ' + action };
+      var bridgeMethod = POLL_ACTION_MAP[action];
+      if (bridgeMethod && typeof WpsBridge[bridgeMethod] === 'function') {
+        result = WpsBridge[bridgeMethod](params || {});
+      } else if (action && action.indexOf('Application.') === 0) {
+        // wps_execute_method 白名单路径（如 Application.ActiveDocument.Content.Text）
+        result = WpsBridge.executeMethod(action, params || {});
+      } else {
+        result = { success: false, data: null, error: '未支持的命令: ' + action };
       }
     } catch (e) {
       result = { success: false, data: null, error: '执行异常: ' + (e && e.message ? e.message : e) };
