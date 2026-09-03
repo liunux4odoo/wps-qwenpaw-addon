@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WPS QwenPaw AI</title>
+    <link rel="stylesheet" href="css/taskpane.css">
+    <script>
+    // 诊断探针：taskpane 页面一旦加载就 XHR 到 :58891（WPS 沙箱已信任），
+    // 通过 :58891 连接变化确认 taskpane 页面是否真的被加载执行。
+    (function () {
+        try {
+            var x = new XMLHttpRequest();
+            x.open('GET', 'http://127.0.0.1:58891/status', true);
+            x.timeout = 3000;
+            x.send();
+        } catch (e) {}
+    })();
+    </script>
+</head>
+<body>
+    <div id="app">
+        <header id="header">
+            <span id="title">QwenPaw AI</span>
+            <span id="statusDot" class="status-dot" title="连接状态"></span>
+        </header>
+
+        <div id="messages" class="messages"></div>
+
+        <div id="toolbar" class="toolbar">
+            <span id="toolStatus" class="tool-status">WPS 桥: --</span>
+        </div>
+
+        <div id="inputArea" class="input-area">
+            <textarea id="input" rows="3" placeholder="输入指令，如：把第三段润色一下…"></textarea>
+            <button id="sendBtn" class="send-btn">发送</button>
+        </div>
+    </div>
+
+    <script src="js/acp-client.js"></script>
+    <script src="js/wps-bridge.js"></script>
+    <script src="js/chat-ui.js"></script>
+    <script src="js/wps-poll-client.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>

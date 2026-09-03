@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ACP Bridge 测试页</title>
+<style>
+  body { font-family: monospace; margin: 20px; }
+  #log { white-space: pre-wrap; background: #f5f5f5; padding: 10px; height: 400px; overflow-y: auto; border: 1px solid #ccc; }
+  .row { margin: 8px 0; }
+  input, button { padding: 6px; }
+  input { width: 60%; }
+  .sent { color: #0066cc; }
+  .recv { color: #008800; }
+  .err { color: #cc0000; }
+  .chunk { color: #993300; }
+</style>
+</head>
+<body>
+<h3>ACP Bridge 测试页（ws://127.0.0.1:8765）</h3>
+<div class="row">
+  <button id="btnConnect">连接</button>
+  <button id="btnNew">session/new</button>
+  <button id="btnLoad">session/load</button>
+  <button id="btnClose">session/close</button>
+  <span id="status">未连接</span>
+</div>
+<div class="row">
+  <input id="msgInput" placeholder="输入消息…">
+  <button id="btnSend">发送 (session/prompt)</button>
+</div>
+<div id="log"></div>
+
+<script>
+let ws = null;
+let seq = 0;
+let sessionId = null;
+const log = (text, cls = '') => {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = text;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+};
+const send = (method, params) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log('未连接', 'err'); return null; }
+  const id = ++seq;
+  ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  log(`>> ${method} id=${id}`, 'sent');
+  return id;
+};
+const connect = () => {
+  ws = new WebSocket('ws://127.0.0.1:8765');
+  ws.onopen = () => { log('连接成功', 'recv'); document.getElementById('status').textContent = '已连接'; };
+  ws.onclose = () => { log('连接关闭'); document.getElementById('status').textContent = '已断开'; };
+  ws.onerror = (e) => log('WS 错误: ' + e, 'err');
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { log('非JSON: ' + ev.data, 'err'); return; }
+    if (msg.method === 'session/update') {
+      const upd = (msg.params || {}).update || {};
+      if (upd.sessionUpdate === 'agent_message_chunk') {
+        const t = (upd.content || {}).text || '';
+        if (t) log(t, 'chunk');
+      } else {
+        log(`<< update: ${upd.sessionUpdate}`, 'recv');
+      }
+    } else if (msg.id) {
+      if (msg.error) {
+        log(`<< error ${msg.id}: ${JSON.stringify(msg.error)}`, 'err');
+      } else {
+        log(`<< result ${msg.id}: ${JSON.stringify(msg.result).slice(0, 300)}`, 'recv');
+        if (msg.method === 'session/new' && msg.result && msg.result.sessionId) {
+          sessionId = msg.result.sessionId;
+          log(`  sessionId = ${sessionId}`, 'recv');
+        }
+      }
+    } else {
+      log(`<< ${ev.data}`, 'recv');
+    }
+  };
+};
+
+document.getElementById('btnConnect').onclick = () => { if (ws) ws.close(); connect(); };
+document.getElementById('btnNew').onclick = () => send('session/new', { cwd: '/tmp/kilo', mcpServers: [] });
+document.getElementById('btnLoad').onclick = () => send('session/load', { sessionId, cwd: '/tmp/kilo', mcpServers: [] });
+document.getElementById('btnClose').onclick = () => send('session/close', { sessionId });
+document.getElementById('btnSend').onclick = () => {
+  const text = document.getElementById('msgInput').value;
+  if (!text) return;
+  send('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
+  document.getElementById('msgInput').value = '';
+};
+</script>
+</body>
+</html>

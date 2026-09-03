@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
+  <ribbon startFromScratch="false">
+    <tabs>
+      <tab id="qwenpawTab" label="QwenPaw AI" insertAfterMso="TabHome">
+        <group id="qwenpawMain" label="AI 助手">
+          <button id="btnShowTaskPane"
+                  label="AI 侧边栏"
+                  size="large"
+                  onAction="OnShowTaskPane"
+                  imageMso="Addins"
+                  supertip="打开/切换 AI 对话侧边栏"/>
+          <button id="btnStatus"
+                  label="状态"
+                  size="large"
+                  onAction="OnStatusClick"
+                  imageMso="Info"
+                  supertip="查看 AI 助手连接状态"/>
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
