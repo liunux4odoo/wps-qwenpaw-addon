@@ -34,6 +34,7 @@ Wire 协议（阶段 0.5 实测，ACP v0.12.2）：
 
 用法：
   python acp-bridge.py [--port 8765] [--http-port 8766] [--agent default] [--host 127.0.0.1]
+                       [--ui-root <插件仓库根>] [--wps-mcp-entry <dist/index.js 绝对路径>]
 """
 from __future__ import annotations
 
@@ -80,13 +81,18 @@ MIME_TYPES = {
 
 class AcpBridge:
     def __init__(self, port: int = 8765, http_port: int = 8766, agent: str = "default", host: str = "127.0.0.1",
-                 ui_root: str | None = None, log_file: str | None = None):
+                 ui_root: str | None = None, log_file: str | None = None, wps_mcp_entry: str | None = None):
         self.port = port
         self.http_port = http_port
         self.agent = agent
         self.host = host
         # 静态文件根目录（加载项 UI 文件，/ui/* 映射）：默认插件仓库根（bridge/ 的上一级）
         self.ui_root = ui_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # wps-office-mcp 入口（dist/index.js）：依赖 opencode-wps 作为 submodule 固定在
+        # <仓库根>/third_party/opencode-wps/wps-office-mcp/，故默认路径可确定；可 --wps-mcp-entry 覆盖。
+        self.wps_mcp_entry = (wps_mcp_entry
+                              or os.path.join(self.ui_root, "third_party", "opencode-wps",
+                                              "wps-office-mcp", "dist", "index.js"))
         # 调试日志文件（None = 只写 stdout）
         self.log_file = log_file
         # 连接集与路由表
@@ -532,6 +538,14 @@ class AcpBridge:
                     payload["ports"] = dict(self._port_allocated)
                     payload["session_ports"] = dict(self._session_port)
                 await self._http_json(writer, 200, payload)
+            elif path == "/config":
+                # 加载项侧确定性配置：wps-office-mcp 入口由 bridge 依据仓库根解析，
+                # 不依赖客户端机器上的硬编码绝对路径（submodule 固定后可确定）。
+                await self._http_json(writer, 200, {
+                    "wpsMcpEntry": self.wps_mcp_entry,
+                    "pollPortStart": POLL_PORT_START,
+                    "pollPortEnd": POLL_PORT_END,
+                })
             elif path == "/poll-port/allocate" and method == "POST":
                 port = self._allocate_port(client_id)
                 if port is not None:
@@ -672,9 +686,11 @@ def main() -> None:
     ap.add_argument("--agent", default="default")
     ap.add_argument("--ui-root", default=None, help="加载项 UI 静态文件根目录（/ui/* 映射），默认插件仓库根")
     ap.add_argument("--log-file", default=None, help="调试日志文件路径（默认只写 stdout）")
+    ap.add_argument("--wps-mcp-entry", default=None,
+                    help="wps-office-mcp 入口 dist/index.js 绝对路径（默认 <ui-root>/third_party/opencode-wps/wps-office-mcp/dist/index.js）")
     args = ap.parse_args()
     asyncio.run(AcpBridge(port=args.port, http_port=args.http_port, agent=args.agent, host=args.host,
-                          ui_root=args.ui_root, log_file=args.log_file).run())
+                          ui_root=args.ui_root, log_file=args.log_file, wps_mcp_entry=args.wps_mcp_entry).run())
 
 
 if __name__ == "__main__":

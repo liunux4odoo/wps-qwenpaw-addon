@@ -1,0 +1,43 @@
+# AGENTS.md
+
+面向 code agent 的最小项目指引。**完整开发规则见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)，架构见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。**
+
+## Project
+
+WPS 加载项（侧边栏）+ QwenPaw 智能体集成：用户在 WPS 里用自然语言让 AI 协助编辑 Word/Excel/PPT。三层 + 双角色（详见 docs/ARCHITECTURE.md §3）。
+
+```
+WPS (加载项 taskpane, HTTP轮询 :8766) ── acp-bridge (HTTP/WS↔stdio) ── qwenpaw acp (ACP)
+    │  (角色B, HTTP轮询 poll端口)                                   └─ wps-office-mcp (MCP stdio, 每session一个)
+    └── wps-office-mcp 的反向轮询端点（加载项是执行代理）
+```
+
+## Key Commands
+
+```bash
+./scripts/install.sh                          # 一键安装/配置（submodule+build+补丁+noop+同步+起bridge）
+git submodule update --init --recursive       # 拉取 third_party/opencode-wps
+conda run -n py312 python bridge/acp-bridge.py --agent default   # 前台启动 bridge
+conda run -n py312 python -m py_compile bridge/acp-bridge.py     # 语法检查 bridge
+node --check js/main.js                       # 语法检查加载项 JS（其余模块同理）
+```
+
+## Architecture (critical)
+
+- **硬约束**（不允许动）：见 docs/ARCHITECTURE.md §6。wps-office-mcp 零 fork（唯一例外：`WPS_POLL_PORT` env 支持，1 行加法）；acp-bridge 纯传输层不实现 ACP 业务逻辑；只绑 `127.0.0.1`；文档操作必须经 QwenPaw→MCP→wps-mcp。
+- **入口**：`js/main.js` 是唯一耦合点（知道所有模块，其他模块互不依赖）。
+- **wps 路线 P**：每 ACP session 一个 wps-mcp 子进程，bridge 集中分配 `WPS_POLL_PORT`（59000+），多窗口并发合法（docs/ARCHITECTURE.md §13）。
+- **WPS Linux 沙箱**：只放行 HTTP，拦 WebSocket → 加载项走 HTTP 短轮询（bridge :8766）；CreateTaskPane 只能 HTTP URL（bridge /ui/* 托管）。
+
+## Dependencies
+
+- `third_party/opencode-wps/` 是 **submodule**（固定提交 6b8b33c）。**不要**把 POLL_PORT 补丁/noop 部署提交进 submodule 的 git（见 docs/DEPENDENCIES.md）。
+- wps-office-mcp 需 build 后才有 `dist/index.js`；安装脚本负责 build + 打补丁 + noop 部署。
+
+## Gotchas
+
+1. `js/main.js` 与 `js/wps-bridge.js` 必须**一起**同步到安装目录并完全重启 WPS（原子耦合）
+2. WPS 需打开文档后 CEF 加载项引擎才启动（工具才可执行）
+3. `:58891` 是 wps-mcp 懒启动端口，「WPS 桥: 重连中」是预期行为
+4. 加载项 MCP 入口路径经 bridge `GET /config` 下发（`wpsMcpEntry`），不要硬编码本机绝对路径
+5. 架构层决策变更必须先回 discuss agent，code agent 不得自行修改

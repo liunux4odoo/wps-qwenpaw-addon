@@ -30,15 +30,21 @@
   }
   window.QPLog = QPLog;
 
+  // bridge /config 下发的 wps-mcp 入口；未取到前的兜底值（仅当 bridge 不可达时使用，
+  // 正常运行时由 /config 返回的绝对路径覆盖——bridge 依据仓库根解析 submodule 路径）
+  var WPS_MCP_ENTRY_DEFAULT = '../third_party/opencode-wps/wps-office-mcp/dist/index.js';
+
   // wps-office-mcp MCP 服务器（§5.1 + §13 v0.17 路线 P）：
   // 走 stdio（QwenPaw 每 ACP session spawn 独立 wps-mcp 子进程），bridge 集中分配独立 poll 端口
   // （WPS_POLL_PORT env 注入，59000+ 段，多窗口并发不抢 :58891、不串台）。
   // env 是 [{name,value}] 列表（ACP schema: McpServerStdio.env = List[EnvVariable]），
   // 端口值由 bridge /poll-port/allocate 分配后覆盖（bridge 转发 session/new 时也会强制注入权威值）。
+  // 入口路径不硬编码本机绝对路径：由 bridge /config 下发（bridge 依据仓库根解析，
+  // opencode-wps 以 submodule 固定在 third_party/opencode-wps/，路径可确定）。
   var MCP_SERVERS = [{
     name: 'wps',
     command: 'node',
-    args: ['/data/myrepo/opencode-wps/wps-office-mcp/dist/index.js'],
+    args: [WPS_MCP_ENTRY_DEFAULT],
     env: [{ name: 'WPS_POLL_PORT', value: '58891' }]
   }];
 
@@ -135,6 +141,36 @@
     } catch (e) {}
   }
 
+  // 从 bridge /config 拉取确定性配置（wps-mcp 入口等），异步回调；失败时保留兜底值
+  function loadBridgeConfig(cb) {
+    cb = cb || function () {};
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', 'http://127.0.0.1:8766/config', true);
+      xhr.timeout = 3000;
+      xhr.onload = function () {
+        if (xhr.status === 200) {
+          try {
+            var r = JSON.parse(xhr.responseText);
+            if (r && r.wpsMcpEntry) {
+              MCP_SERVERS[0].args = [r.wpsMcpEntry];
+              QPLog('main', 'bridge /config 下发 wpsMcpEntry: ' + r.wpsMcpEntry);
+            }
+          } catch (e) {}
+        } else {
+          QPLog('main', 'bridge /config 拉取失败 HTTP ' + xhr.status);
+        }
+        cb();
+      };
+      xhr.onerror = function () { QPLog('main', 'bridge /config 网络错误'); cb(); };
+      xhr.ontimeout = function () { QPLog('main', 'bridge /config 超时'); cb(); };
+      xhr.send();
+    } catch (e) {
+      QPLog('main', 'bridge /config 异常: ' + (e && e.message ? e.message : e));
+      cb();
+    }
+  }
+
   // ══════════════════════════════════════════════
   // taskpane 上下文：聊天 + ACP + 轮询
   // ══════════════════════════════════════════════
@@ -143,26 +179,30 @@
     // 1. 聊天 UI
     ChatUi.init({ onSend: onUserSend });
 
-    // 2. 路线 P：异步分配 poll 端口（与 ACP 连接并行）。bridge 是唯一分配者且幂等：
-    //    即使 session/new 先于分配完成发出，bridge 也会按该 client 幂等分配同一端口，无竞态。
-    allocatePollPort(function (alloc) {
-      WpsPollClient.init({
-        serverUrl: 'http://127.0.0.1:' + alloc.port,
-        handler: onPollCommand,
-        onStatus: onPollStatus
+    // 2. 从 bridge 拉取确定性配置（wps-mcp 入口），完成后再分配 poll 端口 + 连接 ACP，
+    //    保证 ensureSession 用到的 MCP_SERVERS 路径已就绪
+    loadBridgeConfig(function () {
+      // 3. 路线 P：异步分配 poll 端口（与 ACP 连接并行）。bridge 是唯一分配者且幂等：
+      //    即使 session/new 先于分配完成发出，bridge 也会按该 client 幂等分配同一端口，无竞态。
+      allocatePollPort(function (alloc) {
+        WpsPollClient.init({
+          serverUrl: 'http://127.0.0.1:' + alloc.port,
+          handler: onPollCommand,
+          onStatus: onPollStatus
+        });
+        WpsPollClient.start();
+        QPLog('main', 'initTaskpane: WpsPollClient.start() 已调用 (poll=' + alloc.port + ')');
+        ChatUi.setStatus('WPS 桥: 轮询中');
       });
-      WpsPollClient.start();
-      QPLog('main', 'initTaskpane: WpsPollClient.start() 已调用 (poll=' + alloc.port + ')');
-      ChatUi.setStatus('WPS 桥: 轮询中');
-    });
 
-    // 3. ACP 客户端：连接 + 会话管理
-    AcpClient.onConnectionChange(onAcpConnChange);
-    AcpClient.onResponse(onAcpResponse);
-    AcpClient.onSessionUpdate(onAcpSessionUpdate);
-    AcpClient.onRequest(onAcpRequest);
-    AcpClient.connect();
-    QPLog('main', 'initTaskpane: AcpClient.connect() 已调用');
+      // 4. ACP 客户端：连接 + 会话管理
+      AcpClient.onConnectionChange(onAcpConnChange);
+      AcpClient.onResponse(onAcpResponse);
+      AcpClient.onSessionUpdate(onAcpSessionUpdate);
+      AcpClient.onRequest(onAcpRequest);
+      AcpClient.connect();
+      QPLog('main', 'initTaskpane: AcpClient.connect() 已调用');
+    });
   }
 
   // ── ACP 连接状态 ──

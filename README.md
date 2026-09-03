@@ -1,76 +1,70 @@
-# wps-qwenpaw-addon
+# WPS-QwenPaw AI 助手
 
-WPS 加载项（侧边栏）+ QwenPaw 智能体集成。
+在 WPS 里用自然语言让 AI 帮你编辑 Word / Excel / PPT 文档，体验类似 Cursor。
 
-用户在 WPS 写作时通过侧边栏对话界面，用自然语言让 AI 协助编辑 Word/Excel/PPT 文档，实现类似 Cursor 的体验。
+直接在 WPS 侧边栏对话，AI（QwenPaw）会调用 WPS 的 MCP 工具完成文档读写、查找替换、排版、插图、批注等操作。
 
-## 架构
+## 特性
 
-**三层 + 双角色**，详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+- 🗨️ **侧边栏对话** — 在 WPS 里打开「QwenPaw AI」侧边栏，用自然语言下达指令
+- 📝 **文档编辑** — AI 经 wps-office-mcp 直接读写文档（插入文本、查找替换、设置字体/段落、插入表格/图片、批注/书签/页眉页脚/TOC 等 40+ 命令）
+- 🎯 **支持三端** — Word / Excel / PPT（manifest 声明 wps/et/wpp）
+- 🔌 **跨进程架构** — acp-bridge 桥接 WPS 加载项与 QwenPaw（ACP 协议），wps-office-mcp 作为 MCP 工具执行文档操作
 
-## 项目结构
+## 快速开始
 
-```
-wps-qwenpaw-addon/
-├── README.md                ← 你在这里
-├── manifest.xml             ← WPS 加载项清单（已实现）
-├── ribbon.xml               ← WPS 功能区（QwenPaw AI 标签）
-├── index.html               ← WPS Linux 加载项入口页（已实现）
-├── taskpane.html            ← 侧边栏 UI 骨架（已实现）
-├── bridge/                  ← ACP 桥接服务（已实现，阶段 0.5/1）
-│   ├── acp-bridge.py        ← HTTP/WebSocket ↔ stdio 双向转发桥（HTTP :8766 + WS :8765）
-│   ├── test_bridge.py       ← Python 自动化端到端验证脚本（WebSocket）
-│   └── test-page.html       ← 浏览器手动测试页
-├── js/                      ← 加载项 JS 模块（已实现）
-│   ├── acp-client.js        ← ACP 协议客户端（HTTP 轮询 transport）
-│   ├── wps-bridge.js        ← WPS JS API 轻量封装
-│   ├── chat-ui.js           ← 聊天界面渲染
-│   ├── wps-poll-client.js   ← wps-office-mcp 轮询执行端
-│   └── main.js              ← 入口胶水层
-├── css/
-│   └── taskpane.css         ← 样式
-└── docs/
-    └── ARCHITECTURE.md      ← 完整架构方案（v0.7）
+```bash
+# 1. 克隆（含 submodule）
+git clone --recurse-submodules <repo-url>
+cd wps-qwenpaw-addon
+
+# 2. 一键安装（环境自检 + 构建 + 部署 + 启动）
+./scripts/install.sh
 ```
 
-## 文档索引
+> 环境要求：Linux、WPS Office（Linux 版）、Node.js ≥ 18、Python 3.12、QwenPaw v2.1.0。完整步骤见 **[docs/INSTALL.md](docs/INSTALL.md)**。
+
+安装完成后：
+
+1. 启动 WPS 并打开一个文档
+2. 功能区点击 **QwenPaw AI** → **AI 侧边栏**
+3. 输入指令，如：「把第三段润色一下」
+
+## 文档
 
 | 文档 | 说明 |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 完整开发方案 v0.7 — 目标、架构、约束、验收、阶段划分 |
+| [docs/INSTALL.md](docs/INSTALL.md) | 安装部署全流程（含一键脚本说明） |
+| [docs/README.md](docs/README.md) | 文档中心索引 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 完整架构方案（开发者） |
+| [docs/PROGRESS.md](docs/PROGRESS.md) | 开发阶段与当前状态 |
 
-## 开发方案的维护规则
+## 架构速览
 
-- 架构层决策的变更 **必须先回到 discuss agent 重启讨论**，不能由 code agent 自行修改
-- code agent 实施时如发现某条约束不可行，**先暂停、再讨论**，不要绕过
-- 方案版本在 `docs/ARCHITECTURE.md` §0 记录
+```
+WPS 加载项 (taskpane)
+   │   HTTP 短轮询 :8766（ACP 聊天通道）
+   ▼
+acp-bridge ──▶ qwenpaw acp（智能体，stdio）
+   │   MCP stdio（每会话一个 wps-mcp 子进程，WPS_POLL_PORT 59000+）
+   ▼
+wps-office-mcp ──反向轮询──▶ WPS 加载项（角色 B，执行代理）
+```
 
-## 相关项目
+- **acp-bridge**：传输层桥（HTTP/WS ↔ stdio），连接 WPS 与 QwenPaw
+- **qwenpaw acp**：智能体后端（记忆、技能、工具调用循环）
+- **wps-office-mcp**：WPS 操作 MCP Server（v1.5.2，14 直连工具 + 250+ Gateway 工具），作为 submodule 固定在 `third_party/opencode-wps/`
 
-- [opencode-wps/wps-office-mcp](/data/myrepo/opencode-wps/wps-office-mcp) — WPS 操作的 MCP Server 实现（v1.5.2，14 个直连工具 + 250+ Gateway 工具）
-- QwenPaw — 智能体后端（记忆、技能、工具调用循环）
+## 相关项目与版本
 
-## 当前状态
+| 项目 | 版本/提交 | 说明 |
+|---|---|---|
+| [opencode-wps](https://github.com/lnxsun/opencode-wps) | `6b8b33c`（submodule） | 内含 wps-office-mcp |
+| wps-office-mcp | v1.5.2 | WPS 操作 MCP Server |
+| QwenPaw | v2.1.0 | 智能体后端 |
 
-**方案版本 v0.17**（阶段 0/0.5/1 代码完成；wps MCP 路线 P 已落地，待 WPS 实机重开侧边栏端到端验证）
+详细依赖与补丁说明见 [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md)。
 
-**阶段 0：环境验证 ✅ 已完成（2026-08-28）**
+## License
 
-实测结论（详见 docs/ARCHITECTURE.md §8.1）：
-1. ✅ **:58891 回环打通**：通过 QwenPaw 触发 `ai-developer` 调 WPS 工具，wps-office-mcp 懒启动 :58891，`getDocumentText` 返回真实文档内容
-2. ✅ **轮询协议逆向完成**：`/poll`（500ms）、`/result`、`/status`、CORS `*`、单槽位、30s 超时、去重、退避（§3.3）
-3. ✅ **manifest 加载机制验证**：`authwebsite.xml` 是 WPS 的 allowedOrigins 等价机制；须打开文档才启动 CEF 加载项引擎
-4. ✅ **QwenPaw MCP 挂载验证**：`ai-developer` agent 已挂 wps-office-mcp（14 个直连工具 + Gateway 全部 enabled）
-
-**阶段 0.5：ACP 桥接服务 ✅ 已完成（2026-08-28）**
-
-- ✅ 实现 `bridge/acp-bridge.py`（HTTP :8766 + WebSocket :8765 ↔ qwenpaw acp stdio 双向转发 + sessionId 路由 + 子进程崩溃重启）
-- ✅ 端到端验证通过：initialize → session/new → session/prompt 流式 → 断线重连 + session/load 会话不丢 → session/close → 子进程崩溃自动重启（§8.2）
-- ✅ ACP wire 协议实测定论：NDJSON 帧、`session/prompt` 发消息、`session/update` 通知流式（§3.4/§8.2）
-
-**阶段 1：加载项骨架 ✅ 代码完成，路线 P 已落地，待 WPS 实机重开侧边栏验收（2026-08-28 → 2026-09-03）**
-
-- ✅ 加载项 8 文件 + index.html 入口页全部实现（manifest/ribbon/taskpane/css + 5 个 js 模块）
-- ✅ **架构实测发现**：WPS Linux 沙箱拦截 WebSocket（:8765），只放行 HTTP（:58891）→ ACP 传输层改 **HTTP 短轮询**（acp-bridge :8766），Python 侧端到端验证通过（§3.3/§3.4）
-- ✅ **wps MCP 路线 P 落地（v0.17，2026-09-03）**：wps-mcp 支持 `WPS_POLL_PORT` env（1 行）+ bridge 集中分配 poll 端口（59000+，`/poll-port/*` + session/new 注入 + close 回收）+ 加载项 stdio mcpServers + 轮询分配端口；Python 端到端验证通过（详见 docs/ARCHITECTURE.md §0 v0.17）
-- 🚧 **待办**：WPS 实机重开侧边栏端到端验收（路线 P 多窗口并发）；noop 脚本部署确认（§5.1.1）
+MIT

@@ -52,12 +52,32 @@
 
 ## §0 文档元信息
 
-- **方案版本**：v0.17（wps MCP 路线 P：多实例多端口，2026-09-03）
-- **上一里程碑**：v0.16 完成 http 化（已实现并验证）；v0.17 经多窗口并发分析发现 http 化不解命令串台，决策转向**路线 P**（每 session 独立 wps-mcp + 独立 poll 端口，bridge 集中分配），http 化方案被取代；待 WPS 实机重开侧边栏后端到端验证
+- **方案版本**：v0.22（阶段 3 方案补 P14/P15，2026-09-03）
+- **上一里程碑**：v0.21 阶段 3 方案 A-G 直接整合进 P 系列（DEV-PLAN-Phase3.md v1.2）；v0.22 按用户补充新增 P14（清除对话历史）/ P15（同一文档加载历史对话记录），DEV-PLAN-Phase3.md v1.3；**P15 已核实与 ACP 会话历史不重复**——`session/load` 恢复 AI 上下文记忆（后端，qwenpaw session state JSON 落盘），ACP 无拉取消息明文接口，前端历史显示需自缓存（localStorage 按 doc_id）
 - **变更控制**：任何架构层决策的修改需回到 discuss agent 重启讨论
 
 ### 变更历史
 
+- **v0.22（阶段 3 方案补 P14/P15，2026-09-03）**：
+  - **P14 清除对话历史**（用户补充）：UI 入口（"清空对话"按钮 + 确认），区别于 P13 `/clear` 快捷指令；清空动作 = 前端清 + 后端 `session/close`+`session/new`（V7 待验证有无 `session/clear`）
+  - **P15 同一文档加载历史对话记录**（用户补充，已核实不重复）：`session/load` = AI 上下文记忆恢复（后端，qwenpaw session state JSON 落盘，key=session_id+user_id=`acp_{id[:8]}`+channel=""）；ACP 协议无拉取消息明文接口（server 方法仅 new/load/list/resume/close/prompt/cancel/set_session_model/set_config_option）；**前端历史显示需自缓存**（localStorage 按 doc_id），不扩展 bridge 读 qwenpaw 内部存储（守 §6.1 铁律）
+  - **连带**：UX 扩至 UX1-UX15；待验证项 V1-V7（新增 V7 有无 session/clear）；批 2 加 P15、批 3 加 P14；DEV-PLAN-Phase3.md v1.2→v1.3
+- **v0.21（阶段 3 方案重构，2026-09-03）**：
+  - **A-G 直接整合进 P 系列**：按用户决策（"该补充的补充，该修正的修正，该增加的增加"），DEV-PLAN-Phase3.md v1.1→v1.2，删除独立 §1.5「打磨方向全景」，A-G 全部并入 P1-P13
+  - **并入**：B（思考反馈）→P4、C（工具可视化）→P4、D（错误恢复）→P2、G 粘贴图片→P6、G 多轮上下文→P8
+  - **新增**：A→P10（Markdown）、E→P11（操作反馈）、F→P12（视觉）、G 快捷指令→P13（/clear）
+  - **§2 改为来源追踪表**：原 §8.5 4 项 + A-G 7 方向 → P1-P13 去向映射
+  - **验收/待验证同步**：UX1-UX13 引用更新为 P 编号；V6 影响任务 E→P11
+- **v0.20（阶段 3 方案扩展，2026-09-03）**：
+  - **合并打磨方向 A-G**：DEV-PLAN-Phase3.md v1.0→v1.1，新增 §1.5「打磨方向全景（A-G）」（A Markdown 渲染 / B 思考反馈 / C 工具可视化 / D 错误引导 / E 操作反馈 / F 视觉 / G 交互）
+  - **新增独立新项**：A（Markdown 渲染，零依赖约束下需评估 vendored marked 或自写子集）、E（操作结果反馈，文档内定位依赖 V6）、F（视觉打磨）
+  - **重叠项并入**：B→P4/P5、C→P4、D→P2、G→P3/P6（各补独立验收）
+  - **UX 验收扩展**：UX1-UX8 → UX1-UX13（新增 UX9 Markdown/UX10 进行中反馈/UX11 操作反馈/UX12 视觉/UX13 快捷指令）
+  - **待验证项扩展**：V1-V5 → V1-V6（新增 V6 wps-bridge 定位命令）
+- **v0.19（文档拆分，2026-09-03）**：
+  - **阶段 3 方案独立**：从本文档 §8.5 拆分，扩展为 `docs/DEV-PLAN-Phase3.md`（v1.0）——含用户反馈 9 项问题（P1-P9：状态误报/中断恢复/agent 选择/过程折叠/中止/上传/自动展开/文档隔离/三端加载）、原 §8.5 4 项打磨（流式优化/错误 UI/文档隔离/工具状态条）合并映射、后续多 ACP 后端计划（F1）、待验证项 V1-V5、UX 验收标准 UX1-UX8、三批优先级
+  - **§8.5 精简**：原任务清单移入新文档，本节点保留进度状态 + 指向新文档
+  - **部署**：acp-bridge 侧新增 `/poll-port/*` 分配端点（v0.17 路线 P 配套，§5.1.1）
 - **v0.18（code 实施，2026-09-03 已落地，待 WPS 实机验证）**：
   - **背景**：路线 P 端到端链路已通（qwenpaw 给工具调用建议、审批自动批准、命令推送到加载项角色 B），但所有编辑类工具执行失败——调试日志定位：加载项 `onPollCommand` 只实现 `ping/getActiveDocument/getSelectedText`，其余命令全部回 `未支持的命令: <action>`（§8.3 阶段 1 只读骨架，阶段 2 编辑命令未实施）
   - **加载项 wps-bridge.js 全面扩展**（阶段 2 编辑能力落地）：
@@ -520,7 +540,7 @@ wps-office-mcp 通过 **ACP 的 `session/new` mcpServers 动态注入**（每 se
     {
       "name": "wps",
       "command": "node",
-      "args": ["/data/myrepo/opencode-wps/wps-office-mcp/dist/index.js"],
+      "args": ["<仓库根>/third_party/opencode-wps/wps-office-mcp/dist/index.js"],
       "env": [
         { "name": "WPS_POLL_PORT", "value": "<bridge 分配的唯一端口>" }
       ]
@@ -528,6 +548,8 @@ wps-office-mcp 通过 **ACP 的 `session/new` mcpServers 动态注入**（每 se
   ]
 }
 ```
+
+> **入口路径（submodule 化后）**：opencode-wps 作为 git submodule 固定在 `<仓库根>/third_party/opencode-wps/`，路径可确定。加载项不硬编码本机绝对路径——由 acp-bridge `GET /config` 下发 `wpsMcpEntry`（bridge 依据其 ui_root 解析），`js/main.js` 在 `initTaskpane` 时拉取并填入 mcpServers。`--wps-mcp-entry` 可覆盖。
 
 > **schema 注意（实测）**：ACP `McpServerStdio` 的 `env` 是 **`[{name,value}]` 列表**（`acp/schema.py` `McpServerStdio.env: List[EnvVariable]`），不是 dict；且**没有** `transport`/`type` 字段（http/sse 型才有 `type:"http"|"sse"` + `url`，stdio 靠 `command`+`args`+`env` 判别）。上文早期版本把 env 写成 dict、加 `transport` 字段是**文档笔误**，以这里为准。
 
@@ -546,10 +568,11 @@ wps-office-mcp 通过 **ACP 的 `session/new` mcpServers 动态注入**（每 se
 1. 部署 noop 脚本到 wps-office-mcp 期望的固定路径：
 
    ```bash
-   # 复制 noop 脚本（详见 §12.2.2）
-   cp /data/myrepo/wps-qwenpaw-addon/scripts/wps-auto-noop.sh \
-      /data/myrepo/opencode-wps/opencode-wps-linux/wps-auto.sh
-   chmod +x /data/myrepo/opencode-wps/opencode-wps-linux/wps-auto.sh
+   # 复制 noop 脚本（详见 §12.2.2；install.sh 自动完成）
+   # <仓库根> 即 wps-qwenpaw-addon 仓库根（submodule 位于其下 third_party/opencode-wps/）
+   cp <仓库根>/scripts/wps-auto-noop.sh \
+      <仓库根>/third_party/opencode-wps/opencode-wps-linux/wps-auto.sh
+   chmod +x <仓库根>/third_party/opencode-wps/opencode-wps-linux/wps-auto.sh
    ```
 
 2. **路径说明**：`linux-poll-server.ts:24-29` 硬编码 `LINUX_SWITCH_SCRIPT = path.join(__dirname, '../../../opencode-wps-linux/wps-auto.sh')`，**wps-mcp 不提供配置开关**，只能替换这个文件
@@ -810,12 +833,12 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 ### 8.5 阶段 3：体验打磨（MVP 验收）
 
-- 任务清单：
-  1. 流式输出优化
-  2. 错误提示 UI
-  3. 多文档会话隔离
-  4. 工具状态条
-- **停止门**：§2.1 的 G1-G6 全部满足
+> **已独立为文档**：`docs/DEV-PLAN-Phase3.md`（2026-09-03，v1.3）——打磨项统一清单 P1-P15（用户反馈 9 项 + 前端打磨方向 A-G 直接整合 + 用户补充 P14 清除对话历史 / P15 历史对话加载）+ 后续多 ACP 后端计划 + 待验证项 V1-V7 + UX 验收标准 UX1-UX15；来源追踪见该文档 §2。
+> 本小节仅保留进度状态。
+
+- **任务清单**：见 `docs/DEV-PLAN-Phase3.md` §1（P1-P15）+ §4 优先级
+- **停止门**：§2.1 的 G1-G6 全部满足 + DEV-PLAN-Phase3.md §5 的 UX1-UX15
+- **进度**：🚧 方案已定（2026-09-03），待实施
 
 ---
 
@@ -944,10 +967,11 @@ esac
 **部署命令**：
 
 ```bash
-# 1. 复制到 wps-mcp 期望的固定路径（hardcoded in linux-poll-server.ts:24-29）
-cp /data/myrepo/wps-qwenpaw-addon/scripts/wps-auto-noop.sh \
-   /data/myrepo/opencode-wps/opencode-wps-linux/wps-auto.sh
-chmod +x /data/myrepo/opencode-wps/opencode-wps-linux/wps-auto.sh
+# 1. 复制到 wps-mcp 期望的固定路径（hardcoded in linux-poll-server.ts:24-29；install.sh 自动完成）
+#    <仓库根> 即 wps-qwenpaw-addon 仓库根（submodule 位于其下 third_party/opencode-wps/）
+cp <仓库根>/scripts/wps-auto-noop.sh \
+   <仓库根>/third_party/opencode-wps/opencode-wps-linux/wps-auto.sh
+chmod +x <仓库根>/third_party/opencode-wps/opencode-wps-linux/wps-auto.sh
 ```
 
 **延迟成本分析**：
