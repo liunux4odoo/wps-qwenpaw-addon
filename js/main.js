@@ -14,7 +14,8 @@
   'use strict';
 
   var ACP_WS_URL = 'ws://127.0.0.1:8765';
-  var SESSION_CWD = '/tmp/kilo'; // QwenPaw ACP session 工作目录（阶段 1 固定，后续按文档项目目录）
+  // P16：QwenPaw ACP session 工作目录——默认兜底；实际用当前活动文档目录（getSessionCwd()）
+  var SESSION_CWD = '/tmp/kilo';
 
   // ── 统一调试日志：console.log + POST 到 bridge /debug/log（持久化，WPS CEF 崩溃时也能在 bridge 日志看到） ──
   function QPLog(tag, msg) {
@@ -55,6 +56,7 @@
   var isTaskpane = !!document.getElementById('messages');
   var acpSessionId = null;
   var streamBuffer = ''; // 当前流式消息的累积文本
+  var preamblePending = false; // P16：新会话（session/new 成功）待注入环境上下文 preamble（仅首条 prompt 注入一次）
   var waitingResponse = false; // 是否有 in-flight 请求（禁止并发发送）
   var pendingRequests = {}; // requestId -> { method, text }
   var ribbonUI = null;
@@ -109,6 +111,55 @@
   }
 
   function historyKey(docId) { return 'qp.history.' + (docId || 'default'); }
+
+  // ── P16：WPS 活动文档环境上下文（session bootstrap）──
+  // 从 WpsBridge 读取轻量文档身份 {name, path, appType}（与 getDocId 同源，只读不触发计数）。
+  function getDocEnvContext() {
+    try {
+      if (typeof WpsBridge !== 'undefined' && WpsBridge.getDocIdentity) {
+        return WpsBridge.getDocIdentity();
+      }
+      if (typeof WpsBridge !== 'undefined' && WpsBridge.getActiveDocumentInfo) {
+        return WpsBridge.getActiveDocumentInfo();
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // P16：session/new / session/load 的 cwd = 当前活动文档目录（doc.Path）；无路径回退默认
+  function getSessionCwd() {
+    var info = getDocEnvContext();
+    if (info && info.path) return info.path;
+    return SESSION_CWD;
+  }
+
+  // P16：构建环境上下文 preamble（独立文本块，仅进 ACP prompt、不进用户气泡）
+  // 契约：文档类型（appType）/ 完整路径（未保存标注"未保存的新文档"）/ 工作目录 + 三条行为规则。
+  // 无活动文档 → 返回 null（优雅降级：不发 preamble、不崩溃）。
+  function buildPreamble() {
+    var info = getDocEnvContext();
+    if (!info) return null;
+    var appTypeLabel = {
+      wps: 'Word/WPS 文字',
+      et: 'Excel/WPS 表格',
+      wpp: 'PowerPoint/WPS 演示'
+    }[info.appType] || info.appType || '文档';
+    var name = info.name || '未命名文档';
+    var saved = !!(info.path);
+    var fullPath = saved ? (info.path.replace(/\/+$/, '') + '/' + name) : null;
+    var pathDesc = saved ? fullPath : '（未保存的新文档）';
+    var cwd = info.path || SESSION_CWD;
+    return '【当前工作环境】（自动注入的环境上下文，请据此工作）\n'
+      + '文档类型：' + appTypeLabel + '\n'
+      + '文档名称：' + name + '\n'
+      + '文档路径：' + pathDesc + '\n'
+      + '工作目录：' + cwd + '\n\n'
+      + '行为规则：\n'
+      + '1. 对文档做任何修改前，先读取文档当前状态，不要假设内容；\n'
+      + '2. 本会话只围绕当前打开的活动文档工作，不要自行打开其他文档；\n'
+      + '3. 同目录下的周边文档可按路径检索，但默认以当前文档为工作中心。';
+  }
+
   function sessionKey(docId) { return 'qp.session.' + (docId || 'default'); }
   function agentKey() { return 'qp.agent'; }
 
@@ -151,7 +202,8 @@
     if (!currentDocId) return;
     docStates[currentDocId] = {
       acpSessionId: acpSessionId,
-      messages: ChatUi.snapshot()
+      messages: ChatUi.snapshot(),
+      preamblePending: preamblePending // P16：随文档保存待注入标记（新会话未发首条前切走再切回不丢）
     };
     saveHistory(currentDocId, ChatUi.snapshot());
   }
@@ -183,11 +235,13 @@
     if (st && st.messages && st.messages.length) {
       ChatUi.restore(st.messages);
       acpSessionId = st.acpSessionId || null;
+      preamblePending = !!st.preamblePending; // P16：恢复该文档待注入标记
     } else {
       var hist = loadHistory(docId);
       ChatUi.restore(hist);
       if (!hist.length) ChatUi.showEmptyHint();
       acpSessionId = null;
+      preamblePending = false; // P16：新文档状态，由 session/new 成功后再置位
     }
     QPLog('P8', '切换到文档 ' + docId + '，恢复会话=' + acpSessionId + ' 历史条数=' + (ChatUi.snapshot().length));
     ChatUi.setStatus(acpSessionId ? '就绪' : '加载会话…');
@@ -732,15 +786,16 @@
     }
     var cachedSid = loadCachedSessionId(currentDocId);
     var method = cachedSid ? 'session/load' : 'session/new';
+    var cwd = getSessionCwd(); // P16：cwd = 当前活动文档目录；无路径回退默认
     var params = {
-      cwd: SESSION_CWD,
+      cwd: cwd,
       mcpServers: MCP_SERVERS
     };
     if (cachedSid) params.sessionId = cachedSid;
     var id = AcpClient.send(method, params);
     if (id !== null) {
       pendingRequests[id] = { method: method };
-      QPLog('main', 'ensureSession: 发送 ' + method + ' id=' + id + ' (cwd=' + SESSION_CWD + ', mcpServers=' + MCP_SERVERS.length + (cachedSid ? ', cachedSid=' + cachedSid : '') + ')');
+      QPLog('main', 'ensureSession: 发送 ' + method + ' id=' + id + ' (cwd=' + cwd + ', mcpServers=' + MCP_SERVERS.length + (cachedSid ? ', cachedSid=' + cachedSid : '') + ')');
       ChatUi.setStatus(cachedSid ? 'ACP: 恢复会话…' : 'ACP: 创建会话…');
     } else {
       QPLog('main', 'ensureSession: ' + method + ' 发送失败（未连接）');
@@ -768,11 +823,14 @@
       } else if (result && result.sessionId) {
         acpSessionId = result.sessionId;
         saveCachedSessionId(currentDocId, acpSessionId);
-        QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId);
+        // P16：仅 session/new 的新会话在首条 prompt 注入环境上下文；session/load（重开文档）不注入
+        preamblePending = (req.method === 'session/new');
+        QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId + (preamblePending ? '（待注入环境上下文）' : ''));
         ChatUi.setStatus('就绪');
       } else if (req.method === 'session/load' && loadCachedSessionId(currentDocId)) {
         // session/load 成功但未返回 sessionId：复用请求时用的缓存 id
         acpSessionId = loadCachedSessionId(currentDocId);
+        preamblePending = false; // P16：load 不注入
         QPLog('P15', 'session/load 成功（未回 sessionId，复用缓存）=' + acpSessionId);
         ChatUi.setStatus('就绪');
       }
@@ -1022,9 +1080,22 @@
     ChatUi.showTyping('思考中…');
     pendingToolCards = [];
     streamBuffer = '';
+    var blocks = buildPromptBlocks(text);
+    // P16：新会话（session/new）首条 prompt 注入环境上下文 preamble（独立文本块，不进用户气泡）；
+    // 仅注入一次；session/load（重开文档）不注入；无活动文档优雅降级（跳过不崩溃）。
+    if (preamblePending) {
+      var pre = buildPreamble();
+      preamblePending = false; // 无论是否取到文档，仅尝试注入一次
+      if (pre) {
+        blocks.unshift({ type: 'text', text: pre });
+        QPLog('P16', '已向新会话注入环境上下文 preamble（blocks=' + blocks.length + '）');
+      } else {
+        QPLog('P16', '无活动文档，跳过环境上下文注入（优雅降级）');
+      }
+    }
     var id = AcpClient.send('session/prompt', {
       sessionId: acpSessionId,
-      prompt: buildPromptBlocks(text)
+      prompt: blocks
     });
     if (id !== null) {
       lastPromptReqId = id;
