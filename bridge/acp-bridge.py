@@ -59,6 +59,14 @@ log = logging.getLogger("acp-bridge")
 
 MAX_POLL_BATCH = 200
 
+# ── agent 切换竞态修复（docs/plan-2026-09-04-agent-switch-mcp-race-fix.md）─────────────
+# 根因 1 修复：切换 agent 后 /agent/set 返回 ok 之前等待新 qwenpaw acp 子进程 spawn 就绪，
+# 期间上行消息不静默丢弃（排队转发）；两者都有上限，crash loop 不无限挂起。
+SWITCH_READY_TIMEOUT = 8.0    # switch_agent 等新子进程就绪超时（前端 /agent/set XHR 超时 10s，留余量）
+UPSTREAM_QUEUE_MAX = 512      # 上行排队条数上限（异常积压时丢最旧，防内存失控）
+UPSTREAM_QUEUE_MAX_BYTES = 8 * 1024 * 1024  # 上行排队字节预算（覆盖超大单条消息，双上限）
+UPSTREAM_QUEUE_TTL = 30.0     # 排队消息最长等待秒数（超时丢弃，前端看门狗+重试兜底）
+
 # ── stdio reader 行缓冲（docs/plan-2026-09-03-bridge-stdout-reader-fix.md）──────────────────
 # asyncio StreamReader.readline 默认行缓冲上限 64KB：qwenpaw 工具大返回值（如 getActiveDocument
 # 文档全文）作为单行 JSON 超限时 readline 抛 ValueError → reader 任务崩溃 → 下行永久断。
@@ -175,6 +183,12 @@ class AcpBridge:
         # 子进程
         self.proc: asyncio.subprocess.Process | None = None
         self._restart_delay = 1.0
+        # 根因 1：新 qwenpaw acp 子进程 spawn 就绪信号 + 上行排队（stdin 不可用时不静默丢弃）
+        self._proc_started = asyncio.Event()
+        self._restart_seq = 0             # 递增即唤醒 _wait_proc 的在途退避等待（switch_agent 用）
+        self._upstream_queue: deque[tuple[str, str | None, float]] = deque()  # (raw, client_id, enqueue_time)
+        self._upstream_bytes = 0          # 排队总字符数（字节预算防护，配合条数上限）
+        self._flushing = False
         # P3：agent 列表缓存（qwenpaw agent list 启动开销约 8s，TTL 缓存避免每次 /agents 都慢）
         self._agents_cache: list[dict] = []
         self._agents_cached_at: float = 0.0
@@ -308,6 +322,8 @@ class AcpBridge:
     def _inject_poll_port(self, raw: str, client_id: str | None) -> str:
         """路线 P：session/new / session/load 转发前，把 wps mcpServer 的 env.WPS_POLL_PORT
         设为该 client 的分配端口（权威值，覆盖加载项自带值，保证唯一防串台）。
+        根因 2：同时把该 server 的 args[0] 强制为 bridge 解析的 wpsMcpEntry 绝对路径
+        （权威值，覆盖前端可能传入的相对路径/旧路径，杜绝"相对路径 spawn 失败 -> 无工具"）。
         返回（可能被修改的）raw。ACP schema：env 是 [{name,value}] 列表。"""
         if not client_id:
             return raw
@@ -333,29 +349,35 @@ class AcpBridge:
                 continue
             if server.get("command") is None:
                 continue  # 非 stdio（http/sse）不注入，也不占用端口
+            # 根因 2：权威 wps-mcp 入口路径（bridge 依据仓库根解析的 submodule 绝对路径）
+            if self.wps_mcp_entry:
+                args = server.get("args")
+                if not isinstance(args, list) or not args or args[0] != self.wps_mcp_entry:
+                    server["args"] = [self.wps_mcp_entry]
+                    modified = True
+                    log.info("inject authoritative wpsMcpEntry=%s (client=%s)", self.wps_mcp_entry, client_id)
             # 只有确认要注入 wps stdio server 时才分配端口（避免 http 型 session 白白占端口）
             port = self._port_allocated.get(client_id)
             if port is None:
                 port = self._allocate_port(client_id)
-            if port is None:
-                return raw
-            self._touch_client(client_id)
-            env = server.get("env")
-            if not isinstance(env, list):
-                env = []
-                server["env"] = env
-            found = False
-            for item in env:
-                if isinstance(item, dict) and item.get("name") == "WPS_POLL_PORT":
-                    item["value"] = str(port)
-                    found = True
-                    break
-            if not found:
-                env.append({"name": "WPS_POLL_PORT", "value": str(port)})
-            modified = True
-            sid = params.get("sessionId")
-            if sid:
-                self._session_port[str(sid)] = port
+            if port is not None:
+                self._touch_client(client_id)
+                env = server.get("env")
+                if not isinstance(env, list):
+                    env = []
+                    server["env"] = env
+                found = False
+                for item in env:
+                    if isinstance(item, dict) and item.get("name") == "WPS_POLL_PORT":
+                        item["value"] = str(port)
+                        found = True
+                        break
+                if not found:
+                    env.append({"name": "WPS_POLL_PORT", "value": str(port)})
+                modified = True
+                sid = params.get("sessionId")
+                if sid:
+                    self._session_port[str(sid)] = port
             break
         if modified:
             return json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
@@ -493,11 +515,23 @@ class AcpBridge:
         # 主动切换 = 有意重启：复位退避延迟，避免此前多次崩溃把 _restart_delay 推到 30s，
         # 导致 agent 切换后 qwenpaw acp 迟迟不拉起来。
         self._restart_delay = 1.0
+        # 根因 1：递增 _restart_seq 唤醒 _wait_proc 的在途退避等待（若正处 crash loop 退避睡眠），
+        # 让新 agent 尽快 spawn；再重置就绪事件等待新子进程 spawn 完成（kill 后 _wait_proc 会 set）。
+        self._restart_seq += 1
+        self._proc_started = asyncio.Event()
         if self.proc:
             try:
                 self.proc.kill()
             except Exception:
                 pass
+        # 根因 1：返回 ok 前等待新 qwenpaw acp 子进程 spawn 就绪（stdin 可写），
+        # 避免前端立即 session/new 落在"stdin 不可用"窗口被丢弃。
+        # 有上限：crash loop 时不无限挂起；超时返回 ok，由上行排队 + 前端超时重试兜底。
+        try:
+            await asyncio.wait_for(self._proc_started.wait(), timeout=SWITCH_READY_TIMEOUT)
+            log.info("switch_agent: 新 qwenpaw acp 子进程就绪 (agent=%s)", agent_id)
+        except asyncio.TimeoutError:
+            log.warning("switch_agent: 等待新子进程就绪超时（%.0fs），由上行排队+前端重试兜底", SWITCH_READY_TIMEOUT)
         return True, ""
 
     async def start_proc(self) -> None:
@@ -513,6 +547,14 @@ class AcpBridge:
         asyncio.create_task(self._stdout_reader())
         asyncio.create_task(self._stderr_reader())
         asyncio.create_task(self._wait_proc())
+        # 根因 1：新子进程已 spawn（stdin 可写），唤醒 switch_agent 的就绪等待；
+        # 并排空切换期间排队的上行消息（顺序转发，见 _flush_upstream）。
+        self._proc_started.set()
+        asyncio.create_task(self._flush_upstream())
+
+    def _proc_ready(self) -> bool:
+        """qwenpaw acp 子进程 stdin 是否可写（spawn 完成即可写，消息由 qwenpaw 缓冲处理）。"""
+        return bool(self.proc and self.proc.stdin and not self.proc.stdin.is_closing())
 
     async def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
@@ -544,7 +586,11 @@ class AcpBridge:
         rc = await self.proc.wait()
         log.error("qwenpaw acp exited rc=%s, restarting in %.1fs", rc, self._restart_delay)
         self.proc = None
-        await asyncio.sleep(self._restart_delay)
+        # 退避等待可被 switch_agent 提前唤醒（_restart_seq 递增即退出），agent 切换不必等满整个退避。
+        seq = self._restart_seq
+        deadline = time.monotonic() + self._restart_delay
+        while time.monotonic() < deadline and self._restart_seq == seq:
+            await asyncio.sleep(0.05)
         self._restart_delay = min(self._restart_delay * 2, 30.0)
         try:
             await self.start_proc()
@@ -634,10 +680,102 @@ class AcpBridge:
 
     # ── 上行写入（前端 -> stdio） ──────────────────────────────────
     async def _write_stdin(self, raw: str, client_id: str | None = None) -> bool:
-        if not self.proc or not self.proc.stdin or self.proc.stdin.is_closing():
-            log.error("qwenpaw acp stdin unavailable, dropping message")
+        """把一条上行 ACP 消息写入 qwenpaw acp stdin。
+
+        根因 1 修复：stdin 不可用（agent 切换 kill 后/重启中）时**不静默丢弃**——
+        排入 _upstream_queue，待新子进程 spawn 后按顺序转发；排队有 TTL 上限，
+        超时丢弃由前端看门狗+重试兜底。排队期间保持全局 FIFO 转发顺序（多窗口不串台）。
+        """
+        if self._upstream_queue or not self._proc_ready():
+            self._enqueue_upstream(raw, client_id)
+            asyncio.create_task(self._flush_upstream())
+            return True
+        try:
+            return await self._write_stdin_now(raw, client_id)
+        except Exception:
+            # 直连写失败（如 _proc_ready 检查后子进程恰好退出）：不静默丢弃，转入排队等待新子进程
+            if not self._proc_ready():
+                self._enqueue_upstream(raw, client_id)
+                asyncio.create_task(self._flush_upstream())
+                return True
+            log.error("upstream write failed, dropping message (client=%s)", client_id or "ws")
             return False
-        # 路线 P：session/new 注入 WPS_POLL_PORT；session/close 回收端口
+
+    def _enqueue_upstream(self, raw: str, client_id: str | None) -> None:
+        """把上行消息排入 _upstream_queue（条数/字节双上限；同 client 的旧 session/new|load 被新的取代时丢弃）。
+
+        丢弃同 client 的旧 session/new|session/load：崩溃恢复/看门狗重试期间会连续出现多条
+        会话建立请求，只留最新一条，防止恢复后重复建会话抢占同一 poll 端口（守根因 1 目标）。
+        """
+        method = self._queue_method(raw)
+        if client_id and method in ("session/new", "session/load"):
+            new_q = deque()
+            dropped = False
+            for old_raw, old_cid, old_t in self._upstream_queue:
+                if old_cid == client_id and self._queue_method(old_raw) in ("session/new", "session/load"):
+                    self._upstream_bytes -= len(old_raw)
+                    dropped = True
+                    continue
+                new_q.append((old_raw, old_cid, old_t))
+            if dropped:
+                log.info("upstream: 丢弃同 client 的旧 %s（剩余 %d queued）", method, len(new_q))
+            self._upstream_queue = new_q
+        self._upstream_queue.append((raw, client_id, time.monotonic()))
+        self._upstream_bytes += len(raw)
+        while self._upstream_queue and (
+                len(self._upstream_queue) > UPSTREAM_QUEUE_MAX
+                or self._upstream_bytes > UPSTREAM_QUEUE_MAX_BYTES):
+            old_raw, old_cid, _ = self._upstream_queue.popleft()
+            self._upstream_bytes -= len(old_raw)
+            log.warning("upstream queue overflow (count=%d bytes=%d), dropped oldest client=%s",
+                        len(self._upstream_queue), self._upstream_bytes, old_cid)
+        log.warning("qwenpaw acp stdin unavailable, queued %d upstream message(s) (client=%s)",
+                    len(self._upstream_queue), client_id or "ws")
+
+    @staticmethod
+    def _queue_method(raw: str) -> str | None:
+        """提取排队消息的 ACP method（解析失败返回 None）。"""
+        try:
+            m = json.loads(raw).get("method")
+            return str(m) if m else None
+        except Exception:
+            return None
+
+    async def _flush_upstream(self) -> None:
+        """把排队中的上行消息按顺序转发到 qwenpaw acp（_flushing 守卫保证同一时刻只有
+        一个排空者，保持全局 FIFO：排队消息先于其后到达的新消息转发）。"""
+        if self._flushing:
+            return
+        self._flushing = True
+        try:
+            while self._upstream_queue:
+                raw, client_id, t = self._upstream_queue.popleft()
+                self._upstream_bytes -= len(raw)
+                if time.monotonic() - t > UPSTREAM_QUEUE_TTL:
+                    log.warning("upstream queued message expired (>%.0fs), dropped (client=%s)",
+                                UPSTREAM_QUEUE_TTL, client_id or "ws")
+                    continue
+                if not self._proc_ready():
+                    # 排空过程中子进程又不可用：放回队首保持顺序，等下次触发
+                    self._upstream_queue.appendleft((raw, client_id, t))
+                    self._upstream_bytes += len(raw)
+                    return
+                try:
+                    await self._write_stdin_now(raw, client_id)
+                except Exception:
+                    # 写失败（flush 期间子进程又退出）：放回队首保序，等下次触发重发，不丢消息、不中断排空
+                    if not self._proc_ready():
+                        self._upstream_queue.appendleft((raw, client_id, time.monotonic()))
+                        self._upstream_bytes += len(raw)
+                        return
+                    log.error("upstream write failed, dropped message (client=%s)", client_id or "ws")
+        finally:
+            self._flushing = False
+
+    async def _write_stdin_now(self, raw: str, client_id: str | None = None) -> bool:
+        """实际写 stdin（前置条件：proc stdin 可写）。含 poll 端口/入口路径权威注入与
+        请求归属登记。调用方保证顺序（_write_stdin 排队 / _flush_upstream 顺序转发）。"""
+        # 路线 P：session/new 注入 WPS_POLL_PORT；session/close 回收端口；wpsMcpEntry 权威路径注入
         raw = self._inject_poll_port(raw, client_id)
         log.info("upstream[%s]: %s", client_id or "ws", self._summarize_acp(raw))
         # 记录请求归属（多窗口同 id 靠转发顺序去重，见 _pop_request_owner）

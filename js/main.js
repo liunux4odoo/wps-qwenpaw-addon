@@ -31,9 +31,11 @@
   }
   window.QPLog = QPLog;
 
-  // bridge /config 下发的 wps-mcp 入口；未取到前的兜底值（仅当 bridge 不可达时使用，
-  // 正常运行时由 /config 返回的绝对路径覆盖——bridge 依据仓库根解析 submodule 路径）
-  var WPS_MCP_ENTRY_DEFAULT = '../third_party/opencode-wps/wps-office-mcp/dist/index.js';
+  // bridge /config 下发前的 wps-mcp 入口占位。**相对路径/占位值永不实际用于 spawn**：
+  // ① ensureSession 门禁：wpsMcpEntryReady 之前不发 session/new（不携带相对路径去 spawn）；
+  // ② bridge 转发 session/new 时权威注入绝对路径（_inject_poll_port，覆盖任何前端值）。
+  // 正常运行时由 /config 返回的绝对路径覆盖（bridge 依据仓库根解析 submodule 路径）。
+  var WPS_MCP_ENTRY_DEFAULT = null;
 
   // wps-office-mcp MCP 服务器（§5.1 + §13 v0.17 路线 P）：
   // 走 stdio（QwenPaw 每 ACP session spawn 独立 wps-mcp 子进程），bridge 集中分配独立 poll 端口
@@ -45,7 +47,7 @@
   var MCP_SERVERS = [{
     name: 'wps',
     command: 'node',
-    args: [WPS_MCP_ENTRY_DEFAULT],
+    args: WPS_MCP_ENTRY_DEFAULT ? [WPS_MCP_ENTRY_DEFAULT] : [],
     env: [{ name: 'WPS_POLL_PORT', value: '58891' }]
   }];
 
@@ -60,6 +62,18 @@
   var waitingResponse = false; // 是否有 in-flight 请求（禁止并发发送）
   var pendingRequests = {}; // requestId -> { method, text }
   var ribbonUI = null;
+
+  // ── 会话建立看门狗（plan-2026-09-04 根因 1 路线 B）──
+  // session/new（或 session/load）发出后超时：清 pending 防锁死 + 自动重试 ≤1 次；
+  // 仍失败则用户可见错误，绝不永久卡在"ACP: 创建会话…"。
+  var SESSION_TIMEOUT_MS = 25000; // 必须盖过 bridge 切换后 qwenpaw 重启就绪时间（实测 ≥8s）+ 余量
+  var sessionRetries = 0;         // 当前逻辑会话建立的重试次数（上限 1，见 onSessionTimeout）
+  var sessionTimer = null;        // 会话建立看门狗定时器
+
+  // ── bridge /config 权威配置门禁（plan-2026-09-04 根因 2）──
+  var wpsMcpEntryReady = false;  // MCP_SERVERS[0].args 已由 /config 下发权威绝对路径
+  var bridgeConfigErrorShown = false; // 错误卡片只展示一次（恢复后再失败可再次展示）
+  var configFetching = false;    // 是否有在途的 /config 拉取链（防重复触发）
 
   // ── 阶段 3 批 1：P1 状态合并 / P2 中断恢复 / P4 过程呈现 / P5 中止 ──
   // P2 v1.4（docs/DEV-PLAN-Phase3.md §1 P2）：看门狗阈值按实测分层——
@@ -459,30 +473,59 @@
   // 从 bridge /config 拉取确定性配置（wps-mcp 入口等），异步回调；失败时保留兜底值
   function loadBridgeConfig(cb) {
     cb = cb || function () {};
+    var attempts = 0;
+    var delays = [1000, 3000, 5000]; // /config 重试间隔（bridge 冷启动/繁忙时可能慢）
+    function attempt() {
+      fetchBridgeConfig(function () {
+        cb();
+      }, function (reason) {
+        QPLog('main', 'bridge /config 拉取失败: ' + reason + (attempts < delays.length ? '，重试' : ''));
+        if (attempts < delays.length) {
+          var d = delays[attempts];
+          attempts++;
+          setTimeout(attempt, d);
+        } else {
+          // 根因 2：多次拉取失败 → 可见错误（不静默保留相对路径去 spawn）
+          if (!bridgeConfigErrorShown) {
+            bridgeConfigErrorShown = true;
+            ChatUi.addMessage('error', 'bridge 配置获取失败（WPS 工具不可用）：请确认 acp-bridge 已启动后重试。');
+          }
+          cb();
+        }
+      });
+    }
+    attempt();
+  }
+
+  // 单次拉取 /config 并把权威 wpsMcpEntry（绝对路径）写入 MCP_SERVERS。
+  // onSuccess()：成功（已更新 MCP_SERVERS，wpsMcpEntryReady=true）；onFail(reason)：本次尝试失败。
+  function fetchBridgeConfig(onSuccess, onFail) {
+    onFail = onFail || function () {};
     try {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', 'http://127.0.0.1:8766/config', true);
-      xhr.timeout = 3000;
+      xhr.timeout = 4000;
       xhr.onload = function () {
         if (xhr.status === 200) {
           try {
             var r = JSON.parse(xhr.responseText);
             if (r && r.wpsMcpEntry) {
               MCP_SERVERS[0].args = [r.wpsMcpEntry];
+              wpsMcpEntryReady = true;
+              bridgeConfigErrorShown = false; // 配置恢复后允许后续失败再次提示
               QPLog('main', 'bridge /config 下发 wpsMcpEntry: ' + r.wpsMcpEntry);
+              if (onSuccess) onSuccess();
+              return;
             }
           } catch (e) {}
-        } else {
-          QPLog('main', 'bridge /config 拉取失败 HTTP ' + xhr.status);
         }
-        cb();
+        onFail('HTTP ' + xhr.status);
       };
-      xhr.onerror = function () { QPLog('main', 'bridge /config 网络错误'); cb(); };
-      xhr.ontimeout = function () { QPLog('main', 'bridge /config 超时'); cb(); };
+      xhr.onerror = function () { onFail('网络错误'); };
+      xhr.ontimeout = function () { onFail('超时'); };
       xhr.send();
     } catch (e) {
-      QPLog('main', 'bridge /config 异常: ' + (e && e.message ? e.message : e));
-      cb();
+      onFail('异常: ' + (e && e.message ? e.message : e));
     }
   }
 
@@ -776,6 +819,8 @@
   // 连接后创建/复用会话（initialize 由 acp-bridge 无需显式）。
   // P15：同一文档重开时优先 session/load 复用缓存的 sessionId（恢复 AI 上下文记忆），
   // 无缓存才 session/new。sessionId 按 docId 持久化在 localStorage（qp.session.<docId>）。
+  // 根因 2：wps-mcp 入口必须是权威绝对路径（/config 下发）才发 session/new，未就绪先拉 /config。
+  // 根因 1：发送后启动看门狗（超时清 pending + 重试 ≤1 + 可见错误），防请求被丢弃后永久锁死。
   function ensureSession() {
     if (acpSessionId) return;
     // 已有在途的 session/new 或 session/load：不重复发送（防 onAcpConnChange 重入/onUserSend 竞态）
@@ -784,6 +829,18 @@
         return;
       }
     }
+    if (!wpsMcpEntryReady) {
+      // 根因 2：不得带相对/空路径去 spawn（静默失败）——先拉 /config，成功后再继续建会话
+      QPLog('main', 'ensureSession: wpsMcpEntry 未就绪，先拉取 /config');
+      ChatUi.setStatus('ACP: 等待 bridge 配置…');
+      ensureBridgeConfigThenSession();
+      return;
+    }
+    sessionRetries = 0; // 新的逻辑会话建立尝试
+    ensureSessionSend();
+  }
+
+  function ensureSessionSend() {
     var cachedSid = loadCachedSessionId(currentDocId);
     var method = cachedSid ? 'session/load' : 'session/new';
     var cwd = getSessionCwd(); // P16：cwd = 当前活动文档目录；无路径回退默认
@@ -795,11 +852,86 @@
     var id = AcpClient.send(method, params);
     if (id !== null) {
       pendingRequests[id] = { method: method };
+      startSessionWatchdog();
       QPLog('main', 'ensureSession: 发送 ' + method + ' id=' + id + ' (cwd=' + cwd + ', mcpServers=' + MCP_SERVERS.length + (cachedSid ? ', cachedSid=' + cachedSid : '') + ')');
       ChatUi.setStatus(cachedSid ? 'ACP: 恢复会话…' : 'ACP: 创建会话…');
     } else {
       QPLog('main', 'ensureSession: ' + method + ' 发送失败（未连接）');
     }
+  }
+
+  // 根因 2：拉取 /config（有限重试），成功则继续建会话；确认失败给用户可见错误。
+  function ensureBridgeConfigThenSession() {
+    if (configFetching) return; // 已有在途 /config 拉取链
+    configFetching = true;
+    var attempts = 0;
+    var delays = [1000, 3000];
+    function finish() { configFetching = false; }
+    function attempt() {
+      fetchBridgeConfig(function () {
+        finish();
+        ensureSession();
+      }, function (reason) {
+        QPLog('main', 'ensureSession 拉取 /config 失败: ' + reason);
+        if (attempts < delays.length) {
+          var d = delays[attempts];
+          attempts++;
+          setTimeout(attempt, d);
+        } else {
+          finish();
+          if (!bridgeConfigErrorShown) {
+            bridgeConfigErrorShown = true;
+            ChatUi.addMessage('error', 'bridge 配置获取失败（WPS 工具不可用）：请确认 acp-bridge 已启动后重试。');
+          }
+          ChatUi.setStatus('ACP: bridge 未就绪');
+        }
+      });
+    }
+    attempt();
+  }
+
+  // ── 会话建立看门狗（根因 1 路线 B）──
+  function clearSessionWatchdog() {
+    if (sessionTimer) { clearTimeout(sessionTimer); sessionTimer = null; }
+  }
+
+  function startSessionWatchdog() {
+    clearSessionWatchdog();
+    sessionTimer = setTimeout(onSessionTimeout, SESSION_TIMEOUT_MS);
+  }
+
+  function onSessionTimeout() {
+    sessionTimer = null;
+    // 找出在途的 session/new 或 session/load 请求；若响应已到（pending 已被 onAcpResponse 删除）则不处理
+    var method = null;
+    for (var k in pendingRequests) {
+      var req = pendingRequests[k];
+      if (req && (req.method === 'session/new' || req.method === 'session/load')) {
+        method = req.method;
+        delete pendingRequests[k]; // 清理防锁死：后续 ensureSession 不再被防重入卡住
+        break;
+      }
+    }
+    if (!method || acpSessionId) return;
+    if (sessionRetries < 1) {
+      sessionRetries++;
+      QPLog('main', '会话建立超时（' + method + '），自动重试 1/2');
+      ChatUi.setStatus('ACP: 创建会话…（重试）');
+      ensureSessionSend();
+      return;
+    }
+    if (method === 'session/load') {
+      // 沿用 session/load 失败降级：清缓存回退 session/new（守 plan 边界 #8）
+      QPLog('P15', 'session/load 超时，清缓存回退 session/new');
+      saveCachedSessionId(currentDocId, null);
+      ChatUi.addMessage('system', '上次会话恢复超时，正在创建新会话…');
+      sessionRetries = 0;
+      ensureSessionSend();
+      return;
+    }
+    QPLog('main', '会话建立超时，重试次数用尽');
+    ChatUi.addErrorCard('会话建立失败', 'bridge 或 AI 后端未就绪（创建会话响应超时）。请稍后重试或重建会话。', { retry: true, rebuild: true });
+    ChatUi.setStatus('ACP: 会话建立失败');
   }
 
   // ── ACP 响应处理 ──
@@ -809,6 +941,7 @@
     QPLog('main', 'ACP 响应 id=' + id + ' method=' + req.method + (error ? ' error=' + JSON.stringify(error).slice(0, 200) : ''));
 
     if (req.method === 'session/new' || req.method === 'session/load') {
+      clearSessionWatchdog(); // 任何响应（成功/失败）都结束在途等待
       if (error) {
         if (req.method === 'session/load') {
           // 旧 sessionId 失效（bridge/qwenpaw 重启）：清缓存回退 session/new，这是预期降级
@@ -823,6 +956,7 @@
       } else if (result && result.sessionId) {
         acpSessionId = result.sessionId;
         saveCachedSessionId(currentDocId, acpSessionId);
+        sessionRetries = 0; // 建立成功：清重试计数（下次切换/重建重新计时）
         // P16：仅 session/new 的新会话在首条 prompt 注入环境上下文；session/load（重开文档）不注入
         preamblePending = (req.method === 'session/new');
         QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId + (preamblePending ? '（待注入环境上下文）' : ''));
@@ -831,6 +965,7 @@
         // session/load 成功但未返回 sessionId：复用请求时用的缓存 id
         acpSessionId = loadCachedSessionId(currentDocId);
         preamblePending = false; // P16：load 不注入
+        sessionRetries = 0;
         QPLog('P15', 'session/load 成功（未回 sessionId，复用缓存）=' + acpSessionId);
         ChatUi.setStatus('就绪');
       }
