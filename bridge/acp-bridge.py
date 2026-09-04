@@ -175,6 +175,11 @@ class AcpBridge:
         # 子进程
         self.proc: asyncio.subprocess.Process | None = None
         self._restart_delay = 1.0
+        # P3：agent 列表缓存（qwenpaw agent list 启动开销约 8s，TTL 缓存避免每次 /agents 都慢）
+        self._agents_cache: list[dict] = []
+        self._agents_cached_at: float = 0.0
+        self._agents_failed_at: float = 0.0   # 上次查询失败时间（负缓存，防反复跑慢路径）
+        self._agents_lock = asyncio.Lock()
 
     # ── 调试日志 ────────────────────────────────────────────────────
     @staticmethod
@@ -366,12 +371,49 @@ class AcpBridge:
             return here
         return "qwenpaw"
 
+    AGENTS_CACHE_TTL = 60.0
+    AGENTS_FAIL_TTL = 5.0   # 查询失败后的负缓存窗口：避免反复跑 7s 级 CLI 慢路径
+
     async def list_agents(self) -> list[dict]:
         """查询可用 agent 列表（qwenpaw agent list），供加载项侧选择（P3）。
 
         返回 [{id, name, description}]；命令失败/解析失败返回空列表（不抛异常）。
         注：这是配置面查询（类似 /status），不实现任何 ACP 业务逻辑（守 §6.1 铁律）。
+        TTL 缓存：qwenpaw agent list 冷启动约 8s，避免每次 /agents 都慢。startup 后台预取。
+        失败负缓存：上次查询失败后短时间内直接返回当前缓存（可能为空），不重复跑慢路径。
         """
+        if self._agents_lock.locked():
+            # 正在刷新（startup 预取或首个并发请求），直接等待结果
+            await self._agents_lock.acquire()
+            self._agents_lock.release()
+            return list(self._agents_cache)
+        if time.monotonic() - self._agents_failed_at < self.AGENTS_FAIL_TTL:
+            return list(self._agents_cache)
+        if self._agents_cache and time.monotonic() - self._agents_cached_at < self.AGENTS_CACHE_TTL:
+            return list(self._agents_cache)
+        async with self._agents_lock:
+            if time.monotonic() - self._agents_failed_at < self.AGENTS_FAIL_TTL:
+                return list(self._agents_cache)
+            if self._agents_cache and time.monotonic() - self._agents_cached_at < self.AGENTS_CACHE_TTL:
+                return list(self._agents_cache)
+            agents = await self._fetch_agents()
+            if agents:
+                self._agents_cache = agents
+                self._agents_cached_at = time.monotonic()
+            else:
+                self._agents_failed_at = time.monotonic()
+            return list(agents)
+
+    async def _fetch_agents(self) -> list[dict]:
+        """实际查询 agent 列表：优先 qwenpaw daemon 的 HTTP API（快），失败回退 CLI 子进程。"""
+        base = self._daemon_base_url()
+        if base:
+            try:
+                agents = await asyncio.to_thread(self._http_get_json, base + "/api/agents")
+                if agents:
+                    return self._normalize_agents(agents.get("agents") or [])
+            except Exception as e:
+                log.info("agent 列表 daemon API 不可用（%s），回退 qwenpaw agent list", e)
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._qwenpaw_bin(), "agent", "list",
@@ -381,22 +423,58 @@ class AcpBridge:
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             obj = json.loads(stdout.decode("utf-8", "replace"))
-            agents = obj.get("agents") or []
-            out = []
-            for a in agents:
-                if not isinstance(a, dict):
-                    continue
-                if not a.get("id"):
-                    continue
-                out.append({
-                    "id": str(a["id"]),
-                    "name": str(a.get("name") or a["id"]),
-                    "description": str(a.get("description") or ""),
-                })
-            return out
+            return self._normalize_agents(obj.get("agents") or [])
         except Exception as e:
             log.warning("list_agents 失败: %s", e)
             return []
+
+    @staticmethod
+    def _normalize_agents(agents: list) -> list[dict]:
+        out = []
+        for a in agents:
+            if not isinstance(a, dict):
+                continue
+            if not a.get("id"):
+                continue
+            out.append({
+                "id": str(a["id"]),
+                "name": str(a.get("name") or a["id"]),
+                "description": str(a.get("description") or ""),
+            })
+        return out
+
+    @staticmethod
+    def _http_get_json(url: str, timeout: float = 3.0) -> dict | None:
+        """同步 GET 一个 JSON 端点（在 to_thread 中调用）。失败返回 None。"""
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "acp-bridge"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    return None
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            return None
+
+    def _daemon_base_url(self) -> str | None:
+        """解析 qwenpaw daemon 地址（config.json last_api.host:port），解析失败返回 None。"""
+        try:
+            working = os.environ.get("QWENPAW_WORKING_DIR", "")
+            if not working:
+                return None
+            cfg_path = os.path.join(working, "config.json")
+            if not os.path.exists(cfg_path):
+                return None
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            api = cfg.get("last_api") or {}
+            host = api.get("host") or "127.0.0.1"
+            port = api.get("port")
+            if not port:
+                return None
+            return f"http://{host}:{port}"
+        except Exception:
+            return None
 
     async def switch_agent(self, agent_id: str) -> tuple[bool, str]:
         """切换到指定 agent：杀掉当前 qwenpaw acp 子进程，_wait_proc 会用新 agent 自动重启。
@@ -808,6 +886,8 @@ class AcpBridge:
             handlers=handlers,
         )
         await self.start_proc()
+        # P3：后台预取 agent 列表，让加载项首次打开时下拉立即可用（qwenpaw agent list 冷启动约 8s）
+        asyncio.create_task(self.list_agents())
         http_server = await asyncio.start_server(self._http_handler, self.host, self.http_port)
         log.info("acp-bridge HTTP listening on http://%s:%d (agent=%s)", self.host, self.http_port, self.agent)
         log.info("acp-bridge UI static root: %s (/ui/*)", self.ui_root)

@@ -295,15 +295,20 @@
     var el = document.getElementById('agentSelect');
     if (!el) return;
     try { agentCached = localStorage.getItem(agentKey()) || null; } catch (e) {}
-    try {
+    // qwenpaw agent list 冷启动约 8s（bridge 已 TTL 缓存+预取，但首次仍可能慢），给足超时
+    // 重试间隔需盖过 bridge 的失败负缓存窗口（AGENTS_FAIL_TTL=5s），否则重试命中缓存空列表
+    var attempts = 0;
+    var delays = [6000, 8000];
+    function attempt() {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', 'http://127.0.0.1:8766/agents', true);
-      xhr.timeout = 5000;
+      xhr.timeout = 20000;
       xhr.onload = function () {
-        if (xhr.status !== 200) return;
+        if (xhr.status !== 200) { fail('HTTP ' + xhr.status); return; }
         try {
           var r = JSON.parse(xhr.responseText);
           agentList = r.agents || [];
+          if (!agentList.length) { fail('空列表'); return; }
           var cur = r.current || null;
           // 记住的上次选择优先；否则用 bridge 当前 agent
           var target = agentCached || cur;
@@ -312,12 +317,23 @@
             QPLog('P3', '上次选择 agent=' + agentCached + ' 与 bridge 当前=' + cur + ' 不一致，请求切换');
             switchAgent(agentCached);
           }
-        } catch (e) {}
+        } catch (e) { fail('解析失败'); }
       };
-      xhr.onerror = function () {};
-      xhr.ontimeout = function () {};
+      xhr.onerror = function () { fail('网络错误'); };
+      xhr.ontimeout = function () { fail('超时'); };
       xhr.send();
-    } catch (e) {}
+    }
+    function fail(reason) {
+      QPLog('P3', 'agent 列表加载失败: ' + reason);
+      if (attempts < delays.length) {
+        var d = delays[attempts];
+        attempts++;
+        setTimeout(attempt, d);
+      } else {
+        populateAgentSelect(el, [], null);
+      }
+    }
+    attempt();
   }
 
   function populateAgentSelect(el, agents, selected) {
