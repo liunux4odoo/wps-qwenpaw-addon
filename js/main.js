@@ -69,6 +69,7 @@
   var SESSION_TIMEOUT_MS = 25000; // 必须盖过 bridge 切换后 qwenpaw 重启就绪时间（实测 ≥8s）+ 余量
   var sessionRetries = 0;         // 当前逻辑会话建立的重试次数（上限 1，见 onSessionTimeout）
   var sessionTimer = null;        // 会话建立看门狗定时器
+  var sessionFailed = false;      // P21：会话建立失败（重试用尽）——发送按钮保持禁用 + 占位提示
 
   // ── bridge /config 权威配置门禁（plan-2026-09-04 根因 2）──
   var wpsMcpEntryReady = false;  // MCP_SERVERS[0].args 已由 /config 下发权威绝对路径
@@ -239,7 +240,6 @@
       pendingToolCards = [];
       for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
       ChatUi.hideTyping();
-      ChatUi.setInputEnabled(true);
       ChatUi.setBusy(false);
       streamBuffer = '';
     }
@@ -262,6 +262,7 @@
     if (acpState === 'connected') {
       if (!acpSessionId) ensureSession();
     }
+    updateSendAvailability(); // P21：切换后按新文档会话状态刷新发送可用性
   }
 
   // P8：周期检测活动文档变化（同一 taskpane 实例内多文档隔离；每文档独立 taskpane 时是 no-op）
@@ -448,6 +449,7 @@
         ChatUi.clear();
         ChatUi.showEmptyHint();
         if (acpState === 'connected') ensureSession();
+        updateSendAvailability(); // P21：agent 切换重建中会话未建 → 发送按钮禁用
       } else {
         QPLog('P3', 'agent 切换失败 HTTP ' + xhr.status);
         ChatUi.addMessage('error', 'agent 切换失败');
@@ -556,6 +558,8 @@
     tryAutoExpand();    // P7：自动展开侧边栏（尽力而为）
     // P1：初始状态（启动握手：ACP 连接中 + WPS 未激活）
     updateStatus();
+    // P21：初始会话未建 → 发送按钮禁用（ACP 连接 + 会话建立后自动启用）
+    updateSendAvailability();
 
     // P8/P15：确定当前文档 id，恢复该文档的历史消息（前端缓存）
     currentDocId = getDocId();
@@ -645,6 +649,28 @@
     }
   }
 
+  // ── P21：发送按钮可用性统一判定 ──
+  // 可对话条件 = ACP 已连接 + 会话已建立（acpSessionId 非空）+ 无进行中请求。
+  // 条件不满足时禁用发送按钮并给出占位提示；随状态变化自动启用（bridge 就绪/会话建立成功）。
+  // 注意：等待回复期间按钮禁用但"停止"仍可用（setBusy 独立控制 stopBtn，见 P5）。
+  function updateSendAvailability() {
+    var ready = (acpState === 'connected') && (acpSessionId !== null) && !waitingResponse;
+    ChatUi.setInputEnabled(ready);
+    var ph;
+    if (acpState !== 'connected') {
+      ph = '连接中…（等待 ACP 就绪）';
+    } else if (sessionFailed && acpSessionId === null) {
+      ph = '会话建立失败，请点击错误卡片重试';
+    } else if (acpSessionId === null) {
+      ph = '正在创建会话…';
+    } else if (waitingResponse) {
+      ph = 'AI 正在处理…';
+    } else {
+      ph = '输入指令，如：把第三段润色一下…（/help 查看指令）';
+    }
+    ChatUi.setPlaceholder(ph);
+  }
+
   // ── P2：中断恢复看门狗 ──
   function clearPromptTimers() {
     if (noFirstChunkTimer) { clearTimeout(noFirstChunkTimer); noFirstChunkTimer = null; }
@@ -715,7 +741,7 @@
     pendingToolCards = [];
     for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'error');
     ChatUi.hideTyping();
-    ChatUi.setInputEnabled(true);
+    updateSendAvailability(); // P21：会话仍有效 → 恢复可发送；会话失效则保持禁用
     ChatUi.setBusy(false);
     ChatUi.addErrorCard('连接中断', reason + '。可重试当前消息或重建会话。', { retry: true, rebuild: true });
     ChatUi.setStatus('对话中断');
@@ -733,7 +759,7 @@
     QPLog('P2', '用户点击"重建会话"');
     if (acpSessionId) {
       var cid = AcpClient.send('session/close', { sessionId: acpSessionId });
-      if (cid !== null) pendingRequests[cid] = { method: 'session/close' };
+      if (cid !== null) pendingRequests[cid] = { method: 'session/close', sessionId: acpSessionId };
     }
     acpSessionId = null;
     saveCachedSessionId(currentDocId, null);
@@ -741,35 +767,49 @@
       docStates[currentDocId].acpSessionId = null; // 防切走再切回恢复死 session
     }
     ensureSession();
+    updateSendAvailability(); // P21：重建期间会话未建 → 发送按钮禁用
   }
 
-  // ── P13/P14：清空当前会话（/clear 指令 + "清空对话"按钮共用） ──
+  // ── P13/P14/P19：清空当前会话（/clear 指令 + "清空对话"按钮共用） ──
   function clearCurrentSession() {
-    QPLog('P14', '清空当前会话 docId=' + currentDocId);
+    QPLog('P19', '清空当前会话 docId=' + currentDocId);
     if (acpSessionId) {
       var cid = AcpClient.send('session/close', { sessionId: acpSessionId });
-      if (cid !== null) pendingRequests[cid] = { method: 'session/close' };
+      // 记下被关闭的 sessionId：onAcpResponse 用其判断竞态（清空后立即新建的新会话不被 close 响应覆盖）
+      if (cid !== null) pendingRequests[cid] = { method: 'session/close', sessionId: acpSessionId };
     }
     acpSessionId = null;
     saveCachedSessionId(currentDocId, null);
     ChatUi.clear();
     ChatUi.showEmptyHint();
-    ChatUi.setStatus('会话已清空');
     streamBuffer = '';
     pendingAttachments = []; // P14：清空未发送的待选附件
     waitingResponse = false;
     gotFirstChunk = false;
     clearPromptTimers();
+    // 清空时若仍有在途 prompt：删除其 pending 记录，防遗留响应被 onAcpResponse 处理——
+    // 否则 stale 响应会清掉 P19 刚新建的会话（错误路径 acpSessionId=null）或打乱新会话上的在途请求（同 onStop）。
+    if (lastPromptReqId !== null && pendingRequests[lastPromptReqId]) {
+      delete pendingRequests[lastPromptReqId];
+    }
     lastPromptReqId = null;
     var cards = pendingToolCards.slice();
     pendingToolCards = [];
     for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
     ChatUi.hideTyping();
-    ChatUi.setInputEnabled(true);
     ChatUi.setBusy(false);
     docStates[currentDocId] = { acpSessionId: null, messages: [] };
     saveHistory(currentDocId, []);
-    if (acpState === 'connected') ensureSession();
+    // P19：清空后立即新建空会话（防止惰性新建与旧上下文串；新建失败由会话看门狗给可见错误+可重试，
+    // 不清空动作不回滚）。新会话沿用 P16：session/new 成功置 preamblePending → 首条 prompt 重新注入
+    // 环境上下文（重新现取当前文档身份）。
+    if (acpState === 'connected') {
+      ChatUi.setStatus('正在新建会话…');
+      ensureSession();
+    } else {
+      ChatUi.setStatus('会话已清空（未连接，重连后自动建会话）');
+    }
+    updateSendAvailability(); // P21：会话未建 → 发送按钮保持禁用
   }
 
   // ── P5：中止执行 ──
@@ -788,7 +828,7 @@
     pendingToolCards = [];
     for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
     ChatUi.hideTyping();
-    ChatUi.setInputEnabled(true);
+    updateSendAvailability(); // P21：停止后恢复可发送（若会话仍有效）
     ChatUi.setBusy(false);
     ChatUi.addMessage('system', '已停止');
     ChatUi.setStatus('已停止');
@@ -814,6 +854,7 @@
       acpSessionId = null;
       ChatUi.setStatus('ACP: 未连接');
     }
+    updateSendAvailability(); // P21：连接状态变化 → 刷新发送可用性
   }
 
   // 连接后创建/复用会话（initialize 由 acp-bridge 无需显式）。
@@ -852,6 +893,7 @@
     var id = AcpClient.send(method, params);
     if (id !== null) {
       pendingRequests[id] = { method: method };
+      sessionFailed = false; // P21：新一次会话建立尝试 → 清除失败标记（可重试）
       startSessionWatchdog();
       QPLog('main', 'ensureSession: 发送 ' + method + ' id=' + id + ' (cwd=' + cwd + ', mcpServers=' + MCP_SERVERS.length + (cachedSid ? ', cachedSid=' + cachedSid : '') + ')');
       ChatUi.setStatus(cachedSid ? 'ACP: 恢复会话…' : 'ACP: 创建会话…');
@@ -930,8 +972,10 @@
       return;
     }
     QPLog('main', '会话建立超时，重试次数用尽');
+    sessionFailed = true; // P21：建立失败 → 发送按钮保持禁用 + 占位提示（错误卡片可重试/重建）
     ChatUi.addErrorCard('会话建立失败', 'bridge 或 AI 后端未就绪（创建会话响应超时）。请稍后重试或重建会话。', { retry: true, rebuild: true });
     ChatUi.setStatus('ACP: 会话建立失败');
+    updateSendAvailability(); // P21：失败态刷新占位（禁用态保持）
   }
 
   // ── ACP 响应处理 ──
@@ -950,24 +994,30 @@
           ChatUi.addMessage('system', '上次会话已失效，正在创建新会话…');
           if (!acpSessionId) ensureSession(); // 回退 session/new
         } else {
+          sessionFailed = true; // P21：创建会话即时报错 → 发送按钮保持禁用 + 可重建
           ChatUi.setStatus('ACP: 会话创建失败');
-          ChatUi.addMessage('error', '会话创建失败: ' + (error.message || JSON.stringify(error)));
+          ChatUi.addErrorCard('会话创建失败', (error.message || JSON.stringify(error)) + '。可重建会话后重试。', { rebuild: true });
+          updateSendAvailability(); // P21：失败态刷新占位
         }
       } else if (result && result.sessionId) {
         acpSessionId = result.sessionId;
         saveCachedSessionId(currentDocId, acpSessionId);
         sessionRetries = 0; // 建立成功：清重试计数（下次切换/重建重新计时）
+        sessionFailed = false; // P21：建立成功 → 清除失败标记
         // P16：仅 session/new 的新会话在首条 prompt 注入环境上下文；session/load（重开文档）不注入
         preamblePending = (req.method === 'session/new');
         QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId + (preamblePending ? '（待注入环境上下文）' : ''));
         ChatUi.setStatus('就绪');
+        updateSendAvailability(); // P21：会话建立成功 → 启用发送
       } else if (req.method === 'session/load' && loadCachedSessionId(currentDocId)) {
         // session/load 成功但未返回 sessionId：复用请求时用的缓存 id
         acpSessionId = loadCachedSessionId(currentDocId);
         preamblePending = false; // P16：load 不注入
         sessionRetries = 0;
+        sessionFailed = false; // P21：恢复成功 → 清除失败标记
         QPLog('P15', 'session/load 成功（未回 sessionId，复用缓存）=' + acpSessionId);
         ChatUi.setStatus('就绪');
+        updateSendAvailability(); // P21：会话恢复成功 → 启用发送
       }
     } else if (req.method === 'session/prompt') {
       // 完整响应到达：流式结束，收尾 assistant 消息
@@ -977,7 +1027,7 @@
       lastPromptReqId = null;
       ChatUi.finishAssistant();
       ChatUi.hideTyping();
-      ChatUi.setInputEnabled(true);
+      updateSendAvailability(); // P21：回复结束 → 恢复可发送（若会话仍有效）
       ChatUi.setBusy(false);
       var cards = pendingToolCards.slice();
       pendingToolCards = [];
@@ -989,6 +1039,7 @@
         acpSessionId = null;
         ensureSession();
         ChatUi.setStatus('ACP: 会话重建中…');
+        updateSendAvailability(); // P21：会话已失效重建中 → 发送按钮禁用（"正在创建会话…"占位）
       } else {
         var stopReason = result && result.stopReason;
         QPLog('P2', 'session/prompt 结束 stopReason=' + stopReason + ' 累计流式长度=' + streamBuffer.length);
@@ -1004,9 +1055,14 @@
       streamBuffer = '';
       schedulePersist(); // P15：本轮结束落盘历史
     } else if (req.method === 'session/close') {
-      acpSessionId = null;
-      saveCachedSessionId(currentDocId, null); // P15：关闭会话同步清 sessionId 缓存
-      ChatUi.setStatus('ACP: 会话已关闭');
+      // P19 竞态防护：清空/重建后立即 session/new 时，若 session/new 响应先于 close 到达
+      //（acpSessionId 已是新会话），close 响应不得用 null 覆盖新会话——仅当仍是本次关闭的会话才清空。
+      if (!acpSessionId || acpSessionId === req.sessionId) {
+        acpSessionId = null;
+        saveCachedSessionId(currentDocId, null); // P15：关闭会话同步清 sessionId 缓存
+        ChatUi.setStatus('ACP: 会话已关闭');
+      }
+      updateSendAvailability(); // P21：会话关闭 → 刷新发送可用性（重建中的清空场景保持禁用）
     }
     delete pendingRequests[id];
   }
@@ -1209,7 +1265,7 @@
     schedulePersist();
     waitingResponse = true;
     gotFirstChunk = false;
-    ChatUi.setInputEnabled(false);
+    updateSendAvailability(); // P21：等待回复 → 发送按钮禁用（停止按钮仍可用）
     ChatUi.setBusy(true);
     ChatUi.setStatus('处理中…');
     ChatUi.showTyping('思考中…');
@@ -1240,7 +1296,7 @@
     } else {
       waitingResponse = false;
       gotFirstChunk = false;
-      ChatUi.setInputEnabled(true);
+      updateSendAvailability(); // P21：发送失败 → 恢复可发送
       ChatUi.setBusy(false);
       ChatUi.hideTyping();
       ChatUi.addMessage('error', '发送失败：未连接 ACP');

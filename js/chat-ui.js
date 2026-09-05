@@ -54,7 +54,15 @@ var ChatUi = (function () {
       els.showProcessToggle.addEventListener('change', function () {
         showProcess = els.showProcessToggle.checked;
         try { localStorage.setItem('qp.showProcess', showProcess ? '1' : '0'); } catch (e) {}
-        if (els.messages) els.messages.classList.toggle('hide-process', !showProcess);
+        if (els.messages) {
+          els.messages.classList.toggle('hide-process', !showProcess);
+          // P18：开关切换即时生效——已渲染的 assistant 消息按新状态重渲染（think 块随开关显隐）
+          var nodes = els.messages.querySelectorAll('.msg.assistant');
+          for (var i = 0; i < nodes.length; i++) {
+            var raw = nodes[i].getAttribute('data-raw');
+            if (raw !== null && md) nodes[i].innerHTML = md.render(showProcess ? raw : md.stripThink(raw));
+          }
+        }
       });
     }
     if (!showProcess && els.messages) {
@@ -103,8 +111,9 @@ var ChatUi = (function () {
     el.className = 'msg ' + (role === 'assistant' ? 'assistant' : role === 'user' ? 'user' : role);
     if (role === 'assistant' && md) {
       // P10：assistant 消息渲染 Markdown（转义安全）；data-raw 存原文供 P15 快照/历史复用
+      // P18：关闭"显示过程"时剥离 think 块（实时渲染与最终一致）
       el.setAttribute('data-raw', text);
-      el.innerHTML = md.render(text);
+      el.innerHTML = md.render(showProcess ? text : md.stripThink(text));
     } else {
       el.textContent = text;
     }
@@ -142,6 +151,8 @@ var ChatUi = (function () {
       } else {
         text = el.getAttribute('data-raw');
         if (text === null || text === undefined) text = el.textContent;
+        // P18：历史缓存存原文（含 think 块明文），渲染时按开关状态过滤——保证"存明文则开=回显"，
+        // 且无论消息来自实时流式还是历史恢复，开关切换行为一致（P15 历史与实时不打架）。
       }
       if (text) msgs.push({ role: role, text: text });
     }
@@ -162,7 +173,8 @@ var ChatUi = (function () {
         var el = document.createElement('div');
         el.className = 'msg assistant';
         el.setAttribute('data-raw', m.text);
-        el.innerHTML = md.render(m.text);
+        // P18：恢复时按当前开关状态渲染（历史若存明文、开关关闭则过滤 think）
+        el.innerHTML = md.render(showProcess ? m.text : md.stripThink(m.text));
         els.messages.appendChild(el);
       } else {
         addMessage(m.role || 'system', m.text);
@@ -285,10 +297,11 @@ var ChatUi = (function () {
     }
     if (md) {
       // 累积纯文本（存于 last 的 data-raw 属性），每次重新渲染
+      // P18：关闭"显示过程"时流式渲染剥离 think 块（与最终渲染一致，data-raw 仍存原文）
       var raw = last.getAttribute('data-raw') || '';
       raw += chunk;
       last.setAttribute('data-raw', raw);
-      last.innerHTML = md.render(raw);
+      last.innerHTML = md.render(showProcess ? raw : md.stripThink(raw));
     } else {
       last.textContent += chunk;
     }
@@ -426,6 +439,14 @@ var ChatUi = (function () {
   }
 
   /**
+   * P21：设置输入框占位文案（连接中…/正在创建会话…/正常提示）
+   * @param {string} text
+   */
+  function setPlaceholder(text) {
+    if (els.input) els.input.placeholder = text || '';
+  }
+
+  /**
    * P5：AI 响应期间显示"停止"按钮
    * @param {boolean} busy
    */
@@ -451,6 +472,7 @@ var ChatUi = (function () {
     setConnStateText: setConnStateText,
     setWpsState: setWpsState,
     setInputEnabled: setInputEnabled,
+    setPlaceholder: setPlaceholder,
     setBusy: setBusy,
     snapshot: snapshot,
     restore: restore,

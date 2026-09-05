@@ -238,9 +238,26 @@ var MarkdownRenderer = (function () {
     return /```|\n\s*[-*]\s|\n\s*\d+\.\s|^#{1,6}\s|\|.*\|\s*\n\s*\|?\s*:?-{3,}/m.test(text);
   }
 
+  // P18：剥离 AI 回复中的 think 块（```think ... ``` 三反引号围栏包裹的思考内容）。
+  // 关闭"显示过程"时对渲染到对话的正文调用，实时与最终渲染一致；开启时跳过（原样显示）。
+  // 匹配 think/thought/thinking/reason/reasoning/note 围栏语言标签，避免误删正常代码块。
+  function stripThink(text) {
+    if (!text) return '';
+    var s = String(text);
+    // 完整 think 围栏块（含跨行内容，非贪婪到闭合围栏）
+    s = s.replace(/```(?:think|thought|thinking|reason|reasoning|note)\s*\n?[\s\S]*?```/gi, '');
+    // 流式场景的未闭合尾部 think 围栏（qwenpaw 可能把 think 与正文混在同一个 chunk）：
+    // 仅当尾随无三重反引号（其后无闭合围栏/正常代码块）时从围栏剥离到末尾；
+    // 容忍 think 内容中的单个反引号（不闪烁），拒绝把后面的 ``` 当内容吞掉。
+    s = s.replace(/```(?:think|thought|thinking|reason|reasoning|note)\s*\n?(?:(?!```)[\s\S])*$/gi, '');
+    // 清理剥离后遗留的多余空行
+    return s.replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/[ \t]+$/gm, '');
+  }
+
   return {
     render: render,
     hasBlock: hasBlock,
+    stripThink: stripThink,
     _escapeHtml: escapeHtml
   };
 })();

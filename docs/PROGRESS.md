@@ -60,7 +60,11 @@
   - **thinking 心跳接入**：`onAcpSessionUpdate` 新增 `agent_thought_chunk` 分支 → `touchActivity()` 续命 + "正在思考…"打字指示器（qwenpaw 思考时每 0.1-0.2s 一条，长思考不触发看门狗）
   - **自动延长不死判**：看门狗触发时进入"疑似中断"顺延态（UI 显示"AI 仍在处理…"，每次再等 60s，上限 3 次，总等待 ≤ 5min）；顺延期间任何下行回到正常态；顺延用尽才判定中断
 - ✅ **WPS 宏安全性检查（2026-09-03，本轮）**：实机验证结论——宏安全性未调到最低时 jsaddon 加载项不加载。新增 `scripts/check-wps-macro-security.sh`（检查 + `--apply` 自动调整 wps/wpp `VbaSecurityLevel` 与 et `KDESecurityLevel` 为 1，带备份 + WPS 运行中拦截），`scripts/install.sh` 步骤 7 调用检查并提示，`docs/INSTALL.md` 新增「宏安全性（必需）」章节 + FAQ
-- 🚧 **待 WPS 实机验证**：批 2/3 的 FE 改动（agent 切换、文档隔离切换、附件、自动展开）需 WPS 实机重开侧边栏端到端验收；P9（excel/ppt 加载）需实机确认 V4（manifest 已含 wps/et/wpp hosts）
+- ✅ **P18/P19/P21（2026-09-05，用户第二轮实机反馈，见 DEV-PLAN-Phase3.md §1）**：
+  - **P18 think 过滤**：关闭"显示过程"后，AI 回复正文中的 ```` ```think/thought/reasoning/note ... ``` ```` 围栏块不再显示——`MarkdownRenderer.stripThink()`（完整块剥离 + 流式未闭合尾部兜底，容忍 think 内容内单反引号、不误删正常代码块）；流式渲染/最终渲染/开关切换即时重渲染三处一致；历史缓存存**原文**（存明文=开=回显），渲染时按开关状态过滤——实时与历史恢复的开关行为一致（P18 方案内定：存明文则开=回显）
+  - **P19 清空即新建空会话**：`clearCurrentSession()` 清空后主动 `session/new`（非惰性），UI 显示"正在新建会话…"；新会话沿用 P16 preamble 重新注入（重新现取文档身份）；`session/close` 竞态防护（close 响应不覆盖已就绪的新会话 id）；复用 SESSION_TIMEOUT_MS 看门狗/重试/可见错误
+  - **P21 发送按钮条件禁用**：新增统一 `updateSendAvailability()`（ACP 已连接 + 会话已建立 + 无进行中请求 才可发送），替换全部散落的 `setInputEnabled` 调用；未就绪时按钮禁用 + 占位提示（连接中…/正在创建会话…/会话建立失败…/AI 正在处理…）；建立失败态 `sessionFailed` 标记 + 错误卡可重建；停止（P5）仍独立可用
+- 🚧 **待 WPS 实机验证**：批 2/3 的 FE 改动（agent 切换、文档隔离切换、附件、自动展开）需 WPS 实机重开侧边栏端到端验收；P9（excel/ppt 加载）需实机确认 V4（manifest 已含 wps/et/wpp hosts）；P17（修订模式/回滚）V8 未决前不委派开发；P20（WPS 连接状态判定）待 V9 读 wps-poll-client 确认
 
 ## 部署配套（v0.17 路线 P 强制）
 
