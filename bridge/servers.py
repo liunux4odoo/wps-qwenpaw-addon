@@ -20,6 +20,8 @@ bridge（任何 server 都需要），qwenpaw 专属发现逻辑原样搬入本�
   loadSession     bool    C7：session/load 是否支持历史恢复
   cancel          bool    C8：是否支持 session/cancel（中止语义）
   agents          bool    是否有"agent/mode"概念（枚举与切换）
+  switchSemantics str     agent/mode 切换语义：restart=kill+重启子进程（qwenpaw）/ config_option=会话级
+                          set_config_option（opencode，V11：configOptions 只读，新建会话默认仍 build）
 """
 from __future__ import annotations
 
@@ -84,6 +86,7 @@ class QwenpawAdapter(AcpServerAdapter):
         "loadSession": True,       # C7 ✅
         "cancel": True,            # C8 ✅ 支持 session/cancel
         "agents": True,            # 命名 agent 概念（agent list / switch_agent）
+        "switchSemantics": "restart",  # C3 切换 = kill + 重启子进程
     }
 
     def _bin(self) -> str:
@@ -208,6 +211,7 @@ class OpencodeAdapter(AcpServerAdapter):
         "loadSession": True,        # V6 ✅ 支持历史恢复
         "cancel": False,            # V7 不支持 session/cancel → 中止走 session/close（D8）
         "agents": True,             # V8 有 mode/自定义 agent 概念（agent list）
+        "switchSemantics": "config_option",  # V11 会话级 set_config_option 应用（前端 Phase 2）
     }
 
     def _bin(self) -> str:

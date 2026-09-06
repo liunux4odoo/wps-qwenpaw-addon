@@ -76,6 +76,19 @@
   var bridgeConfigErrorShown = false; // 错误卡片只展示一次（恢复后再失败可再次展示）
   var configFetching = false;    // 是否有在途的 /config 拉取链（防重复触发）
 
+  // ── ACP server 能力标志（plan-2026-09-05 §6，bridge /config 下发，Phase 2 前端按标志适配）──
+  // 默认值对齐 qwenpaw 现状（/config 拉取前 / 失败时行为零变化）。
+  var acpServerName = 'qwenpaw'; // /config 下发的当前 ACP server（版本倾斜检测用，见 switchAgent）
+  var capabilities = {
+    honorMcpEnv: true,
+    approval: 'auto',            // auto=自动批准(allow_once) / none=无审批 / manual=手动确认
+    thoughtHeartbeat: true,
+    loadSession: true,
+    cancel: true,
+    agents: true,
+    switchSemantics: 'restart'   // restart=kill+重启 / config_option=会话级 set_config_option
+  };
+
   // ── 阶段 3 批 1：P1 状态合并 / P2 中断恢复 / P4 过程呈现 / P5 中止 ──
   // P2 v1.4（docs/DEV-PLAN-Phase3.md §1 P2）：看门狗阈值按实测分层——
   // qwenpaw 单次请求内存在 78s/91s/104s 的 thinking 完全静默窗口，60s 阈值必然误报。
@@ -427,6 +440,7 @@
   function switchAgent(agentId) {
     if (!agentId) return;
     QPLog('P3', '切换 agent: ' + agentId);
+    agentCached = agentId; // P3：同步内存态（set_config_option 应用 / 重连重建时读取）
     try { localStorage.setItem(agentKey(), agentId); } catch (e) {}
     var xhr = new XMLHttpRequest();
     xhr.open('POST', 'http://127.0.0.1:8766/agent/set?agent=' + encodeURIComponent(agentId), true);
@@ -434,26 +448,52 @@
     xhr.onload = function () {
       var ok = false;
       try { ok = xhr.status === 200 && JSON.parse(xhr.responseText).ok; } catch (e) {}
-      if (ok) {
-        QPLog('P3', 'agent 切换成功，重建会话');
-        ChatUi.addMessage('system', '已切换到 agent「' + agentId + '」，正在重建会话…');
-        // 旧 sessionId 随子进程重启失效：清当前会话状态 + 内存/缓存，重建。
-        // 同步清 docStates 的 messages 与 localStorage 历史：新 agent = 全新会话无记忆，
-        // 若保留旧消息，切走再切回会显示死会话的旧记录（P15「用户看得见但 AI 不记得 = 误导」）。
-        acpSessionId = null;
-        saveCachedSessionId(currentDocId, null);
-        if (currentDocId) {
-          docStates[currentDocId] = { acpSessionId: null, messages: [] };
-          saveHistory(currentDocId, []);
-        }
-        ChatUi.clear();
-        ChatUi.showEmptyHint();
-        if (acpState === 'connected') ensureSession();
-        updateSendAvailability(); // P21：agent 切换重建中会话未建 → 发送按钮禁用
-      } else {
+      if (!ok) {
         QPLog('P3', 'agent 切换失败 HTTP ' + xhr.status);
         ChatUi.addMessage('error', 'agent 切换失败');
+        return;
       }
+      QPLog('P3', 'agent 切换成功: ' + agentId);
+      // Phase 2 C3：切换语义按能力标志——
+      //   config_option（opencode）：mode 是会话级 set_config_option（V11），对当前会话应用即可，
+      //     不销毁会话/历史（与 qwenpaw restart 的"重建"语义不同）；
+      //   restart（qwenpaw）：kill+重启子进程 → 旧 sessionId 失效，清空重建（原行为）。
+      if (capabilities.switchSemantics === 'config_option') {
+        if (acpSessionId) {
+          var cid = AcpClient.send('session/set_config_option', {
+            sessionId: acpSessionId, configId: 'mode', value: agentId
+          });
+          if (cid !== null) pendingRequests[cid] = { method: 'session/set_config_option' };
+          QPLog('P3', 'config_option 切换：set_config_option(mode=' + agentId + ') id=' + cid);
+          ChatUi.addMessage('system', '已切换 mode 到「' + agentId + '」（当前会话生效）');
+        } else {
+          // 无当前会话：选择已记录（agentCached/localStorage），下次建会话时 maybeApplyConfigOption 应用
+          ChatUi.addMessage('system', '已选择 mode「' + agentId + '」，将在下次会话生效');
+        }
+        updateSendAvailability();
+        return;
+      }
+      // 版本倾斜防护：bridge 是 opencode 但未下发 switchSemantics（旧 bridge）→ mode 切换不会真正
+      // 生效，此时绝不能再静默销毁会话/历史（A3 无静默错误）。
+      if (acpServerName === 'opencode' && capabilities.switchSemantics !== 'config_option') {
+        QPLog('P3', '版本倾斜：acpServer=opencode 但无 switchSemantics=config_option，切换不会生效');
+        ChatUi.addMessage('error', '检测到 bridge 版本过旧（未下发 switchSemantics），opencode mode 切换不会生效。请重启 bridge 后再试。');
+        return;
+      }
+      // restart 语义（qwenpaw）：旧 sessionId 随子进程重启失效，清当前会话状态 + 内存/缓存，重建。
+      // 同步清 docStates 的 messages 与 localStorage 历史：新 agent = 全新会话无记忆，
+      // 若保留旧消息，切走再切回会显示死会话的旧记录（P15「用户看得见但 AI 不记得 = 误导」）。
+      ChatUi.addMessage('system', '已切换到 agent「' + agentId + '」，正在重建会话…');
+      acpSessionId = null;
+      saveCachedSessionId(currentDocId, null);
+      if (currentDocId) {
+        docStates[currentDocId] = { acpSessionId: null, messages: [] };
+        saveHistory(currentDocId, []);
+      }
+      ChatUi.clear();
+      ChatUi.showEmptyHint();
+      if (acpState === 'connected') ensureSession();
+      updateSendAvailability(); // P21：agent 切换重建中会话未建 → 发送按钮禁用
     };
     xhr.onerror = function () {
       ChatUi.addMessage('error', 'agent 切换失败（bridge 不可达）');
@@ -515,6 +555,17 @@
               MCP_SERVERS[0].args = [r.wpsMcpEntry];
               wpsMcpEntryReady = true;
               bridgeConfigErrorShown = false; // 配置恢复后允许后续失败再次提示
+              if (r.acpServer) acpServerName = r.acpServer; // 版本倾斜检测（switchAgent）
+              // Phase 2：能力标志（opencode 无审批/无 cancel/无 thought heartbeat 等），
+              // 前端按标志适配协议偏好；缺失时保留 qwenpaw 兼容默认值
+              if (r.capabilities && typeof r.capabilities === 'object') {
+                for (var k in r.capabilities) {
+                  if (Object.prototype.hasOwnProperty.call(r.capabilities, k)) {
+                    capabilities[k] = r.capabilities[k];
+                  }
+                }
+                QPLog('main', 'capabilities=' + JSON.stringify(capabilities));
+              }
               QPLog('main', 'bridge /config 下发 wpsMcpEntry: ' + r.wpsMcpEntry);
               if (onSuccess) onSuccess();
               return;
@@ -835,10 +886,27 @@
     streamBuffer = '';
     schedulePersist(); // P15：停止时保留已收到的部分回复
     if (acpSessionId) {
-      // qwenpaw acp 支持 cancel 方法（ACP 协议 session/cancel）；若协议不支持也无妨：
-      // 已置 waitingResponse=false，后续流式输出一律丢弃（P5 退化路径）。
-      var cid = AcpClient.send('session/cancel', { sessionId: acpSessionId });
-      QPLog('P5', '已发送 session/cancel id=' + cid);
+      // Phase 2 C8（plan-2026-09-05 §6.5/D8）：中止语义按能力标志适配。
+      //   cancel=true（qwenpaw）：session/cancel（ACP 标准中止，会话保留）；
+      //   cancel=false（opencode，V7 不支持 session/cancel）：中止 = 放弃当前会话（session/close），
+      //     下次发送自动重建——有明确行为，不静默无效。
+      if (capabilities.cancel) {
+        var cid = AcpClient.send('session/cancel', { sessionId: acpSessionId });
+        QPLog('P5', '已发送 session/cancel id=' + cid);
+      } else {
+        var oldSid = acpSessionId;
+        var cid2 = AcpClient.send('session/close', { sessionId: oldSid });
+        if (cid2 !== null) pendingRequests[cid2] = { method: 'session/close', sessionId: oldSid };
+        QPLog('P5', 'opencode 不支持 cancel：已发送 session/close id=' + cid2 + '（中止=放弃会话，下次自动重建）');
+        ChatUi.addMessage('system', '已停止（当前 AI 后端不支持取消，已结束本次会话，下次发送将自动新建会话）');
+        acpSessionId = null;
+        saveCachedSessionId(currentDocId, null); // P15：同步清 sessionId 缓存
+        if (currentDocId && docStates[currentDocId]) {
+          docStates[currentDocId].acpSessionId = null; // 防切走再切回恢复死 session
+        }
+        if (acpState === 'connected') ensureSession();
+        updateSendAvailability(); // P21：重建期间会话未建 → 发送按钮禁用
+      }
     }
   }
 
@@ -882,7 +950,9 @@
   }
 
   function ensureSessionSend() {
-    var cachedSid = loadCachedSessionId(currentDocId);
+    // Phase 2 C7：session/load 按能力标志门禁——server 不支持历史恢复时直接 session/new
+    //（不携带缓存 id；qwenpaw/opencode 均 loadSession=true，当前无行为变化，纯能力适配）。
+    var cachedSid = capabilities.loadSession ? loadCachedSessionId(currentDocId) : null;
     var method = cachedSid ? 'session/load' : 'session/new';
     var cwd = getSessionCwd(); // P16：cwd = 当前活动文档目录；无路径回退默认
     var params = {
@@ -899,6 +969,24 @@
       ChatUi.setStatus(cachedSid ? 'ACP: 恢复会话…' : 'ACP: 创建会话…');
     } else {
       QPLog('main', 'ensureSession: ' + method + ' 发送失败（未连接）');
+    }
+  }
+
+  // Phase 2 C3（plan-2026-09-05 §5.2/§7，V11）：opencode agent/mode 切换 = 会话级
+  // session/set_config_option（configOptions 数组只读不生效；新建会话默认仍 build）。
+  // 会话建立成功后，若 server 是 config_option 语义且用户有记录的选择，把 mode 应用到新会话。
+  function maybeApplyConfigOption(sessionId) {
+    if (!sessionId) return;
+    if (capabilities.switchSemantics !== 'config_option') return;
+    if (!agentCached || !agentCached.length) return;
+    var id = AcpClient.send('session/set_config_option', {
+      sessionId: sessionId,
+      configId: 'mode',
+      value: agentCached
+    });
+    if (id !== null) {
+      pendingRequests[id] = { method: 'session/set_config_option' };
+      QPLog('main', 'set_config_option(mode=' + agentCached + ') 已应用到会话 ' + sessionId + ' id=' + id);
     }
   }
 
@@ -1009,6 +1097,8 @@
         QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId + (preamblePending ? '（待注入环境上下文）' : ''));
         ChatUi.setStatus('就绪');
         updateSendAvailability(); // P21：会话建立成功 → 启用发送
+        // Phase 2 C3：opencode 会话级 mode 应用（V11 set_config_option；qwenpaw restart 语义跳过）
+        maybeApplyConfigOption(acpSessionId);
       } else if (req.method === 'session/load' && loadCachedSessionId(currentDocId)) {
         // session/load 成功但未返回 sessionId：复用请求时用的缓存 id
         acpSessionId = loadCachedSessionId(currentDocId);
@@ -1018,6 +1108,7 @@
         QPLog('P15', 'session/load 成功（未回 sessionId，复用缓存）=' + acpSessionId);
         ChatUi.setStatus('就绪');
         updateSendAvailability(); // P21：会话恢复成功 → 启用发送
+        maybeApplyConfigOption(acpSessionId); // Phase 2 C3：同 load 场景
       }
     } else if (req.method === 'session/prompt') {
       // 完整响应到达：流式结束，收尾 assistant 消息
@@ -1070,10 +1161,18 @@
   // ── ACP 流式通知（session/update） ──
   function onAcpSessionUpdate(sessionId, update) {
     if (!update) return;
+    // 非当前会话的 session/update（如 cancel:false 中止 close 重建后，旧会话的残留流式/工具调用）
+    // 一律不处理——不续命、不渲染。bridge 按 sessionId 路由且 close 后旧映射残留（见 review finding），
+    // 若让旧会话的 tool_call 渲染，会污染新会话的 pendingToolCards/过程呈现。
+    if (acpSessionId && sessionId && sessionId !== acpSessionId) return;
+    // Phase 2 C6（plan-2026-09-05 §6.3）：看门狗改为"任意下行消息都续命"——
+    // opencode 不发 agent_thought_chunk / status_update（V5 实测），长工具执行期只靠
+    // tool_call / tool_call_update / usage_update / available_commands_update 证明存活；
+    // 未识别 update 类型也一律续命（协议通用行为，不误报中断）。
+    touchActivity();
     if (update.sessionUpdate === 'agent_message_chunk' && update.content) {
       var text = update.content.text || '';
       if (text) {
-        touchActivity();
         // P5：无进行中请求（已停止/已恢复）→ 丢弃残留流式，不污染 UI
         if (!waitingResponse) {
           QPLog('P2', '丢弃残留流式 chunk');
@@ -1096,16 +1195,28 @@
       // P2 v1.4：thinking 心跳——qwenpaw 思考时密集下发 agent_thought_chunk
       //（实测每 0.1-0.2s 一条），作为续命信号重置看门狗：即使无文本 chunk，
       // 长思考/静默期间看门狗也不触发（覆盖 91s+ thinking 完全静默窗口）。
-      touchActivity();
       // 可选的"正在思考…"打字指示器：仅进行中请求 + 尚无首文本 chunk + 无工具卡片时提示
       //（避免覆盖 tool_call 阶段设置的"正在调用工具…"标签，见审查 finding）
       if (waitingResponse && !gotFirstChunk && pendingToolCards.length === 0) {
         ChatUi.showTyping('正在思考…');
       }
+    } else if (update.sessionUpdate === 'tool_call') {
+      // Phase 2：opencode 不发 request_permission/status_update（V4/V5），工具调用以
+      // tool_call 下发——渲染工具卡片（P4 过程呈现），字段形状做防御式提取。
+      if (!waitingResponse) return;
+      var tct = update.toolCall || update.content || {};
+      var tcName = tct.name || tct.title || tct.tool_call_id || '工具调用';
+      var tcArgs = tct.arguments || tct.input || null;
+      // 新工具调用 → 之前的工具已完成（标记 done），避免卡片滞留"调用中"
+      var prevTc = pendingToolCards.slice();
+      pendingToolCards = [];
+      for (var p = 0; p < prevTc.length; p++) ChatUi.markToolCard(prevTc[p], 'done');
+      ChatUi.showTyping('正在调用工具…');
+      var tcCard = ChatUi.addToolCard(tcName, tcArgs ? JSON.stringify(tcArgs).slice(0, 200) : '');
+      pendingToolCards.push(tcCard);
     } else if (update.sessionUpdate === 'status_update') {
       // P4：阶段/工具调用状态（qwenpaw 若下发 status_update）；仅进行中请求时处理
       if (!waitingResponse) return;
-      touchActivity();
       var st = update.status || {};
       if (st.subtype === 'tool_call' && st.toolCall) {
         var tc = st.toolCall;
@@ -1113,7 +1224,7 @@
         // 新工具调用 → 之前的工具已完成（标记 done），避免卡片滞留"调用中"
         var prev = pendingToolCards.slice();
         pendingToolCards = [];
-        for (var p = 0; p < prev.length; p++) ChatUi.markToolCard(prev[p], 'done');
+        for (var q = 0; q < prev.length; q++) ChatUi.markToolCard(prev[q], 'done');
         ChatUi.showTyping('正在调用工具…');
         var card = ChatUi.addToolCard(name);
         pendingToolCards.push(card);
@@ -1126,7 +1237,10 @@
 
   // ── ACP 服务端请求（如 session/request_permission） ──
   // wps 工具 policy 为 default_effect: ask（§8.1）：每次工具调用需审批。
-  // MVP 阶段自动批准（allow_once，仅本次会话本次调用），并回 UI 一条系统消息提示。
+  // Phase 2 C5（plan-2026-09-05 §6.2）：审批行为按能力标志适配——
+  //   approval=auto（qwenpaw 现状）：自动批准 allow_once（仅本次会话本次调用），无则取 options[0]；
+  //   approval=none/manual（opencode 等）：不自动批准、不盲选第一个——弹 UI 手动确认
+  //     （默认 build 权限全 allow 时 opencode 根本不发 request_permission，此路径只在改 ask 规则时触发）。
   function onAcpRequest(req) {
     if (!req || !req.method) return;
     QPLog('main', '收到 ACP 服务端请求 method=' + req.method + ' id=' + req.id);
@@ -1149,19 +1263,53 @@
         pendingToolCards.push(card);
         ChatUi.showTyping('正在调用工具…');
       }
-      var allow = null;
-      for (var i = 0; i < options.length; i++) {
-        if (options[i].optionId === 'allow_once') { allow = options[i]; break; }
-      }
-      if (!allow && options.length > 0) allow = options[0];
-      if (allow) {
-        AcpClient.respond(req.id, {
-          outcome: { outcome: 'selected', optionId: allow.optionId }
-        });
-        QPLog('main', 'request_permission: 已自动批准 ' + allow.optionId + ' (tool=' + toolTitle + ')');
+      var approvalMode = capabilities.approval || 'auto';
+      if (approvalMode === 'auto') {
+        // qwenpaw 现状：自动批准 allow_once（仅本次会话本次调用），无 allow_once 时取 options[0]。
+        var allow = null;
+        for (var i = 0; i < options.length; i++) {
+          if (options[i].optionId === 'allow_once') { allow = options[i]; break; }
+        }
+        if (!allow && options.length > 0) allow = options[0];
+        if (allow) {
+          AcpClient.respond(req.id, {
+            outcome: { outcome: 'selected', optionId: allow.optionId }
+          });
+          QPLog('main', 'request_permission: 已自动批准 ' + allow.optionId + ' (tool=' + toolTitle + ')');
+        } else {
+          AcpClient.respond(req.id, { outcome: { outcome: 'cancelled' } });
+          QPLog('main', 'request_permission: 无可用选项，已拒绝');
+        }
       } else {
-        AcpClient.respond(req.id, { outcome: { outcome: 'cancelled' } });
-        QPLog('main', 'request_permission: 无可用选项，已拒绝');
+        // manual/none（opencode 改 ask 规则）：弹 UI 手动确认，不盲选（§6.2 降级兜底）。
+        QPLog('main', 'request_permission: 手动审批（approval=' + approvalMode + '）tool=' + toolTitle);
+        ChatUi.addApprovalCard(toolTitle || '工具调用', toolArgs ? JSON.stringify(toolArgs).slice(0, 200) : '', {
+          onAllow: function () {
+            // 用户显式允许：优先选最受限的授权 option（allow_once 一次性 > allow_session 会话级），
+            // 避免单个"允许"点击意外授予持久权限（allow_always）；不盲选 options[0]。
+            var best = null;
+            var scoped = null;
+            for (var j = 0; j < options.length; j++) {
+              var oid = options[j].optionId || '';
+              if (oid === 'allow_once') { best = options[j]; break; }
+              if (oid === 'allow_session') { scoped = options[j]; }
+            }
+            if (!best) best = scoped;
+            if (best) {
+              AcpClient.respond(req.id, { outcome: { outcome: 'selected', optionId: best.optionId } });
+              QPLog('main', 'request_permission: 手动允许 ' + best.optionId + ' (tool=' + toolTitle + ')');
+            } else {
+              // 无一次性/会话级 option（如只有 allow_always）：弹 UI 让用户明确选择，不替用户决定
+              ChatUi.addMessage('system', '工具「' + toolTitle + '」需要更高权限授权，请在 AI 后端调整权限规则后重试。');
+              AcpClient.respond(req.id, { outcome: { outcome: 'cancelled' } });
+              QPLog('main', 'request_permission: 无一次性/会话级 option，已取消（避免误授持久权限）');
+            }
+          },
+          onDeny: function () {
+            AcpClient.respond(req.id, { outcome: { outcome: 'cancelled' } });
+            QPLog('main', 'request_permission: 手动拒绝 (tool=' + toolTitle + ')');
+          }
+        });
       }
     }
   }

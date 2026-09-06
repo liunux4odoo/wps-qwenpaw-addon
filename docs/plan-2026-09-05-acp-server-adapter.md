@@ -1,6 +1,7 @@
 # ACP Server Adapter 改造方案（v0.3：以兼容 opencode 为第一实施目标）
 
-> **文档状态**：v0.3（2026-09-06，review 修订）
+> **文档状态**：v0.4（2026-09-07，Phase 2 完成）
+> **v0.3 → v0.4 变更**：Phase 2 落地完成（C4-C8）：看门狗任意下行续命 / 审批按标志分支（非 auto 弹 UI 手动确认不盲选）/ 中止按标志（cancel:false 走 session/close+重建）/ session/load 按 loadSession 门禁 / opencode agent 切换 set_config_option 应用（V11 实测）/ tool_call 工具卡片；capabilities 新增 switchSemantics；qwenpaw 零回归（adapter E2E 全绿）。A7 属 Phase 3 范围。
 > **v0.1 → v0.2 变更**：目标从"泛化多 ACP 后端"**收敛为"先以兼容 opencode 为目标"**；纳入 opencode Phase 0 实测结果（V1-V5/V7 已验，V6/V8 待补）；kilocode 因配置错误推迟
 > **v0.2 → v0.3 变更**：补 C9（ACP `initialize` 握手缺失，前端/bridge 现状从不发 initialize）耦合点与 V10/V11 待测项（Phase 1 前置门）；修正 C2 行号（429-499）；修订 §5.2 opencode agent 切换语义（与 V9 只读结论一致）；澄清 §6.2 盲选兜底（现状 `main.js:1156` 已有 `options[0]` 兜底）与 §6.3 看门狗实际缺口（tool_call 类不续命）；`docs/acp-servers/opencode.md` 移除明文 API key（已写入本机配置）
 > **独立文档**：从 `docs/DEV-PLAN-Phase3.md` §3 F1（后续计划）提升为可实施计划；F1 原条目标注"仅规划，不在阶段 3 实施"，本文档为其落地方案
@@ -92,7 +93,9 @@
 Phase 0  目标 server 能力验证（阻塞门）→ opencode 已全部完成（V1-V11 ✅），kilocode 待补
 Phase 1  bridge server adapter 抽象（C1-C3/C8/C9）→ ✅ 已完成（2026-09-06）：--acp-server qwenpaw|opencode，
          bridge/servers.py adapter，qwenpaw 零回归 + opencode 可建会话（test_adapter.py / test_switch_race.py / test_bridge.py 全绿）
-Phase 2  前端协议偏好按能力标志适配（C4-C7）→ opencode 差异显式化
+Phase 2  前端协议偏好按能力标志适配（C4-C8）→ ✅ 已完成（2026-09-07）：opencode 差异显式化
+         （看门狗任意下行续命 / 审批手动确认不盲选 / 中止 session/close 重建 / load 按标志门禁 /
+          agent 切换 set_config_option 应用 / tool_call 过程呈现；qwenpaw 零回归）
 Phase 3  UI 配置化（F1 完整形态）→ 插件页面配置 ACP server
 ```
 
@@ -154,7 +157,7 @@ adapter 是 bridge 内部的一个**配置化描述**（不是代码插件），
 
 - **spawn**：`opencode acp --cwd <dir>`（无 `--agent` 参数；`protocolVersion` 用整数 `1`）
 - **session/new**：必须带 `mcpServers`（数组，可为 `[]`）——bridge 建会话逻辑需保证默认传空数组
-- **agent 语义**：`opencode agent list` 枚举（build/plan + 自定义 skill agent）；**切换 = `session/set_config_option(configId:"mode", value:<mode>)`**（V11 已实测：configOptions 数组只读不生效，set_config_option 生效且为**会话级**——新建会话默认仍 build）。与 qwenpaw 的 kill+restart 不同
+- **agent 语义**：`opencode agent list` 枚举（build/plan + 自定义 skill agent）；**切换 = `session/set_config_option(configId:"mode", value:<mode>)`**（V11 已实测：configOptions 数组只读不生效，set_config_option 生效且为**会话级**——新建会话默认仍 build）。与 qwenpaw 的 kill+restart 不同。**Phase 2 已落地**：前端会话建立成功后按 `switchSemantics=config_option` + 用户记录选择，对新会话发 set_config_option(mode) 应用（V11 实测通过）
 - **中止**：不支持 `session/cancel`，前端中止走 `session/close`（破坏会话）或等待自然结束
 
 ### 5.3 配置面（CONFIG）
@@ -173,9 +176,19 @@ adapter 是 bridge 内部的一个**配置化描述**（不是代码插件），
 
 ---
 
-## 6. Phase 2：前端协议偏好按能力标志适配（C4-C8）
+## 6. Phase 2：前端协议偏好按能力标志适配（C4-C8）✅ 已完成（2026-09-07）
 
 > 前置：Phase 0 拿到能力标志，bridge `/config` 下发 `capabilities` 字段。
+> **实施落地**：`bridge/servers.py` capabilities 新增 `switchSemantics`（restart/config_option）；
+> `js/main.js` 解析 /config capabilities（默认 qwenpaw 兼容）、看门狗任意下行续命、审批按标志
+> 分支（非 auto 弹 UI 手动确认）、中止按标志（cancel:false 走 session/close+重建）、
+> session/load 按 loadSession 门禁、opencode agent 切换用 set_config_option(mode)（V11 会话级）、
+> tool_call 更新渲染工具卡片。qwenpaw 零回归（test_adapter.py qwenpaw/opencode E2E 全绿）。
+> **review 修订（2026-09-07）**：① 手动审批 onAllow 优先 allow_once > allow_session，避免单个
+> "允许"误授持久权限（allow_always），不盲选 options[0]；② session/update 增加会话 id 守卫
+> （非当前会话的残留 tool_call/流式不渲染不续命）；③ switchAgent 按 switchSemantics 分支——
+> config_option 对当前会话 set_config_option 应用（不销毁会话/历史），opencode+旧 bridge 版本
+> 倾斜时显式报错不静默销毁。
 
 ### 6.1 路线 P 注入（C4）——opencode ✅
 
@@ -183,29 +196,33 @@ adapter 是 bridge 内部的一个**配置化描述**（不是代码插件），
 - 其它 server（如 kilocode）V2 未测，走"先验后定"：不通则降级单 wps-mcp（见下）
 - **验收**：opencode 下多窗口独立端口隔离正常（WPS_POLL_PORT 各自独立）
 
-### 6.2 审批自动批准（C5）——opencode 默认无审批
+### 6.2 审批自动批准（C5）——opencode 默认无审批 ✅
 
-- 能力标志声明该 server 是否发审批（opencode=`no_approval`，build 全 allow）
+- 能力标志声明该 server 是否发审批（opencode=`approval:none`，build 全 allow）
 - **opencode 下**：无审批环节 → 自动批准路径不触发，工具直接执行（无需改动，但不能误以为 qwenpaw 的 `allow_once` 逻辑在用）
 - **降级兜底**：若用户把 opencode 权限改成 `ask`（会发 request_permission），映射不到 option 时**弹 UI 手动确认**，不盲选第一个。⚠️ 现状 `main.js:1156` 已有"盲选 `options[0]`"兜底，Phase 2 必须按能力标志改造该分支（qwenpaw 保留自动批准；opencode 默认无审批则整条路径不触发；ask 场景改手动确认），否则该行仍会盲选
 - **验收**：opencode 默认配置下工具调用直接执行，无假审批 UI
+- **✅ 落地**：`onAcpRequest` 按 `capabilities.approval` 分支——auto（qwenpaw）保留 allow_once 自动批准 + options[0] 兜底；none/manual（opencode 改 ask 规则）弹 `ChatUi.addApprovalCard`（允许/拒绝按钮），用户显式允许才按 allow 语义 option 应答，**不盲选**
 
-### 6.3 看门狗心跳（C6）——opencode 必改
+### 6.3 看门狗心跳（C6）——opencode 必改 ✅
 
 - opencode **不发 agent_thought_chunk / status_update** → 现心跳的 thought 续命（`main.js:1095`）与 status_update 续命（`main.js:1108`）在 opencode 下不触发。实际缺口是**工具执行期**：opencode 只下发 `tool_call` / `tool_call_update` / `usage_update`，三者均不调用 `touchActivity` → 长工具链会误报中断。注意 `touchActivity` 现状已由 agent_message_chunk / status_update / request_permission 触发，不是只靠 thought chunk
 - **必改**：看门狗改为**任意下行消息都续命**（`touchActivity` 扩展为协议通用行为：agent_message_chunk / tool_call / tool_call_update / usage_update / available_commands_update / 未识别 update 一律刷新）
 - **验收**：opencode 长思考 + 工具执行期不误报中断
+- **✅ 落地**：`onAcpSessionUpdate` 顶部无条件 `touchActivity()`（任何 session/update 都续命），qwenpaw 现路径不受影响；另为 opencode 的 `tool_call` 更新渲染工具卡片（P4 过程呈现）
 
 ### 6.4 session/load（C7）——opencode ✅ 支持
 
 - opencode 实测：`session/load` 支持历史恢复（close 后仍可 load），**需 cwd + mcpServers 必填**（adapter 注意）
 - P15 历史恢复在 opencode 下可用（AI 上下文记忆恢复）
 - **验收**：opencode 重开文档 P15 历史恢复正常；load 必填参数由 bridge adapter 补齐
+- **✅ 落地**：前端 session/new|load 恒带 cwd+mcpServers（现状已满足，bridge 转发时权威注入）；`ensureSessionSend` 按 `capabilities.loadSession` 门禁（不支持的 server 直接 session/new）
 
-### 6.5 中止（C8）——opencode 不支持 cancel，新增适配
+### 6.5 中止（C8）——opencode 不支持 cancel，新增适配 ✅
 
 - opencode 不支持 `session/cancel` → 前端中止按钮改为调用 `session/close`（破坏当前会话，下次重建）或提供"停止等待"但不销毁会话的降级
 - **验收**：opencode 下点击中止有明确行为（销毁会话重建 / 停止等待），不静默无效
+- **✅ 落地**：`onStop` 按 `capabilities.cancel` 分支——qwenpaw（cancel=true）保留 session/cancel；opencode（cancel=false）发送 session/close + 清缓存 + 自动重建新会话，UI 明确提示"已停止（当前 AI 后端不支持取消，已结束本次会话，下次发送将自动新建会话）"（A8）
 
 ---
 
@@ -223,7 +240,8 @@ adapter 是 bridge 内部的一个**配置化描述**（不是代码插件），
 ```
 Phase 0（opencode 已完成）→ 门：能力表落盘（docs/acp-servers/opencode.md ✅）+ V1-V11 ✅
 Phase 1（bridge adapter）→ ✅ 已完成（2026-09-06）：--acp-server qwenpaw|opencode，qwenpaw 零回归 + opencode 可建会话（A1/A2 过）
-Phase 2（前端能力适配）→ 门：opencode 全链路可用或显式降级
+Phase 2（前端能力适配）→ ✅ 已完成（2026-09-07）：C4-C8 + opencode agent 切换 set_config_option 应用，
+         qwenpaw 零回归（adapter E2E 全绿）；门：opencode 全链路可用或显式降级（WPS 实机验收待做）
 Phase 3（UI 配置）→ 门：UX 验收
 kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 ```
@@ -237,16 +255,16 @@ kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 
 ## 9. 验收标准（停止门）
 
-| ID | 验收项 | 度量 |
-|---|---|---|
-| A1 | qwenpaw 零回归 | `--acp-server qwenpaw` 现有行为/测试全绿 |
-| A2 | opencode 基本可用 | 可建会话（`mcpServers:[]` 兜底）、可对话、可工具调用（V1-V3 过前提下） |
-| A3 | 能力差异显式化 | 每个能力标志对应 UI 可见状态（支持 / 降级 / 禁用），无静默错误 |
-| A4 | opencode 无审批路径正确 | 默认配置下工具调用直接执行，无假审批 UI；改 ask 规则时弹 UI 手动确认不盲选 |
-| A5 | 看门狗通用 | 任意下行续命；opencode 长思考 + 工具执行不误报 |
-| A6 | 多窗口隔离诚实 | opencode V2 ✅ 多窗口正常；未验证的 server 明示降级不假装支持 |
-| A7 | 配置持久化 | 页面选择 server 后重启加载项仍生效 |
-| A8 | opencode 中止有明确行为 | 中止按钮不静默无效（close 重建或停止等待） |
+| ID | 验收项 | 度量 | 状态 |
+|---|---|---|---|
+| A1 | qwenpaw 零回归 | `--acp-server qwenpaw` 现有行为/测试全绿 | ✅（2026-09-07 test_adapter qwenpaw E2E） |
+| A2 | opencode 基本可用 | 可建会话（`mcpServers:[]` 兜底）、可对话、可工具调用（V1-V3 过前提下） | ✅（2026-09-07 test_adapter opencode E2E + set_config_option 实测） |
+| A3 | 能力差异显式化 | 每个能力标志对应 UI 可见状态（支持 / 降级 / 禁用），无静默错误 | ✅ 代码落地（中止提示/审批手动 UI/工具卡片）；WPS 实机目验待做 |
+| A4 | opencode 无审批路径正确 | 默认配置下工具调用直接执行，无假审批 UI；改 ask 规则时弹 UI 手动确认不盲选 | ✅ 代码落地；ask 规则 option 形状待 WPS 实机补测 |
+| A5 | 看门狗通用 | 任意下行续命；opencode 长思考 + 工具执行不误报 | ✅ 代码落地；实机长工具链待测 |
+| A6 | 多窗口隔离诚实 | opencode V2 ✅ 多窗口正常；未验证的 server 明示降级不假装支持 | ✅（V2 实测透传 env） |
+| A7 | 配置持久化 | 页面选择 server 后重启加载项仍生效 | ⏳ Phase 3（UI 配置化）范围 |
+| A8 | opencode 中止有明确行为 | 中止按钮不静默无效（close 重建或停止等待） | ✅ 代码落地；实机目验待做 |
 
 ---
 

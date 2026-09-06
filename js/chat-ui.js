@@ -385,6 +385,69 @@ var ChatUi = (function () {
   }
 
   /**
+   * Phase 2 C5：工具审批卡（手动确认 UI，plan-2026-09-05 §6.2 降级兜底）。
+   * 用于 approval=manual/none 的 server（opencode 改 ask 规则时）：
+   * 不自动批准、不盲选 option，由用户点"允许/拒绝"后 onAllow/onDeny 回调应答。
+   * @param {string} name - 工具名
+   * @param {string} detail - 参数摘要（可选）
+   * @param {object} opts - { onAllow: fn, onDeny: fn }
+   * @returns {HTMLElement}
+   */
+  function addApprovalCard(name, detail, opts) {
+    var card = document.createElement('div');
+    card.className = 'tool-card pending approval-card';
+
+    var row = document.createElement('div');
+    row.className = 'tool-card-row';
+
+    var icon = document.createElement('span');
+    icon.className = 'tool-card-icon';
+    icon.textContent = '🔧';
+
+    var label = document.createElement('span');
+    label.className = 'tool-card-name';
+    label.textContent = name || '工具调用';
+
+    var status = document.createElement('span');
+    status.className = 'tool-card-status';
+    status.textContent = '等待审批…';
+
+    row.appendChild(icon);
+    row.appendChild(label);
+    row.appendChild(status);
+    card.appendChild(row);
+
+    if (detail) {
+      var detailEl = document.createElement('div');
+      detailEl.className = 'tool-card-detail';
+      detailEl.textContent = detail;
+      card.appendChild(detailEl);
+    }
+
+    var actions = document.createElement('div');
+    actions.className = 'approval-actions';
+    var allowBtn = document.createElement('button');
+    allowBtn.className = 'err-btn primary';
+    allowBtn.textContent = '允许';
+    allowBtn.addEventListener('click', function () {
+      if (opts && opts.onAllow) opts.onAllow();
+    });
+    var denyBtn = document.createElement('button');
+    denyBtn.className = 'err-btn';
+    denyBtn.textContent = '拒绝';
+    denyBtn.addEventListener('click', function () {
+      if (opts && opts.onDeny) opts.onDeny();
+    });
+    actions.appendChild(allowBtn);
+    actions.appendChild(denyBtn);
+    card.appendChild(actions);
+
+    els.messages.appendChild(card);
+    scrollBottom();
+    return card;
+  }
+
+  /**
    * P4：显示打字指示器 + 阶段文案（思考中…/正在调用工具…/正在生成回复…）
    * @param {string} phase
    */
@@ -466,6 +529,7 @@ var ChatUi = (function () {
     finishAssistant: finishAssistant,
     addToolCard: addToolCard,
     markToolCard: markToolCard,
+    addApprovalCard: addApprovalCard,
     showTyping: showTyping,
     hideTyping: hideTyping,
     setStatus: setStatus,

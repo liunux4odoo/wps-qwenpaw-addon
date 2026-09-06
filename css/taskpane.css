@@ -239,6 +239,16 @@ html, body {
 /* P4：关闭"显示过程"时隐藏工具卡片 */
 .messages.hide-process .tool-card { display: none; }
 
+/* ── Phase 2 C5：工具审批卡（手动确认 UI，approval=manual/none 时） ── */
+.approval-card { cursor: default; }
+.approval-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 8px;
+}
+.approval-card .tool-card-status { color: #f39c12; }
+
 /* ── P4：打字指示器 + 阶段切换（位于消息区与工具栏之间，始终可见） ── */
 .typing {
     display: inline-flex;
