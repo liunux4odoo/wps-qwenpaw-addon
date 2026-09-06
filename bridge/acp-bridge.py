@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-acp-bridge — WebSocket/HTTP ↔ stdio 双向转发桥，连接 WPS 加载项与 `qwenpaw acp`。
+acp-bridge — WebSocket/HTTP ↔ stdio 双向转发桥，连接 WPS 加载项与 ACP server（默认 `qwenpaw acp`）。
 
 定位（ARCHITECTURE §3.4 / §8.2）：
   - 纯传输层转发：不解析 ACP 消息内容、不修改消息结构、不新增字段
-  - 解决"WPS 加载项只能走 HTTP/WebSocket，但 qwenpaw acp 只有 stdio"的传输断层
+  - 解决"WPS 加载项只能走 HTTP/WebSocket，但 ACP server 只有 stdio"的传输断层
+  - server adapter 抽象（docs/plan-2026-09-05 §5）：spawn / agent 发现 / 切换语义 / 能力标志
+    由 `bridge/servers.py` 的 adapter 提供，bridge 保持纯传输（--acp-server 选 server）
 
 传输前端（阶段 1 实测修正）：
   - WPS Linux 沙箱 **只放行 HTTP，拦截 WebSocket**（实测：:58891 HTTP fetch 通，:8765 ws 不通）。
     因此加载项侧走 **HTTP 短轮询**（与 wps-office-mcp :58891 同机制）；WebSocket 前端保留供
-    非 WPS 场景/调试使用。两者共享同一 qwenpaw acp 子进程与下行路由表。
+    非 WPS 场景/调试使用。两者共享同一 ACP server 子进程与下行路由表。
 
 HTTP 端点（加载项侧 acp-client.js 使用）：
   - GET  /status                    -> {"status":"running","agent":...,"ports":{...}}
-  - GET  /config                    -> {"wpsMcpEntry":...,"pollPortStart":...,"pollPortEnd":...}
-  - GET  /agents                    -> {"agents":[{id,name,description}],"current":agent}（P3 agent 列表）
-  - POST /agent/set?agent=X         -> 切换 agent（重启 qwenpaw acp 子进程，P3）
-  - POST /acp/send?clientId=X       body=NDJSON ACP 请求（一行一条 JSON-RPC）-> 写 qwenpaw stdin
+  - GET  /config                    -> {"wpsMcpEntry":...,"pollPortStart":...,"pollPortEnd":...,
+                                        "acpServer":...,"capabilities":{...}}（能力标志供前端适配，Phase 2）
+  - GET  /agents                    -> {"agents":[{id,name,description}],"current":agent}（P3 agent/mode 列表）
+  - POST /agent/set?agent=X         -> 切换 agent/mode（语义由 adapter 定：qwenpaw=重启子进程；opencode=记录选择，P3）
+  - POST /acp/send?clientId=X       body=NDJSON ACP 请求（一行一条 JSON-RPC）-> 写 ACP server stdin
   - GET  /acp/poll?clientId=X       -> 该 clientId 的待下行 ACP 消息（JSONL，每行一条）
   - GET  /ui/*                      -> 加载项 UI 静态文件（CreateTaskPane 经此加载 taskpane.html，
                                        与 ACP 轮询同源，无 CORS 问题；根目录为插件仓库根，可 --ui-root 覆盖）
@@ -36,8 +39,8 @@ Wire 协议（阶段 0.5 实测，ACP v0.12.2）：
   - 流式下行：session/update 通知（无 id，带 sessionId），update.sessionUpdate=agent_message_chunk
 
 用法：
-  python acp-bridge.py [--port 8765] [--http-port 8766] [--agent default] [--host 127.0.0.1]
-                       [--ui-root <插件仓库根>] [--wps-mcp-entry <dist/index.js 绝对路径>]
+  python acp-bridge.py [--port 8765] [--http-port 8766] [--agent default] [--acp-server qwenpaw]
+                       [--host 127.0.0.1] [--ui-root <插件仓库根>] [--wps-mcp-entry <dist/index.js 绝对路径>]
 """
 from __future__ import annotations
 
@@ -46,8 +49,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
-import sys
 import time
 from collections import deque
 from urllib.parse import unquote
@@ -55,12 +56,14 @@ from urllib.parse import unquote
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
+from servers import get_adapter
+
 log = logging.getLogger("acp-bridge")
 
 MAX_POLL_BATCH = 200
 
 # ── agent 切换竞态修复（docs/plan-2026-09-04-agent-switch-mcp-race-fix.md）─────────────
-# 根因 1 修复：切换 agent 后 /agent/set 返回 ok 之前等待新 qwenpaw acp 子进程 spawn 就绪，
+# 根因 1 修复：切换 agent 后 /agent/set 返回 ok 之前等待新 ACP server 子进程 spawn 就绪，
 # 期间上行消息不静默丢弃（排队转发）；两者都有上限，crash loop 不无限挂起。
 SWITCH_READY_TIMEOUT = 8.0    # switch_agent 等新子进程就绪超时（前端 /agent/set XHR 超时 10s，留余量）
 UPSTREAM_QUEUE_MAX = 512      # 上行排队条数上限（异常积压时丢最旧，防内存失控）
@@ -125,7 +128,7 @@ class _BoundedLineReader:
                 return line
             # 缓冲中已无完整行，且长度超限（无换行的超长单行）：跳过该行防内存爆
             if len(self._buf) >= MAX_LINE_BYTES:
-                log.warning("qwenpaw %s: 单行超过 %d 字节（无换行），跳过该行内容（reader 不崩溃）",
+                log.warning("%s: 单行超过 %d 字节（无换行），跳过该行内容（reader 不崩溃）",
                             self._name, MAX_LINE_BYTES)
                 self._buf.clear()
                 while True:
@@ -150,11 +153,14 @@ class _BoundedLineReader:
 
 class AcpBridge:
     def __init__(self, port: int = 8765, http_port: int = 8766, agent: str = "default", host: str = "127.0.0.1",
-                 ui_root: str | None = None, log_file: str | None = None, wps_mcp_entry: str | None = None):
+                 ui_root: str | None = None, log_file: str | None = None, wps_mcp_entry: str | None = None,
+                 acp_server: str = "qwenpaw"):
         self.port = port
         self.http_port = http_port
         self.agent = agent
         self.host = host
+        # server adapter：spawn / agent 发现 / 切换语义 / 能力标志（plan-2026-09-05 §5）
+        self.adapter = get_adapter(acp_server, self)
         # 静态文件根目录（加载项 UI 文件，/ui/* 映射）：默认插件仓库根（bridge/ 的上一级）
         self.ui_root = ui_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         # wps-office-mcp 入口（dist/index.js）：依赖 opencode-wps 作为 submodule 固定在
@@ -183,13 +189,13 @@ class AcpBridge:
         # 子进程
         self.proc: asyncio.subprocess.Process | None = None
         self._restart_delay = 1.0
-        # 根因 1：新 qwenpaw acp 子进程 spawn 就绪信号 + 上行排队（stdin 不可用时不静默丢弃）
+        # 根因 1：新 ACP server 子进程 spawn 就绪信号 + 上行排队（stdin 不可用时不静默丢弃）
         self._proc_started = asyncio.Event()
         self._restart_seq = 0             # 递增即唤醒 _wait_proc 的在途退避等待（switch_agent 用）
         self._upstream_queue: deque[tuple[str, str | None, float]] = deque()  # (raw, client_id, enqueue_time)
         self._upstream_bytes = 0          # 排队总字符数（字节预算防护，配合条数上限）
         self._flushing = False
-        # P3：agent 列表缓存（qwenpaw agent list 启动开销约 8s，TTL 缓存避免每次 /agents 都慢）
+        # P3：agent 列表缓存（agent 发现冷启动开销大，TTL 缓存避免每次 /agents 都慢）
         self._agents_cache: list[dict] = []
         self._agents_cached_at: float = 0.0
         self._agents_failed_at: float = 0.0   # 上次查询失败时间（负缓存，防反复跑慢路径）
@@ -383,25 +389,16 @@ class AcpBridge:
             return json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
         return raw
 
-    # ── qwenpaw acp 子进程 ──────────────────────────────────────────
-    def _qwenpaw_bin(self) -> str:
-        found = shutil.which("qwenpaw")
-        if found:
-            return found
-        here = os.path.join(os.path.dirname(sys.executable), "qwenpaw")
-        if os.path.exists(here):
-            return here
-        return "qwenpaw"
-
+    # ── ACP server 子进程（spawn 由 adapter 生成，进程生命周期通用） ──────
     AGENTS_CACHE_TTL = 60.0
     AGENTS_FAIL_TTL = 5.0   # 查询失败后的负缓存窗口：避免反复跑 7s 级 CLI 慢路径
 
     async def list_agents(self) -> list[dict]:
-        """查询可用 agent 列表（qwenpaw agent list），供加载项侧选择（P3）。
+        """查询可用 agent 列表（adapter 枚举），供加载项侧选择（P3）。
 
         返回 [{id, name, description}]；命令失败/解析失败返回空列表（不抛异常）。
         注：这是配置面查询（类似 /status），不实现任何 ACP 业务逻辑（守 §6.1 铁律）。
-        TTL 缓存：qwenpaw agent list 冷启动约 8s，避免每次 /agents 都慢。startup 后台预取。
+        TTL 缓存：agent 发现冷启动开销大（qwenpaw 约 8s），避免每次 /agents 都慢。startup 后台预取。
         失败负缓存：上次查询失败后短时间内直接返回当前缓存（可能为空），不重复跑慢路径。
         """
         if self._agents_lock.locked():
@@ -418,7 +415,7 @@ class AcpBridge:
                 return list(self._agents_cache)
             if self._agents_cache and time.monotonic() - self._agents_cached_at < self.AGENTS_CACHE_TTL:
                 return list(self._agents_cache)
-            agents = await self._fetch_agents()
+            agents = await self.adapter.fetch_agents()
             if agents:
                 self._agents_cache = agents
                 self._agents_cached_at = time.monotonic()
@@ -426,94 +423,15 @@ class AcpBridge:
                 self._agents_failed_at = time.monotonic()
             return list(agents)
 
-    async def _fetch_agents(self) -> list[dict]:
-        """实际查询 agent 列表：优先 qwenpaw daemon 的 HTTP API（快），失败回退 CLI 子进程。"""
-        base = self._daemon_base_url()
-        if base:
-            try:
-                agents = await asyncio.to_thread(self._http_get_json, base + "/api/agents")
-                if agents:
-                    return self._normalize_agents(agents.get("agents") or [])
-            except Exception as e:
-                log.info("agent 列表 daemon API 不可用（%s），回退 qwenpaw agent list", e)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self._qwenpaw_bin(), "agent", "list",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=dict(os.environ, PYTHONUNBUFFERED="1"),
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            obj = json.loads(stdout.decode("utf-8", "replace"))
-            return self._normalize_agents(obj.get("agents") or [])
-        except Exception as e:
-            log.warning("list_agents 失败: %s", e)
-            return []
+    async def _restart_proc(self) -> None:
+        """进程级重启 ACP 子进程（switch_semantics="restart" 时由 /agent/set 调用）。
 
-    @staticmethod
-    def _normalize_agents(agents: list) -> list[dict]:
-        out = []
-        for a in agents:
-            if not isinstance(a, dict):
-                continue
-            if not a.get("id"):
-                continue
-            out.append({
-                "id": str(a["id"]),
-                "name": str(a.get("name") or a["id"]),
-                "description": str(a.get("description") or ""),
-            })
-        return out
-
-    @staticmethod
-    def _http_get_json(url: str, timeout: float = 3.0) -> dict | None:
-        """同步 GET 一个 JSON 端点（在 to_thread 中调用）。失败返回 None。"""
-        try:
-            import urllib.request
-            req = urllib.request.Request(url, headers={"User-Agent": "acp-bridge"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status != 200:
-                    return None
-                return json.loads(resp.read().decode("utf-8", "replace"))
-        except Exception:
-            return None
-
-    def _daemon_base_url(self) -> str | None:
-        """解析 qwenpaw daemon 地址（config.json last_api.host:port），解析失败返回 None。"""
-        try:
-            working = os.environ.get("QWENPAW_WORKING_DIR", "")
-            if not working:
-                return None
-            cfg_path = os.path.join(working, "config.json")
-            if not os.path.exists(cfg_path):
-                return None
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            api = cfg.get("last_api") or {}
-            host = api.get("host") or "127.0.0.1"
-            port = api.get("port")
-            if not port:
-                return None
-            return f"http://{host}:{port}"
-        except Exception:
-            return None
-
-    async def switch_agent(self, agent_id: str) -> tuple[bool, str]:
-        """切换到指定 agent：杀掉当前 qwenpaw acp 子进程，_wait_proc 会用新 agent 自动重启。
-
-        返回 (ok, err)。agent 列表以 qwenpaw agent list 为准；未找到返回失败。
+        adapter.switch_agent 已校验并记录新 agent；此处杀掉当前子进程，
+        _wait_proc 会用 adapter.spawn_cmd()（读取 self.agent）自动重启。
         """
-        if not agent_id:
-            return False, "agent 为空"
-        if agent_id == self.agent:
-            return True, "已是指定 agent"
-        known = await self.list_agents()
-        if known and not any(a["id"] == agent_id for a in known):
-            return False, f"未知 agent: {agent_id}"
-        log.info("switching agent: %s -> %s", self.agent, agent_id)
-        self.agent = agent_id
+        log.info("switching agent: %s（重启 ACP 子进程）", self.agent)
         # 主动切换 = 有意重启：复位退避延迟，避免此前多次崩溃把 _restart_delay 推到 30s，
-        # 导致 agent 切换后 qwenpaw acp 迟迟不拉起来。
+        # 导致 agent 切换后 ACP 子进程迟迟不拉起来。
         self._restart_delay = 1.0
         # 根因 1：递增 _restart_seq 唤醒 _wait_proc 的在途退避等待（若正处 crash loop 退避睡眠），
         # 让新 agent 尽快 spawn；再重置就绪事件等待新子进程 spawn 完成（kill 后 _wait_proc 会 set）。
@@ -524,19 +442,18 @@ class AcpBridge:
                 self.proc.kill()
             except Exception:
                 pass
-        # 根因 1：返回 ok 前等待新 qwenpaw acp 子进程 spawn 就绪（stdin 可写），
+        # 根因 1：返回 ok 前等待新 ACP 子进程 spawn 就绪（stdin 可写），
         # 避免前端立即 session/new 落在"stdin 不可用"窗口被丢弃。
         # 有上限：crash loop 时不无限挂起；超时返回 ok，由上行排队 + 前端超时重试兜底。
         try:
             await asyncio.wait_for(self._proc_started.wait(), timeout=SWITCH_READY_TIMEOUT)
-            log.info("switch_agent: 新 qwenpaw acp 子进程就绪 (agent=%s)", agent_id)
+            log.info("switch_agent: 新 ACP 子进程就绪 (agent=%s)", self.agent)
         except asyncio.TimeoutError:
             log.warning("switch_agent: 等待新子进程就绪超时（%.0fs），由上行排队+前端重试兜底", SWITCH_READY_TIMEOUT)
-        return True, ""
 
     async def start_proc(self) -> None:
-        cmd = [self._qwenpaw_bin(), "acp", "--agent", self.agent]
-        log.info("spawning qwenpaw acp: %s", " ".join(cmd))
+        cmd = self.adapter.spawn_cmd()
+        log.info("spawning %s acp: %s", self.adapter.name, " ".join(cmd))
         self.proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -553,18 +470,18 @@ class AcpBridge:
         asyncio.create_task(self._flush_upstream())
 
     def _proc_ready(self) -> bool:
-        """qwenpaw acp 子进程 stdin 是否可写（spawn 完成即可写，消息由 qwenpaw 缓冲处理）。"""
+        """ACP server 子进程 stdin 是否可写（spawn 完成即可写，消息由 server 缓冲处理）。"""
         return bool(self.proc and self.proc.stdin and not self.proc.stdin.is_closing())
 
     async def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
-        reader = _BoundedLineReader(self.proc.stdout, "stdout")
+        reader = _BoundedLineReader(self.proc.stdout, f"{self.adapter.name} stdout")
         while True:
             line = await reader.readline()
             if line is None:
                 continue  # 超长行已显式打日志跳过，继续读下一行
             if not line:
-                log.info("qwenpaw acp stdout EOF")
+                log.info("%s acp stdout EOF", self.adapter.name)
                 break
             text = line.decode("utf-8", "replace").rstrip("\n")
             if text:
@@ -572,19 +489,19 @@ class AcpBridge:
 
     async def _stderr_reader(self) -> None:
         assert self.proc and self.proc.stderr
-        reader = _BoundedLineReader(self.proc.stderr, "stderr")
+        reader = _BoundedLineReader(self.proc.stderr, f"{self.adapter.name} stderr")
         while True:
             line = await reader.readline()
             if line is None:
                 continue  # 超长行已显式打日志跳过，继续读下一行
             if not line:
                 break
-            log.debug("qwenpaw stderr: %s", line.decode("utf-8", "replace").rstrip("\n"))
+            log.debug("%s stderr: %s", self.adapter.name, line.decode("utf-8", "replace").rstrip("\n"))
 
     async def _wait_proc(self) -> None:
         assert self.proc
         rc = await self.proc.wait()
-        log.error("qwenpaw acp exited rc=%s, restarting in %.1fs", rc, self._restart_delay)
+        log.error("%s acp exited rc=%s, restarting in %.1fs", self.adapter.name, rc, self._restart_delay)
         self.proc = None
         # 退避等待可被 switch_agent 提前唤醒（_restart_seq 递增即退出），agent 切换不必等满整个退避。
         seq = self._restart_seq
@@ -595,14 +512,14 @@ class AcpBridge:
         try:
             await self.start_proc()
         except Exception:
-            log.exception("failed to restart qwenpaw acp")
+            log.exception("failed to restart %s acp", self.adapter.name)
 
     # ── 下行路由（stdio -> 前端） ──────────────────────────────────
     def _pop_request_owner(self, rid: object) -> str | None:
         """按转发顺序从请求队列弹出该 id 的归属 client。
 
         每个窗口的 ACP 请求 id 都从 1 递增（js/acp-client.js `var id = ++seq`），
-        多窗口并发必然出现同 id 请求。qwenpaw 顺序处理 stdin、按请求顺序回响应，
+        多窗口并发必然出现同 id 请求。ACP server 顺序处理 stdin、按请求顺序回响应，
         因此这里用全局 FIFO 队列按顺序去重：谁先发该 id，响应就归谁。"""
         while self._request_queue:
             q_rid, cid = self._request_queue.popleft()
@@ -613,7 +530,7 @@ class AcpBridge:
         return None
 
     async def _route_down(self, text: str) -> None:
-        """把 qwenpaw stdout 的一条 ACP 消息路由到对应前端。
+        """把 ACP server stdout 的一条 ACP 消息路由到对应前端。
         优先 HTTP 客户端（WPS 实际使用的），其次 WebSocket。"""
         log.debug("downstream: %s", self._summarize_acp(text))
         target = None
@@ -680,7 +597,7 @@ class AcpBridge:
 
     # ── 上行写入（前端 -> stdio） ──────────────────────────────────
     async def _write_stdin(self, raw: str, client_id: str | None = None) -> bool:
-        """把一条上行 ACP 消息写入 qwenpaw acp stdin。
+        """把一条上行 ACP 消息写入 ACP server stdin。
 
         根因 1 修复：stdin 不可用（agent 切换 kill 后/重启中）时**不静默丢弃**——
         排入 _upstream_queue，待新子进程 spawn 后按顺序转发；排队有 TTL 上限，
@@ -729,8 +646,8 @@ class AcpBridge:
             self._upstream_bytes -= len(old_raw)
             log.warning("upstream queue overflow (count=%d bytes=%d), dropped oldest client=%s",
                         len(self._upstream_queue), self._upstream_bytes, old_cid)
-        log.warning("qwenpaw acp stdin unavailable, queued %d upstream message(s) (client=%s)",
-                    len(self._upstream_queue), client_id or "ws")
+        log.warning("%s acp stdin unavailable, queued %d upstream message(s) (client=%s)",
+                    self.adapter.name, len(self._upstream_queue), client_id or "ws")
 
     @staticmethod
     def _queue_method(raw: str) -> str | None:
@@ -742,7 +659,7 @@ class AcpBridge:
             return None
 
     async def _flush_upstream(self) -> None:
-        """把排队中的上行消息按顺序转发到 qwenpaw acp（_flushing 守卫保证同一时刻只有
+        """把排队中的上行消息按顺序转发到 ACP server（_flushing 守卫保证同一时刻只有
         一个排空者，保持全局 FIFO：排队消息先于其后到达的新消息转发）。"""
         if self._flushing:
             return
@@ -784,7 +701,7 @@ class AcpBridge:
             rid = msg.get("id")
             if rid is not None and client_id and msg.get("method"):
                 # 只登记「客户端发起的请求」（带 method）；respond（id+result，无 method）
-                # 是对 qwenpaw 下行请求的应答，qwenpaw 不会回响应，不入队。
+                # 是对 ACP server 下行请求的应答，server 不会回响应，不入队。
                 self._request_queue.append((rid, client_id))
             params = msg.get("params")
             if isinstance(params, dict) and params.get("sessionId"):
@@ -883,22 +800,30 @@ class AcpBridge:
             elif path == "/config":
                 # 加载项侧确定性配置：wps-office-mcp 入口由 bridge 依据仓库根解析，
                 # 不依赖客户端机器上的硬编码绝对路径（submodule 固定后可确定）。
+                # acpServer + capabilities：当前 ACP server 与能力标志（plan-2026-09-05 §5.1/§6，
+                # Phase 2 前端按标志适配协议偏好）。
                 await self._http_json(writer, 200, {
                     "wpsMcpEntry": self.wps_mcp_entry,
                     "pollPortStart": POLL_PORT_START,
                     "pollPortEnd": POLL_PORT_END,
+                    "acpServer": self.adapter.name,
+                    "capabilities": dict(self.adapter.capabilities),
                 })
             elif path == "/agents" and method == "GET":
-                # P3：可用 agent 列表（qwenpaw agent list），供加载项侧下拉选择
+                # P3：可用 agent/mode 列表（adapter 枚举），供加载项侧下拉选择
                 agents = await self.list_agents()
                 await self._http_json(writer, 200, {
                     "agents": agents,
                     "current": self.agent,
                 })
             elif path == "/agent/set" and method == "POST":
-                # P3：切换 agent（重启 qwenpaw acp 子进程）
+                # P3：切换 agent/mode。语义由 adapter 决定：
+                #   qwenpaw（restart）→ 校验 + 记录 + 重启子进程；
+                #   opencode（config_option）→ 仅记录选择，会话级切换由前端 set_config_option 应用（Phase 2/3）。
                 target = query_params.get("agent", "")
-                ok, err = await self.switch_agent(target)
+                ok, err, need_restart = await self.adapter.switch_agent(target)
+                if ok and need_restart:
+                    await self._restart_proc()
                 await self._http_json(writer, 200 if ok else 400, {
                     "ok": ok,
                     "agent": self.agent,
@@ -1024,13 +949,15 @@ class AcpBridge:
             handlers=handlers,
         )
         await self.start_proc()
-        # P3：后台预取 agent 列表，让加载项首次打开时下拉立即可用（qwenpaw agent list 冷启动约 8s）
+        # P3：后台预取 agent 列表，让加载项首次打开时下拉立即可用（agent 发现冷启动开销大）
         asyncio.create_task(self.list_agents())
         http_server = await asyncio.start_server(self._http_handler, self.host, self.http_port)
-        log.info("acp-bridge HTTP listening on http://%s:%d (agent=%s)", self.host, self.http_port, self.agent)
+        log.info("acp-bridge HTTP listening on http://%s:%d (server=%s, agent=%s)",
+                 self.host, self.http_port, self.adapter.name, self.agent)
         log.info("acp-bridge UI static root: %s (/ui/*)", self.ui_root)
         async with serve(self._ws_handler, self.host, self.port) as ws_server:
-            log.info("acp-bridge WS listening on ws://%s:%d (agent=%s)", self.host, self.port, self.agent)
+            log.info("acp-bridge WS listening on ws://%s:%d (server=%s, agent=%s)",
+                     self.host, self.port, self.adapter.name, self.agent)
             try:
                 await asyncio.Future()  # run forever
             finally:
@@ -1044,13 +971,16 @@ def main() -> None:
     ap.add_argument("--http-port", type=int, default=8766, help="HTTP 轮询端口（WPS 加载项用）")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--agent", default="default")
+    ap.add_argument("--acp-server", default="qwenpaw",
+                    help="ACP server adapter（qwenpaw / opencode；默认 qwenpaw，现状零破坏）")
     ap.add_argument("--ui-root", default=None, help="加载项 UI 静态文件根目录（/ui/* 映射），默认插件仓库根")
     ap.add_argument("--log-file", default=None, help="调试日志文件路径（默认只写 stdout）")
     ap.add_argument("--wps-mcp-entry", default=None,
                     help="wps-office-mcp 入口 dist/index.js 绝对路径（默认 <ui-root>/third_party/opencode-wps/wps-office-mcp/dist/index.js）")
     args = ap.parse_args()
     asyncio.run(AcpBridge(port=args.port, http_port=args.http_port, agent=args.agent, host=args.host,
-                          ui_root=args.ui_root, log_file=args.log_file, wps_mcp_entry=args.wps_mcp_entry).run())
+                          ui_root=args.ui_root, log_file=args.log_file, wps_mcp_entry=args.wps_mcp_entry,
+                          acp_server=args.acp_server).run())
 
 
 if __name__ == "__main__":

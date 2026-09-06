@@ -17,14 +17,15 @@ WPS (加载项 taskpane, HTTP轮询 :8766) ── acp-bridge (HTTP/WS↔stdio) �
 ```bash
 ./scripts/install.sh                          # 一键安装/配置（submodule+build+补丁+noop+同步+起bridge）
 git submodule update --init --recursive       # 拉取 third_party/opencode-wps
-conda run -n py312 python bridge/acp-bridge.py --agent default   # 前台启动 bridge
-conda run -n py312 python -m py_compile bridge/acp-bridge.py     # 语法检查 bridge
+conda run -n py312 python bridge/acp-bridge.py --agent default   # 前台启动 bridge（--acp-server qwenpaw|opencode 选 adapter）
+conda run -n py312 python -m py_compile bridge/acp-bridge.py bridge/servers.py   # 语法检查 bridge + adapter
 node --check js/main.js                       # 语法检查加载项 JS（其余模块同理）
 ```
 
 ## Architecture (critical)
 
 - **硬约束**（不允许动）：见 docs/ARCHITECTURE.md §6。wps-office-mcp 零 fork（唯一例外：`WPS_POLL_PORT` env 支持，1 行加法）；acp-bridge 纯传输层不实现 ACP 业务逻辑；只绑 `127.0.0.1`；文档操作必须经 QwenPaw→MCP→wps-mcp。
+- **server adapter**：bridge 的 spawn/agent 发现/切换语义/能力标志由 `bridge/servers.py` 提供（`--acp-server qwenpaw|opencode`，默认 qwenpaw 零回归）；qwenpaw 专属逻辑在 QwenpawAdapter，opencode 在 OpencodeAdapter（docs/plan-2026-09-05 §5）。
 - **入口**：`js/main.js` 是唯一耦合点（知道所有模块，其他模块互不依赖）。
 - **wps 路线 P**：每 ACP session 一个 wps-mcp 子进程，bridge 集中分配 `WPS_POLL_PORT`（59000+），多窗口并发合法（docs/ARCHITECTURE.md §13）。
 - **WPS Linux 沙箱**：只放行 HTTP，拦 WebSocket → 加载项走 HTTP 短轮询（bridge :8766）；CreateTaskPane 只能 HTTP URL（bridge /ui/* 托管）。

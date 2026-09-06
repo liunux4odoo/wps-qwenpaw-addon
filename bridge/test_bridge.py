@@ -4,11 +4,12 @@
 """
 import asyncio
 import json
+import os
 import sys
 
 import websockets
 
-WS_URL = "ws://127.0.0.1:8765"
+WS_URL = os.environ.get("BRIDGE_WS_URL", "ws://127.0.0.1:8765")
 
 
 async def recv_until(ws, target_id, timeout=90):

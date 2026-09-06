@@ -76,7 +76,8 @@ def main():
     wps_entry = "/data/myrepo/wps-qwenpaw-addon/third_party/opencode-wps/wps-office-mcp/dist/index.js"
     flog = open(BRIDGE_LOG, "w")
     bridge = subprocess.Popen(
-        [sys.executable, BRIDGE, "--http-port", str(PORT), "--agent", agent_a,
+        [sys.executable, BRIDGE, "--http-port", str(PORT), "--port", str(PORT + 1),
+         "--agent", agent_a,
          "--wps-mcp-entry", wps_entry, "--log-file", BRIDGE_LOG],
         stdout=flog, stderr=subprocess.STDOUT, text=True,
     )

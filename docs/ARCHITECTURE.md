@@ -52,12 +52,17 @@
 
 ## §0 文档元信息
 
-- **方案版本**：v0.22（阶段 3 方案补 P14/P15，2026-09-03）
-- **上一里程碑**：v0.21 阶段 3 方案 A-G 直接整合进 P 系列（DEV-PLAN-Phase3.md v1.2）；v0.22 按用户补充新增 P14（清除对话历史）/ P15（同一文档加载历史对话记录），DEV-PLAN-Phase3.md v1.3；**P15 已核实与 ACP 会话历史不重复**——`session/load` 恢复 AI 上下文记忆（后端，qwenpaw session state JSON 落盘），ACP 无拉取消息明文接口，前端历史显示需自缓存（localStorage 按 doc_id）
+- **方案版本**：v0.23（多 ACP server adapter 落地，2026-09-06）
+- **上一里程碑**：v0.22 阶段 3 方案补 P14/P15；v0.23 新增多 ACP server adapter 抽象（docs/plan-2026-09-05），bridge 支持 `--acp-server qwenpaw|opencode`，opencode 作为第一个第二 server 落地（spawn/建会话/对话/agent 枚举/切换语义）
 - **变更控制**：任何架构层决策的修改需回到 discuss agent 重启讨论
 
 ### 变更历史
 
+- **v0.23（多 ACP server adapter，2026-09-06）**：
+  - **server adapter 抽象**：bridge spawn / agent 发现 / 切换语义 / 能力标志 从硬编码 qwenpaw 抽为 `bridge/servers.py` 的 per-server adapter（§3.4 补 adapter 层说明）；默认 `--acp-server qwenpaw` 零回归
+  - **opencode 第一第二 server 落地**（D6）：spawn `opencode acp --cwd`（无 --agent，V1）；`mcpServers:[]` 兜底建会话（V3）；无 initialize 直接建会话可用（V10）；agent 枚举走 `opencode agent list`（V8）；mode 切换 = `session/set_config_option`（会话级，V11）而非 kill+重启
+  - **能力标志下发**：`/config` 返回 `acpServer` + `capabilities`（honorMcpEnv/approval/thoughtHeartbeat/loadSession/cancel/agents），供 Phase 2 前端按标志适配
+  - **验收**：`bridge/test_adapter.py`（qwenpaw+opencode E2E）+ test_switch_race.py/test_bridge.py qwenpaw 零回归全绿
 - **v0.22（阶段 3 方案补 P14/P15，2026-09-03）**：
   - **P14 清除对话历史**（用户补充）：UI 入口（"清空对话"按钮 + 确认），区别于 P13 `/clear` 快捷指令；清空动作 = 前端清 + 后端 `session/close`+`session/new`（V7 待验证有无 `session/clear`）
   - **P15 同一文档加载历史对话记录**（用户补充，已核实不重复）：`session/load` = AI 上下文记忆恢复（后端，qwenpaw session state JSON 落盘，key=session_id+user_id=`acp_{id[:8]}`+channel=""）；ACP 协议无拉取消息明文接口（server 方法仅 new/load/list/resume/close/prompt/cancel/set_session_model/set_config_option）；**前端历史显示需自缓存**（localStorage 按 doc_id），不扩展 bridge 读 qwenpaw 内部存储（守 §6.1 铁律）
@@ -414,7 +419,14 @@ acp-bridge **不做任何业务逻辑**，只做传输层转发（WebSocket ↔ 
 
 ### 3.4 ACP 桥接服务设计
 
-**定位**：解决"WPS 加载项只能走 WebSocket / HTTP，但 `qwenpaw acp` 只有 stdio"的传输层断层。纯转发、不实现业务逻辑、不修改 QwenPaw 源码。
+**定位**：解决"WPS 加载项只能走 WebSocket / HTTP，但 ACP server（`qwenpaw acp` 等）只有 stdio"的传输层断层。纯转发、不实现业务逻辑、不修改 ACP server 源码。
+
+**server adapter 层（v0.23，plan-2026-09-05）**：
+- bridge 的 spawn / agent 发现 / 切换语义 / 能力标志 由 `bridge/servers.py` 的 per-server adapter 提供（配置化描述，非协议归一化层，守"bridge 不做业务逻辑"铁律）
+- 启动参数 `--acp-server <name>`（默认 `qwenpaw`，现状零回归）；当前支持的 adapter：
+  - **qwenpaw**：`qwenpaw acp --agent X`，kill+restart 切换，daemon/CLI agent 发现（行为不变）
+  - **opencode**：`opencode acp --cwd`（无 --agent），`mcpServers:[]` 兜底建会话，无 initialize 握手（V10 ✅），agent 枚举走 `opencode agent list`（mode/自定义 agent），mode 切换 = `session/set_config_option`（会话级，V11 ✅）
+- `/config` 下发 `acpServer` + `capabilities`（能力标志，Phase 2 前端按标志适配：approval/thoughtHeartbeat/cancel/loadSession/honorMcpEnv/agents）
 
 **设计原则**：
 
@@ -432,7 +444,7 @@ acp-bridge **不做任何业务逻辑**，只做传输层转发（WebSocket ↔ 
 | ├─ 静态文件服务 `/ui/*` | 托管加载项 UI 文件（taskpane.html / js/*.js / css/*.css），供 CreateTaskPane 通过 HTTP URL 加载（v0.8 实测：本地文件路径空白，必须 HTTP） |
 | ├─ ACP 轮询 `/acp/*` | `/status`、`/acp/send`（POST 上行）、`/acp/poll`（GET 下行，JSONL），CORS `*` |
 | WebSocket Server :8765 | 供非 WPS 场景/调试（保留） |
-| spawn qwenpaw acp | 启动 `qwenpaw acp` 子进程，管理 stdin/stdout/stderr |
+| spawn ACP server | adapter 生成启动命令（qwenpaw：`qwenpaw acp --agent X`；opencode：`opencode acp --cwd`），管理 stdin/stdout/stderr |
 | 上行转发 | 前端收到消息 → 写子进程 stdin |
 | 下行转发 | 子进程 stdout → 解析 ACP 消息 → 按 sessionId/请求 id 路由到对应前端 |
 | 生命周期管理 | 桥接服务启动 → 拉起 qwenpaw acp；退出 → 杀子进程；子进程异常退出 → 重启（指数退避） |
@@ -444,10 +456,10 @@ acp-bridge **不做任何业务逻辑**，只做传输层转发（WebSocket ↔ 
 加载项（WPS taskpane / index.html 页面）
     │ HTTP 短轮询 http://127.0.0.1:8766/acp/{send,poll}
     ▼
-acp-bridge（Python 进程，1个，HTTP :8766 + WS :8765）
+acp-bridge（Python 进程，1个，HTTP :8766 + WS :8765；--acp-server 选 adapter）
     │ stdin / stdout（ACP NDJSON，每行一条）
     ▼
-qwenpaw acp（Python 子进程，1个，由 acp-bridge spawn）
+ACP server 子进程（1个，由 adapter spawn：qwenpaw acp / opencode acp）
     │ MCP stdio（每 session 注入 env.WPS_POLL_PORT，§13 路线 P 决策）
     ▼
 wps-office-mcp（Node.js 子进程，每 session 一个，各自监听独立 poll 端口 WPS_POLL_PORT）
@@ -664,6 +676,7 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 ### 6.3 允许的扩展方向（MVP 之后）
 
+- **多 ACP server 后端（v0.23 已落地第一个）**：bridge server adapter 抽象（`bridge/servers.py`）支持 `--acp-server qwenpaw|opencode`；opencode 已可 spawn/建会话/对话/agent 枚举。后续可加 kilocode（待其配置修复）、更多 server；Phase 2 前端按能力标志适配协议偏好（审批/看门狗/中止/load），Phase 3 UI 配置化
 - 添加 Excel/PPT 工具（MCP 侧挂更多工具）
 - 添加 Mac/Windows 支持（wps-office-mcp 已支持，验证即可）
 - 添加撤销/重做 UI（QwenPaw 会话记忆 + 加载项 UI）
