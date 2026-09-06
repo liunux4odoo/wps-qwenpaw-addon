@@ -1,6 +1,6 @@
 # opencode ACP 能力表（Phase 0 输出）
 
-> **server**：opencode 1.18.23（`/data/apps/bin/opencode`）
+> **server**：opencode 1.18.23（PATH 中的 `opencode`；bridge 以 `OPENCODE_BIN` env / PATH 解析）
 > **验证日期**：2026-09-05
 > **验证方法**：真实 wps-office-mcp（`third_party/opencode-wps/wps-office-mcp/dist/index.js`）+ 一次性探针脚本（`/tmp/acp_probe*.py`）
 > **关联**：`docs/plan-2026-09-05-acp-server-adapter.md`（v0.3，D6：第一实施目标 = opencode；V10/V11 待补测见 §7）

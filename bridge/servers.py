@@ -87,13 +87,19 @@ class QwenpawAdapter(AcpServerAdapter):
     }
 
     def _bin(self) -> str:
+        """解析 qwenpaw 可执行文件路径（PATH 优先，回退当前 Python 解释器同目录）。
+
+        未安装时抛 FileNotFoundError（含安装提示），不静默回退裸命令名。
+        """
         found = shutil.which("qwenpaw")
         if found:
             return found
         here = os.path.join(os.path.dirname(sys.executable), "qwenpaw")
-        if os.path.exists(here):
+        if os.path.exists(here) and os.access(here, os.X_OK):
             return here
-        return "qwenpaw"
+        raise FileNotFoundError(
+            "未找到可执行的 qwenpaw（当前 ACP server=qwenpaw）。"
+            "请先安装 qwenpaw 并确保其可执行文件在 PATH 中（或位于当前 Python 解释器同目录）。")
 
     def spawn_cmd(self) -> list[str]:
         return [self._bin(), "acp", "--agent", self.bridge.agent]
@@ -204,20 +210,21 @@ class OpencodeAdapter(AcpServerAdapter):
         "agents": True,             # V8 有 mode/自定义 agent 概念（agent list）
     }
 
-    # opencode 安装位置兜底（本机实际安装，非 PATH；可 OPENCODE_BIN 环境变量覆盖）
-    _KNOWN_PATHS = ("/data/apps/bin/opencode",)
-
     def _bin(self) -> str:
+        """解析 opencode 可执行文件路径（OPENCODE_BIN 环境变量 > PATH）。
+
+        假定运行环境已安装 opencode：不预设任何本机安装路径。
+        未安装时抛 FileNotFoundError（含安装提示），让 bridge 启动时明确报错。
+        """
         env = os.environ.get("OPENCODE_BIN")
         if env:
             return env
         found = shutil.which("opencode")
         if found:
             return found
-        for p in self._KNOWN_PATHS:
-            if os.path.exists(p):
-                return p
-        return "opencode"
+        raise FileNotFoundError(
+            "未找到可执行的 opencode（当前 ACP server=opencode）。"
+            "请先安装 opencode 并确保其可执行文件在 PATH 中（或用 OPENCODE_BIN 环境变量指定路径）。")
 
     def spawn_cmd(self) -> list[str]:
         # V1：无 --agent 参数；--cwd 为进程默认工作目录（session/new 的 cwd 由前端按文档目录传入，V3 ✅）

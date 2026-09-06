@@ -948,7 +948,12 @@ class AcpBridge:
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
             handlers=handlers,
         )
-        await self.start_proc()
+        try:
+            await self.start_proc()
+        except FileNotFoundError as e:
+            # server 可执行文件未安装：明确报错退出，不带着无 ACP server 的 bridge 空跑
+            log.error("ACP server 启动失败：%s", e)
+            raise SystemExit(1)
         # P3：后台预取 agent 列表，让加载项首次打开时下拉立即可用（agent 发现冷启动开销大）
         asyncio.create_task(self.list_agents())
         http_server = await asyncio.start_server(self._http_handler, self.host, self.http_port)
