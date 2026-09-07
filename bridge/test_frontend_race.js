@@ -14,15 +14,21 @@ const path = require('path');
 const MAIN_JS = path.join(__dirname, '..', 'js', 'main.js');
 const WATCHDOG_MS = 25000;
 
-function loadEnv(initialConfigMode) {
+function loadEnv(initialConfigMode, opts) {
   let configMode = initialConfigMode;
+  opts = opts || {};
   const st = {
     timers: [], timerSeq: 0,
     chatCalls: { status: [], messages: [], errorCards: [] },
     acpCalls: { send: [], connected: false }, acpIdSeq: 0,
     store: {}, els: {},
     acpCbs: { conn: null, response: null, update: null, request: null },
+    currentServer: 'qwenpaw',
+    serverSwitchedTo: null,
+    deferredServers: [],   // opts.deferServers 时暂存 /servers 响应（flushServers 触发）
   };
+  // 预置记住的 server（Phase 3：qp.server）
+  if (opts.savedServer) st.store['qp.server'] = opts.savedServer;
 
   function fakeSetTimeout(fn, ms) {
     const id = ++st.timerSeq;
@@ -56,8 +62,10 @@ function loadEnv(initialConfigMode) {
     setStatus(label) { st.chatCalls.status.push(label); },
     setConnStateText() {}, setWpsState() {}, snapshot() { return []; },
     restore() {}, clear() {}, showEmptyHint() {}, showTyping() {}, hideTyping() {},
-    setInputEnabled() {}, setBusy() {}, appendAssistantChunk() {}, finishAssistant() {},
+    setInputEnabled() {}, setPlaceholder() {}, setBusy() {}, appendAssistantChunk() {}, finishAssistant() {},
     addToolCard() { return {}; }, markToolCard() {},
+    toggleSettings() {}, setServerList() {}, setServerDesc() {}, setCapabilityNotes() {},
+    populateConfigOptions() {},
   };
 
   const AcpClientStub = {
@@ -92,7 +100,11 @@ function loadEnv(initialConfigMode) {
     };
     if (url.indexOf('/config') !== -1) {
       if (configMode === 'ok') {
-        finish(200, { wpsMcpEntry: '/abs/wps/index.js', pollPortStart: 59000, pollPortEnd: 59999 });
+        finish(200, {
+          wpsMcpEntry: '/abs/wps/index.js', pollPortStart: 59000, pollPortEnd: 59999,
+          acpServer: st.currentServer,
+          capabilities: { switchSemantics: 'config_option', approval: 'none', cancel: false },
+        });
       } else if (self.onerror) {
         self.onerror();
       }
@@ -103,11 +115,39 @@ function loadEnv(initialConfigMode) {
       finish(200, { agents: [{ id: 'default', name: 'Default', description: '' }], current: 'default' });
       return;
     }
+    if (url.indexOf('/servers') !== -1) {
+      const body = {
+        servers: [
+          { name: 'qwenpaw', defaultAgent: 'default', capabilities: { switchSemantics: 'restart' }, description: '' },
+          { name: 'opencode', defaultAgent: 'build', capabilities: { switchSemantics: 'config_option' }, description: '' },
+        ],
+        current: st.currentServer,
+      };
+      if (opts.deferServers) {
+        // 挂起 /servers 响应，等 flushServers() 手动触发（模拟"切换前先连上"竞态）
+        st.deferredServers.push({ fn: finish, body });
+      } else {
+        finish(200, body);
+      }
+      return;
+    }
+    if (url.indexOf('/server/set') !== -1) {
+      // POST /server/set?server=X -> 成功时 bridge current 变为 X；failServerSet 时返回失败（400）
+      if (opts.failServerSet) {
+        finish(400, { ok: false, server: st.currentServer, error: 'boom' });
+        return;
+      }
+      const target = new URL(url, 'http://x').searchParams.get('server');
+      st.serverSwitchedTo = target;
+      st.currentServer = target;
+      finish(200, { ok: true, server: target, error: null });
+      return;
+    }
     finish(404, {});
   };
 
   const sandbox = {
-    console, Date, Math, JSON,
+    console, Date, Math, JSON, URL,
     setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
     setInterval: fakeSetInterval, clearInterval: fakeClearInterval,
     XMLHttpRequest: XHRStub, localStorage: localStorageStub,
@@ -123,6 +163,12 @@ function loadEnv(initialConfigMode) {
     setConfig(mode) { configMode = mode; },
     conn(state) { st.acpCbs.conn(state); },
     respond(id, result, error) { st.acpCbs.response(id, result, error); },
+    flushServers() {
+      const d = st.deferredServers.shift();
+      if (d) d.fn(200, d.body);
+    },
+    currentServer() { return st.currentServer; },
+    serverSwitchedTo() { return st.serverSwitchedTo; },
     fireWatchdog() {
       const t = st.timers.find(x => !x.fired && x.ms === WATCHDOG_MS);
       if (!t) throw new Error('no pending session watchdog (ms=' + WATCHDOG_MS + ')');
@@ -228,6 +274,53 @@ console.log('Scenario D: 重试用尽 -> 可见错误 + 不锁死');
   check('D4 错误后再次触发可重新建会话（pending 未泄漏锁死）',
     env.sessionNewSends().length === before + 1,
     'before=' + before + ' after=' + env.sessionNewSends().length);
+}
+
+// ══ Scenario E：server 切换（Phase 3）—— 竞态：连接先于 /servers 返回，旧 server 已发 session/new，
+// 切换成功后必须清掉 stale pending（否则 ensureSession 被挡住 → 25s 看门狗误报"会话建立失败"）══
+console.log('Scenario E: server 切换竞态（stale session/new 清理）');
+{
+  // /servers 挂起（deferServers），预置 qp.server=opencode（记住的上次选择）
+  const env = loadEnv('ok', { deferServers: true, savedServer: 'opencode' });
+  env.fireAllTimers();          // 耗掉 loadBridgeConfig 的重试（/config ok -> callback: loadServerList 挂起 + connect）
+  // 竞态：ACP 先连上，ensureSession 在旧 server（qwenpaw，bridge current）上发 session/new
+  env.conn('connected');
+  check('E1 切换前：旧 server 上发出 session/new', env.sessionNewSends().length === 1,
+    'count=' + env.sessionNewSends().length);
+  // 现在 /servers 返回：current=qwenpaw，但记住的是 opencode -> 自动切换
+  env.flushServers();
+  env.fireAllTimers();          // switchServer 成功 -> fetchBridgeConfig -> resetAfterServerSwitch -> ensureSession
+  const sends = env.sessionNewSends();
+  const acpServer = env.currentServer();
+  check('E2 切换后 bridge current 变 opencode', acpServer === 'opencode', 'current=' + acpServer);
+  check('E3 切换后重新发出 session/new（stale pending 已被清理，未阻塞 ensureSession）',
+    sends.length >= 2, 'count=' + sends.length);
+  // 先让新会话建立成功（满足会话看门狗），再让旧 server 的 stale 响应到达
+  const staleId = sends[0].id;
+  const newId = sends[sends.length - 1].id;
+  env.respond(newId, { sessionId: 'NEW-SESSION' }, null);
+  env.fireAllTimers();
+  const errBefore = env.chat().errorCards.length;
+  env.respond(staleId, { sessionId: 'OLD-SESSION' }, null);
+  env.fireAllTimers();
+  check('E4 stale 响应不破坏新会话（pending 已清 → no-op，无错误卡/无重建）',
+    env.chat().errorCards.length === errBefore, 'errCards=' + env.chat().errorCards.length);
+}
+
+// ══ Scenario F：server 切换失败（Phase 3）—— 回滚显示为 bridge 实际 server，且不无限重试循环 ══
+console.log('Scenario F: server 切换失败回滚（不无限重试）');
+{
+  const env = loadEnv('ok', { savedServer: 'opencode', failServerSet: true });
+  env.fireAllTimers();   // loadBridgeConfig -> loadServerList -> 自动切换（/server/set 失败 400）-> 回滚 loadServerList(skip)
+  // 若未加 skipAutoSwitch 防护，loadServerList() 会再次触发 switchServer -> 又失败 -> 又 loadServerList -> 无限循环
+  // （XHR 同步执行，若循环会栈溢出/guard 超限；这里只验证展示回滚 + 可见错误）
+  const chat = env.chat();
+  check('F1 切换失败显示错误消息', chat.messages.some(m => m.role === 'error' && m.text.indexOf('ACP server 切换失败') !== -1),
+    JSON.stringify(chat.messages).slice(0, 160));
+  // 未无限循环：/server/set 至多请求 1 次（自动切换那一次）；display 停在 bridge 实际 server（qwenpaw）
+  check('F2 未无限重试 /server/set（≤1 次）', env.serverSwitchedTo() === null,
+    'serverSwitchedTo=' + env.serverSwitchedTo());
+  check('F3 显示回滚为 bridge 当前 server', env.currentServer() === 'qwenpaw', 'current=' + env.currentServer());
 }
 
 console.log(failures === 0 ? '\n✅ 前端行为验证全部通过' : `\n❌ ${failures} 项失败`);

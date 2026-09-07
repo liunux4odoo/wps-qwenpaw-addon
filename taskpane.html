@@ -28,9 +28,26 @@
             <label class="toggle" title="显示/隐藏 AI 思考与工具调用过程">
                 <input type="checkbox" id="showProcess" checked> 显示过程
             </label>
+            <button id="settingsBtn" class="settings-btn" title="ACP 设置（server / 模型 / 能力说明）">⚙</button>
             <select id="agentSelect" class="agent-select" title="选择 AI agent"></select>
             <button id="clearBtn" class="clear-btn" title="清空当前对话历史">清空对话</button>
             <span id="toolStatus" class="tool-status">正在连接…</span>
+        </div>
+
+        <!-- Phase 3：ACP server 设置面板（选择 server / opencode 模型 / 能力差异说明） -->
+        <div id="settingsPanel" class="settings-panel" style="display:none">
+            <div class="settings-row">
+                <label class="settings-label">ACP server</label>
+                <select id="serverSelect" class="server-select" title="选择 ACP 后端"></select>
+                <span id="serverDesc" class="server-desc"></span>
+            </div>
+            <div id="configOptionsRow" class="settings-row" style="display:none">
+                <label class="settings-label">模型</label>
+                <select id="modelSelect" class="config-select" title="会话级模型（set_config_option）"></select>
+                <label class="settings-label">Effort</label>
+                <select id="effortSelect" class="config-select" title="会话级思考强度"></select>
+            </div>
+            <div id="capabilityNotes" class="capability-notes"></div>
         </div>
 
         <div id="inputArea" class="input-area">

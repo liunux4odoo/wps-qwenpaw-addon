@@ -52,12 +52,17 @@
 
 ## §0 文档元信息
 
-- **方案版本**：v0.23（多 ACP server adapter 落地，2026-09-06）
-- **上一里程碑**：v0.22 阶段 3 方案补 P14/P15；v0.23 新增多 ACP server adapter 抽象（docs/plan-2026-09-05），bridge 支持 `--acp-server qwenpaw|opencode`，opencode 作为第一个第二 server 落地（spawn/建会话/对话/agent 枚举/切换语义）
+- **方案版本**：v0.24（多 ACP server 配置化落地，2026-09-07）
+- **上一里程碑**：v0.23 多 ACP server adapter 抽象（docs/plan-2026-09-05）；v0.24 新增 Phase 3 UI 配置化（/servers + /server/set + 设置面板选 server + opencode model/effort 会话级选择）
 - **变更控制**：任何架构层决策的修改需回到 discuss agent 重启讨论
 
 ### 变更历史
 
+- **v0.24（多 ACP server 配置化，2026-09-07）**：
+  - **运行时 server 切换**：bridge 新增 `GET /servers`（可用 server 列表 + capabilities + defaultAgent + 描述）与 `POST /server/set`（换 adapter + 重启子进程 + agent 复位为该 server 默认 + 失效 agent 缓存；server 可执行文件未安装时提前报错，不切坏状态）
+  - **Phase 3 UI 配置化**（plan-2026-09-05 §7）：设置面板（⚙）选择 ACP server、localStorage 持久化（`qp.server`，重启加载项自动对齐 bridge 当前并自动切换，A7）；能力差异说明展示（无审批 / 中止=重建 / 会话级配置）；opencode 特有 model/effort 选择（session/new 的 configOptions 解析填充 + `session/set_config_option` 应用 + 按 server 持久化，新会话自动重新应用，V9/V11）；agent 选择按 server 隔离（`qp.agent.<server>`，旧全局 key 兼容回退）
+  - **验收**：`bridge/test_adapter.py` 新增 /servers + /server/set 覆盖（含真实双向切换 E2E）；qwenpaw 零回归全绿
+  - **健壮性（review）**：切换后清在途 session/new|load pending（防 stale 挡 ensureSession）；/server/set 失败回滚不无限重试；agent 缓存失效在锁内做
 - **v0.23（多 ACP server adapter，2026-09-06）**：
   - **server adapter 抽象**：bridge spawn / agent 发现 / 切换语义 / 能力标志 从硬编码 qwenpaw 抽为 `bridge/servers.py` 的 per-server adapter（§3.4 补 adapter 层说明）；默认 `--acp-server qwenpaw` 零回归
   - **opencode 第一第二 server 落地**（D6）：spawn `opencode acp --cwd`（无 --agent，V1）；`mcpServers:[]` 兜底建会话（V3）；无 initialize 直接建会话可用（V10）；agent 枚举走 `opencode agent list`（V8）；mode 切换 = `session/set_config_option`（会话级，V11）而非 kill+重启
@@ -427,6 +432,10 @@ acp-bridge **不做任何业务逻辑**，只做传输层转发（WebSocket ↔ 
   - **qwenpaw**：`qwenpaw acp --agent X`，kill+restart 切换，daemon/CLI agent 发现（行为不变）
   - **opencode**：`opencode acp --cwd`（无 --agent），`mcpServers:[]` 兜底建会话，无 initialize 握手（V10 ✅），agent 枚举走 `opencode agent list`（mode/自定义 agent），mode 切换 = `session/set_config_option`（会话级，V11 ✅）
 - `/config` 下发 `acpServer` + `capabilities`（能力标志，Phase 2 前端按标志适配：approval/thoughtHeartbeat/cancel/loadSession/honorMcpEnv/agents）
+- **Phase 3 配置面（v0.24）**：
+  - `GET /servers`：可用 server 列表（name + capabilities + defaultAgent + description，源自 `servers.py::list_adapters()`），供设置面板选择
+  - `POST /server/set?server=X`：运行时切换 server（换 adapter + 重启子进程；agent 复位为 `default_agent`；失效 agent 缓存；可执行文件未安装提前报错）
+  - 前端 localStorage：`qp.server`（server 选择）、`qp.agent.<server>`（agent 按 server 隔离）、`qp.config.<server>`（opencode model/effort 会话级配置）
 
 **设计原则**：
 
@@ -676,7 +685,7 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 ### 6.3 允许的扩展方向（MVP 之后）
 
-- **多 ACP server 后端（v0.23 已落地第一个）**：bridge server adapter 抽象（`bridge/servers.py`）支持 `--acp-server qwenpaw|opencode`；opencode 已可 spawn/建会话/对话/agent 枚举。后续可加 kilocode（待其配置修复）、更多 server；Phase 2 前端按能力标志适配协议偏好（审批/看门狗/中止/load），Phase 3 UI 配置化
+- **多 ACP server 后端（v0.23/v0.24 已落地）**：bridge server adapter 抽象（`bridge/servers.py`）支持 `--acp-server qwenpaw|opencode`；opencode 已可 spawn/建会话/对话/agent 枚举。Phase 2 前端按能力标志适配协议偏好（审批/看门狗/中止/load），Phase 3 UI 配置化已完成（/servers + /server/set + 设置面板选 server + opencode model/effort 会话级选择）。后续可加 kilocode（待其配置修复）、更多 server
 - 添加 Excel/PPT 工具（MCP 侧挂更多工具）
 - 添加 Mac/Windows 支持（wps-office-mcp 已支持，验证即可）
 - 添加撤销/重做 UI（QwenPaw 会话记忆 + 加载项 UI）

@@ -334,7 +334,7 @@
   1. acp-bridge 从"硬编码 `qwenpaw acp`"改为"可配置的任意 ACP 命令"（配置来源：bridge 启动参数 → 插件页面配置）
   2. 插件设置区提供 ACP 命令配置（命令 + 参数 + agent 选择）
   3. 注意：不同 ACP server 的协议差异（session 方法名、流式通知、工具调用格式）需要 bridge 做归一化或按 server 适配
-- **状态**：已实施（见 `docs/plan-2026-09-05-acp-server-adapter.md` v0.3，第一实施目标 = opencode）
+- **状态**：已实施（见 `docs/plan-2026-09-05-acp-server-adapter.md` v0.5，第一实施目标 = opencode，Phase 0-3 全部完成：bridge adapter + 前端能力适配 + UI 配置化）
 
 ---
 

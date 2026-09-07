@@ -1,6 +1,8 @@
 # ACP Server Adapter 改造方案（v0.3：以兼容 opencode 为第一实施目标）
 
-> **文档状态**：v0.4（2026-09-07，Phase 2 完成）
+> **文档状态**：v0.5（2026-09-07，Phase 3 完成）
+> **v0.4 → v0.5 变更**：Phase 3 落地完成（UI 配置化 F1）：bridge 新增 `/servers`（可用 server 列表 + 能力标志）与 `/server/set`（运行时切换 adapter + 重启子进程，agent 复位为该 server 默认）；前端设置面板（⚙）选择 ACP server、localStorage 持久化（A7：重启加载项仍生效，启动自动对齐 bridge 当前并自动切换）、能力差异说明（无审批 / 中止=重建 / 会话级配置）；opencode 特有 model/effort 选择（session/new 的 configOptions 解析填充 + set_config_option 应用 + 按 server 持久化，新会话自动重新应用）；agent 选择按 server 隔离（agentKey server-scoped，旧全局 key 兼容迁移）。test_adapter.py 新增 /servers + /server/set 覆盖（含真实双向切换 E2E）。qwenpaw 零回归（全测试绿）。
+> **review 修复（2026-09-07）**：① server 切换后 `resetAfterServerSwitch` 必须清掉在途 session/new|load 的 pending——否则 ensureSession 被 stale pending 挡住（旧子进程已 kill、响应永不到达 → 25s 看门狗误报"会话建立失败"）；② `/server/set` 失败回滚用 `loadServerList(skipAutoSwitch)`，防自动切换→失败→回滚→再切换的无限循环；③ bridge `switch_server` 失效 agent 缓存须在 `_agents_lock` 内做，防 list_agents 持锁中旧 adapter 结果写回残留；④ `_restart_proc` 日志加 reason（agent/server 区分）。新增前端测试 Scenario E（切换竞态 stale pending 清理）+ Scenario F（失败回滚不循环）。
 > **v0.3 → v0.4 变更**：Phase 2 落地完成（C4-C8）：看门狗任意下行续命 / 审批按标志分支（非 auto 弹 UI 手动确认不盲选）/ 中止按标志（cancel:false 走 session/close+重建）/ session/load 按 loadSession 门禁 / opencode agent 切换 set_config_option 应用（V11 实测）/ tool_call 工具卡片；capabilities 新增 switchSemantics；qwenpaw 零回归（adapter E2E 全绿）。A7 属 Phase 3 范围。
 > **v0.1 → v0.2 变更**：目标从"泛化多 ACP 后端"**收敛为"先以兼容 opencode 为目标"**；纳入 opencode Phase 0 实测结果（V1-V5/V7 已验，V6/V8 待补）；kilocode 因配置错误推迟
 > **v0.2 → v0.3 变更**：补 C9（ACP `initialize` 握手缺失，前端/bridge 现状从不发 initialize）耦合点与 V10/V11 待测项（Phase 1 前置门）；修正 C2 行号（429-499）；修订 §5.2 opencode agent 切换语义（与 V9 只读结论一致）；澄清 §6.2 盲选兜底（现状 `main.js:1156` 已有 `options[0]` 兜底）与 §6.3 看门狗实际缺口（tool_call 类不续命）；`docs/acp-servers/opencode.md` 移除明文 API key（已写入本机配置）
@@ -96,7 +98,8 @@ Phase 1  bridge server adapter 抽象（C1-C3/C8/C9）→ ✅ 已完成（2026-0
 Phase 2  前端协议偏好按能力标志适配（C4-C8）→ ✅ 已完成（2026-09-07）：opencode 差异显式化
          （看门狗任意下行续命 / 审批手动确认不盲选 / 中止 session/close 重建 / load 按标志门禁 /
           agent 切换 set_config_option 应用 / tool_call 过程呈现；qwenpaw 零回归）
-Phase 3  UI 配置化（F1 完整形态）→ 插件页面配置 ACP server
+Phase 3  UI 配置化（F1 完整形态）→ ✅ 已完成（2026-09-07）：/servers + /server/set，前端设置面板选 server
+         + localStorage 持久化（A7）+ 能力差异说明 + opencode model/effort 会话级选择；qwenpaw 零回归
 ```
 
 **Phase 0 是门**：先验证目标 server 的能力，再决定后续阶段做多少。验证不过的能力项，对应功能显式降级（不是隐藏 bug）。
@@ -226,12 +229,28 @@ adapter 是 bridge 内部的一个**配置化描述**（不是代码插件），
 
 ---
 
-## 7. Phase 3：UI 配置化（F1 完整形态）
+## 7. Phase 3：UI 配置化（F1 完整形态）✅ 已完成（2026-09-07）
+
+> **实施落地**：`bridge/acp-bridge.py` 新增 `GET /servers`（可用 server 列表：name + capabilities + defaultAgent + 描述，
+> 源自 `bridge/servers.py::list_adapters()`）与 `POST /server/set?server=X`（运行时切换 adapter + 重启子进程，
+> agent 复位为该 server 的 `default_agent`、失效 agent 缓存，未安装的 server 提前报错不切坏状态）。
+> `js/main.js`：设置面板（⚙ 按钮开关）+ server 下拉（loadServerList 填充 + 记住的上次选择与 bridge 当前不一致自动切换，
+> A7 配置持久化）；切换成功 → 重新拉 /config（新 capabilities）→ 清会话重建 → 重载 agent → 重建会话；
+> 能力差异说明（describeCapabilities → 设置面板展示）；opencode 特有 model/effort 选择
+> （session/new 响应 configOptions 解析填充下拉 + set_config_option 应用 + 按 server 持久化，新会话自动重新应用，
+> V9/V11：configOptions 只读不生效、set 生效且会话级）；agent 选择按 server 隔离（agentKey server-scoped，旧 key 兼容回退）。
+> `taskpane.html`/`css/taskpane.css`：设置面板 UI。qwenpaw 零回归（test_adapter.py qwenpaw/opencode E2E + test_bridge + test_frontend_race 全绿）。
+> **遗留（可选增强）**：自定义命令/参数 adapter（非注册 server 的任意 ACP 命令）未实现——需"自定义 server"类型 + 能力标志手动声明，放后续。
 
 - 插件设置区提供 ACP server 配置（选择 server / 自定义命令 / 参数 / agent），持久化到 localStorage
+  - ✅ server 选择 + agent 选择持久化（agent 按 server 隔离）
+  - ⏳ 自定义命令/参数 adapter（遗留，见上）
 - bridge 暴露 `/servers`（可用 server 列表 + 能力标志）与 `/server/set`（切换，qwenpaw 复用 `/agent/set` 重启机制；opencode 复用 spawn 重启）
+  - ✅ `/servers` + `/server/set` 已落地并 E2E 验证（真实双向切换）
 - opencode 特有：模型选择（configOptions 的 model/effort/mode）交互——**用 `session/set_config_option`（configId），session/new 的 configOptions 只读不生效**（V9 已确认）
+  - ✅ model/effort 下拉（configOptions 解析）+ set_config_option 应用 + 持久化（新会话自动重新应用）
 - **验收**（UX）：页面可选择 server 并记住上次选择；切换后会话重建、状态正确；能力差异在 UI 上有说明（如 opencode 无审批 / 中止为重建会话）
+  - ✅ 代码落地；WPS 实机目验待做
 
 ---
 
@@ -242,7 +261,8 @@ Phase 0（opencode 已完成）→ 门：能力表落盘（docs/acp-servers/open
 Phase 1（bridge adapter）→ ✅ 已完成（2026-09-06）：--acp-server qwenpaw|opencode，qwenpaw 零回归 + opencode 可建会话（A1/A2 过）
 Phase 2（前端能力适配）→ ✅ 已完成（2026-09-07）：C4-C8 + opencode agent 切换 set_config_option 应用，
          qwenpaw 零回归（adapter E2E 全绿）；门：opencode 全链路可用或显式降级（WPS 实机验收待做）
-Phase 3（UI 配置）→ 门：UX 验收
+Phase 3（UI 配置）→ ✅ 已完成（2026-09-07）：/servers + /server/set + 设置面板选 server + 持久化（A7）
+         + 能力差异说明 + opencode model/effort；门：UX 验收（WPS 实机目验待做）
 kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 ```
 
@@ -263,7 +283,7 @@ kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 | A4 | opencode 无审批路径正确 | 默认配置下工具调用直接执行，无假审批 UI；改 ask 规则时弹 UI 手动确认不盲选 | ✅ 代码落地；ask 规则 option 形状待 WPS 实机补测 |
 | A5 | 看门狗通用 | 任意下行续命；opencode 长思考 + 工具执行不误报 | ✅ 代码落地；实机长工具链待测 |
 | A6 | 多窗口隔离诚实 | opencode V2 ✅ 多窗口正常；未验证的 server 明示降级不假装支持 | ✅（V2 实测透传 env） |
-| A7 | 配置持久化 | 页面选择 server 后重启加载项仍生效 | ⏳ Phase 3（UI 配置化）范围 |
+| A7 | 配置持久化 | 页面选择 server 后重启加载项仍生效 | ✅ 代码落地（localStorage qp.server + 启动自动对齐/切换）；WPS 实机目验待做 |
 | A8 | opencode 中止有明确行为 | 中止按钮不静默无效（close 重建或停止等待） | ✅ 代码落地；实机目验待做 |
 
 ---

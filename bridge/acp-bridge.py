@@ -56,7 +56,7 @@ from urllib.parse import unquote
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
-from servers import get_adapter
+from servers import get_adapter, list_adapters
 
 log = logging.getLogger("acp-bridge")
 
@@ -423,13 +423,47 @@ class AcpBridge:
                 self._agents_failed_at = time.monotonic()
             return list(agents)
 
-    async def _restart_proc(self) -> None:
+    async def switch_server(self, name: str) -> tuple[bool, str]:
+        """Phase 3（plan-2026-09-05 §7）：运行时切换 ACP server adapter。
+
+        ① 校验名称在可用列表；② 换 adapter（新 spawn_cmd / 能力标志 / agent 语义）；
+        ③ agent 复位为该 server 的默认 agent；④ 失效 agent 列表缓存；
+        ⑤ kill + 重启 ACP 子进程（_restart_proc，新 adapter 的 spawn_cmd）。
+        返回 (ok, err)。bridge 保持纯传输：不实现 ACP 业务逻辑（守 §6.1 铁律）。
+        """
+        if not name:
+            return False, "server 为空"
+        if name == self.adapter.name:
+            return True, ""
+        known = {s["name"] for s in list_adapters()}
+        if name not in known:
+            return False, f"未知 server: {name}（可用: {', '.join(sorted(known))}）"
+        log.info("switching server: %s -> %s", self.adapter.name, name)
+        new_adapter = get_adapter(name, self)
+        # 预检 spawn 命令（server 可执行文件未安装时提前报错，避免带坏子进程重启）
+        try:
+            new_adapter.spawn_cmd()
+        except FileNotFoundError as e:
+            return False, str(e)
+        self.adapter = new_adapter
+        self.agent = self.adapter.default_agent   # agent 语义随 server 不同，复位为默认
+        # 失效 agent 缓存须在 _agents_lock 内做：list_agents 的 fetch 持锁中可能正用旧 adapter
+        # 拉取并把结果写回缓存，不同步清除会残留旧 server 的 agent 列表（review finding）。
+        async with self._agents_lock:
+            self._agents_cache = []
+            self._agents_cached_at = 0.0
+            self._agents_failed_at = 0.0
+        await self._restart_proc(reason="server")
+        return True, ""
+
+    async def _restart_proc(self, reason: str = "agent") -> None:
         """进程级重启 ACP 子进程（switch_semantics="restart" 时由 /agent/set 调用）。
 
         adapter.switch_agent 已校验并记录新 agent；此处杀掉当前子进程，
         _wait_proc 会用 adapter.spawn_cmd()（读取 self.agent）自动重启。
+        reason：日志上下文（agent=agent 切换 / server=server 切换）。
         """
-        log.info("switching agent: %s（重启 ACP 子进程）", self.agent)
+        log.info("switching %s: %s（重启 ACP 子进程）", reason, self.agent)
         # 主动切换 = 有意重启：复位退避延迟，避免此前多次崩溃把 _restart_delay 推到 30s，
         # 导致 agent 切换后 ACP 子进程迟迟不拉起来。
         self._restart_delay = 1.0
@@ -790,6 +824,7 @@ class AcpBridge:
                 payload = {
                     "status": "running",
                     "agent": self.agent,
+                    "acpServer": self.adapter.name,
                     "proc": self.proc.pid if self.proc else None,
                 }
                 # 端口/session 映射只在 ?debug=1 时暴露（默认脱敏，防跨源读取内部路由状态）
@@ -808,6 +843,23 @@ class AcpBridge:
                     "pollPortEnd": POLL_PORT_END,
                     "acpServer": self.adapter.name,
                     "capabilities": dict(self.adapter.capabilities),
+                })
+            elif path == "/servers" and method == "GET":
+                # Phase 3：可用 ACP server 列表 + 能力标志（plan-2026-09-05 §7），
+                # 供插件设置区选择并持久化；前端按能力差异显示说明。
+                await self._http_json(writer, 200, {
+                    "servers": list_adapters(),
+                    "current": self.adapter.name,
+                })
+            elif path == "/server/set" and method == "POST":
+                # Phase 3：切换 ACP server（重启子进程）。切换后旧 sessionId 失效，
+                # 前端重建会话；agent 复位为该 server 默认（各 server agent 语义不同）。
+                target = query_params.get("server", "")
+                ok, err = await self.switch_server(target)
+                await self._http_json(writer, 200 if ok else 400, {
+                    "ok": ok,
+                    "server": self.adapter.name,
+                    "error": err or None,
                 })
             elif path == "/agents" and method == "GET":
                 # P3：可用 agent/mode 列表（adapter 枚举），供加载项侧下拉选择

@@ -42,6 +42,7 @@ class AcpServerAdapter:
     """ACP server adapter 基类：配置化描述。子类覆盖 spawn/发现/切换/能力声明。"""
 
     name = "base"
+    default_agent = "default"          # 切换到此 server 时 bridge agent 复位值（Phase 3 /server/set）
     switch_semantics = "restart"      # "restart" | "config_option"
     handshake_required = False        # initialize 是否必须（V10：opencode/qwenpaw 均无需）
     protocol_version: object = "2025-03-26"  # qwenpaw 用字符串；opencode 用整数 1
@@ -202,6 +203,7 @@ class OpencodeAdapter(AcpServerAdapter):
     """
 
     name = "opencode"
+    default_agent = "build"           # opencode 默认 mode（V8：build primary）；切换到此 server 时复位
     switch_semantics = "config_option"
     protocol_version = 1            # V1 实测整数 1（u16）
     capabilities = {
@@ -291,3 +293,24 @@ def get_adapter(name: str, bridge) -> AcpServerAdapter:
         log.warning("未知 ACP server adapter: %s，回退 qwenpaw", name)
         cls = QwenpawAdapter
     return cls(bridge)
+
+
+def list_adapters() -> list[dict]:
+    """可用 server 列表（Phase 3 /servers 端点）：name + 能力标志 + defaultAgent + 说明。"""
+    out = []
+    for cls in _ADAPTERS.values():
+        caps = dict(cls.capabilities)
+        out.append({
+            "name": cls.name,
+            "defaultAgent": cls.default_agent,
+            "switchSemantics": cls.switch_semantics,
+            "capabilities": caps,
+            "description": _ADAPTER_DESCRIPTION.get(cls.name, cls.name),
+        })
+    return out
+
+
+_ADAPTER_DESCRIPTION: dict[str, str] = {
+    "qwenpaw": "QwenPaw（默认）：自动批准工具、支持中止/历史恢复，agent 切换重启后端",
+    "opencode": "opencode：无审批环节、中止=结束会话重建、模型/mode 会话级配置（set_config_option）",
+}

@@ -119,6 +119,12 @@
   var pendingAttachments = [];       // P6：待发送附件 [{name, text}]（文本提取；图片为 {name, image:true} 占位）
   var MAX_ATTACH_TEXT = 60000;       // P6：单个附件文本上限（超出截断）
 
+  // ── Phase 3：ACP server 配置（plan-2026-09-05 §7）──
+  var serverList = [];               // Phase 3：可用 server 列表（/servers）
+  var serverCached = null;           // Phase 3：localStorage 记住的上次 server
+  var settingsOpen = false;          // Phase 3：设置面板开关状态
+  var currentConfigOptions = null;   // Phase 3：当前会话 configOptions（opencode model/effort/mode）
+
   // P8 文档隔离 key：优先用轻量 getDocIdentity（只读 Name/Path，不触发 Paragraphs 计数，
   // 因为 startDocCheck 每 3s 调用一次，重计数会卡 WPS）；回退默认 'default'。
   function getDocId() {
@@ -189,7 +195,30 @@
   }
 
   function sessionKey(docId) { return 'qp.session.' + (docId || 'default'); }
-  function agentKey() { return 'qp.agent'; }
+
+  // Phase 3：agent 选择按 server 隔离（不同 server 的 agent 语义不同，opencode 是 mode）。
+  // 旧版全局 key 'qp.agent' 兼容回退：server-scoped 无值时读旧 key（一次迁移）。
+  var LEGACY_AGENT_KEY = 'qp.agent';
+  function agentKey() { return 'qp.agent.' + (acpServerName || 'qwenpaw'); }
+  function serverKey() { return 'qp.server'; }
+  function configKey() { return 'qp.config.' + (acpServerName || 'qwenpaw'); }
+
+  function loadSavedAgent() {
+    var k = agentKey();
+    try {
+      var v = localStorage.getItem(k);
+      if (v === null && k !== LEGACY_AGENT_KEY) v = localStorage.getItem(LEGACY_AGENT_KEY);
+      return v || null;
+    } catch (e) { return null; }
+  }
+
+  function saveSavedAgent(id) {
+    var k = agentKey();
+    try {
+      localStorage.setItem(k, id);
+      if (k !== LEGACY_AGENT_KEY) localStorage.removeItem(LEGACY_AGENT_KEY);
+    } catch (e) {}
+  }
 
   function loadHistory(docId) {
     try {
@@ -376,7 +405,8 @@
   function loadAgentList() {
     var el = document.getElementById('agentSelect');
     if (!el) return;
-    try { agentCached = localStorage.getItem(agentKey()) || null; } catch (e) {}
+    // Phase 3：agent 选择按 server 隔离（agentKey 已 server-scoped；旧全局 key 兼容回退）
+    agentCached = loadSavedAgent();
     // qwenpaw agent list 冷启动约 8s（bridge 已 TTL 缓存+预取，但首次仍可能慢），给足超时
     // 重试间隔需盖过 bridge 的失败负缓存窗口（AGENTS_FAIL_TTL=5s），否则重试命中缓存空列表
     var attempts = 0;
@@ -441,7 +471,7 @@
     if (!agentId) return;
     QPLog('P3', '切换 agent: ' + agentId);
     agentCached = agentId; // P3：同步内存态（set_config_option 应用 / 重连重建时读取）
-    try { localStorage.setItem(agentKey(), agentId); } catch (e) {}
+    saveSavedAgent(agentId); // Phase 3：按当前 server 维度持久化（agentKey server-scoped）
     var xhr = new XMLHttpRequest();
     xhr.open('POST', 'http://127.0.0.1:8766/agent/set?agent=' + encodeURIComponent(agentId), true);
     xhr.timeout = 10000;
@@ -499,6 +529,217 @@
       ChatUi.addMessage('error', 'agent 切换失败（bridge 不可达）');
     };
     xhr.send();
+  }
+
+  // ── Phase 3：ACP server 配置（plan-2026-09-05 §7）──
+
+  // 生成人类可读的能力差异说明（UI 展示用，如 opencode 无审批 / 中止=重建会话）
+  function describeCapabilities(caps) {
+    if (!caps) return [];
+    var notes = [];
+    if (caps.approval === 'none') notes.push('无审批环节（工具直接执行）');
+    else if (caps.approval === 'manual') notes.push('工具调用需手动确认');
+    if (caps.cancel === false) notes.push('中止 = 结束会话重建');
+    if (caps.switchSemantics === 'config_option') notes.push('agent/mode 为会话级配置');
+    if (caps.thoughtHeartbeat === false) notes.push('无思考心跳，按任意下行续命');
+    if (caps.loadSession === false) notes.push('不支持历史会话恢复');
+    return notes;
+  }
+
+  // 更新能力说明展示（设置面板 + server 下拉）
+  function updateCapabilityUI() {
+    var notes = describeCapabilities(capabilities);
+    ChatUi.setCapabilityNotes(notes.length ? '能力说明：' + notes.join('；') : '');
+    var desc = '';
+    for (var i = 0; i < serverList.length; i++) {
+      if (serverList[i].name === acpServerName) desc = serverList[i].description || '';
+    }
+    ChatUi.setServerDesc(desc || (acpServerName ? '当前：' + acpServerName : ''));
+  }
+
+  // 加载可用 server 列表（/servers）并填充下拉；与 bridge 当前值对齐并校验本地记录
+  // skipAutoSwitch=true 时只刷新显示，不触发自动切换（/server/set 失败回滚用，防无限重试循环）
+  function loadServerList(skipAutoSwitch) {
+    try { serverCached = localStorage.getItem(serverKey()) || null; } catch (e) {}
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', 'http://127.0.0.1:8766/servers', true);
+    xhr.timeout = 10000;
+    xhr.onload = function () {
+      if (xhr.status !== 200) { ChatUi.setServerList([], null); return; }
+      try {
+        var r = JSON.parse(xhr.responseText);
+        serverList = r.servers || [];
+        var current = r.current || null;
+        ChatUi.setServerList(serverList, current);
+        updateCapabilityUI();
+        // 记住的上次选择与 bridge 当前不一致 → 自动切换（A7：重启加载项后仍生效）
+        // skipAutoSwitch（切换失败回滚）时跳过：只显示 bridge 实际 server，不重试（防循环）
+        if (!skipAutoSwitch && serverCached && current && serverCached !== current) {
+          QPLog('main', '上次选择 server=' + serverCached + ' 与 bridge 当前=' + current + ' 不一致，请求切换');
+          switchServer(serverCached);
+        }
+      } catch (e) { ChatUi.setServerList([], null); }
+    };
+    xhr.onerror = function () { ChatUi.setServerList([], null); };
+    xhr.ontimeout = function () { ChatUi.setServerList([], null); };
+    xhr.send();
+  }
+
+  // 切换 ACP server：POST /server/set（bridge 换 adapter + 重启子进程），成功后重置会话并重建
+  function switchServer(name) {
+    if (!name) return;
+    QPLog('main', '切换 ACP server: ' + name);
+    serverCached = name;
+    try { localStorage.setItem(serverKey(), name); } catch (e) {}
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', 'http://127.0.0.1:8766/server/set?server=' + encodeURIComponent(name), true);
+    xhr.timeout = 20000; // 含子进程重启（bridge SWITCH_READY_TIMEOUT=8s）+ 余量
+    xhr.onload = function () {
+      var ok = false;
+      try { ok = xhr.status === 200 && JSON.parse(xhr.responseText).ok; } catch (e) {}
+      if (!ok) {
+        QPLog('main', 'server 切换失败 HTTP ' + xhr.status);
+        ChatUi.addMessage('error', 'ACP server 切换失败');
+        loadServerList(true); // 回滚显示为 bridge 实际 server；skipAutoSwitch 防无限重试循环
+        return;
+      }
+      QPLog('main', 'server 切换成功: ' + name);
+      // 切换后：重新拉 /config（acpServerName + capabilities 随 server 变化）→ 重置会话 → 重建
+      fetchBridgeConfig(function () {
+        resetAfterServerSwitch();
+        loadAgentList();
+        if (acpState === 'connected') ensureSession();
+        updateSendAvailability();
+      }, function () {
+        // /config 失败不阻塞：仍重置会话（capabilities 保持旧值，版本倾斜由 switchAgent 防护）
+        QPLog('main', 'server 切换后 /config 拉取失败，按旧能力继续');
+        resetAfterServerSwitch();
+        loadAgentList();
+        if (acpState === 'connected') ensureSession();
+        updateSendAvailability();
+      });
+    };
+    xhr.onerror = function () {
+      QPLog('main', 'server 切换网络错误');
+      ChatUi.addMessage('error', 'ACP server 切换失败（bridge 不可达）');
+    };
+    xhr.send();
+  }
+
+  // server 切换后的会话重置：旧 session 属于旧 server，一律清空重建（同 agent restart 语义）
+  function resetAfterServerSwitch() {
+    // 清理进行中请求（旧 server 子进程已被 bridge 重启，响应不可信）
+    // 关键：清掉在途的 session/new|load——否则 ensureSession 被 stale pending 挡住
+    //（其子进程已 kill，响应永不到达 → 25s 看门狗误报"会话建立失败"），见 review finding。
+    for (var pk in pendingRequests) {
+      var p = pendingRequests[pk];
+      if (p && (p.method === 'session/new' || p.method === 'session/load')) {
+        delete pendingRequests[pk];
+      }
+    }
+    clearSessionWatchdog();
+    if (waitingResponse) {
+      var reqId = lastPromptReqId;
+      if (reqId !== null && pendingRequests[reqId]) delete pendingRequests[reqId];
+      lastPromptReqId = null;
+      waitingResponse = false;
+      gotFirstChunk = false;
+      clearPromptTimers();
+      var cards = pendingToolCards.slice();
+      pendingToolCards = [];
+      for (var i = 0; i < cards.length; i++) ChatUi.markToolCard(cards[i], 'cancelled');
+      ChatUi.hideTyping();
+      ChatUi.setBusy(false);
+      streamBuffer = '';
+    }
+    acpSessionId = null;
+    saveCachedSessionId(currentDocId, null);
+    if (currentDocId) {
+      docStates[currentDocId] = { acpSessionId: null, messages: [] };
+      saveHistory(currentDocId, []);
+    }
+    ChatUi.clear();
+    ChatUi.showEmptyHint();
+    currentConfigOptions = null;         // 不同 server 的 configOptions 不同
+    ChatUi.populateConfigOptions(null, null); // 隐藏 model/effort 配置行
+    updateCapabilityUI();                // 能力差异随 server 变化
+    QPLog('main', 'server 切换：会话已重置，等待重建');
+  }
+
+  // 绑定设置按钮（开关设置面板）+ server 下拉 change + model/effort 下拉 change
+  function bindSettingsUI() {
+    var sbtn = document.getElementById('settingsBtn');
+    if (sbtn) {
+      sbtn.addEventListener('click', function () {
+        settingsOpen = !settingsOpen;
+        ChatUi.toggleSettings(settingsOpen);
+      });
+    }
+    var ssel = document.getElementById('serverSelect');
+    if (ssel) {
+      ssel.addEventListener('change', function () {
+        if (ssel.value && ssel.value !== acpServerName) switchServer(ssel.value);
+      });
+    }
+    var msel = document.getElementById('modelSelect');
+    if (msel) {
+      msel.addEventListener('change', function () {
+        if (msel.value && acpSessionId) applyConfigOption('model', msel.value);
+      });
+    }
+    var esel = document.getElementById('effortSelect');
+    if (esel) {
+      esel.addEventListener('change', function () {
+        if (esel.value && acpSessionId) applyConfigOption('effort', esel.value);
+      });
+    }
+  }
+
+  // 应用会话级配置（opencode set_config_option，V9：configOptions 只读不生效，只能 set）
+  // 同时持久化到 localStorage（会话级不跨会话，新会话由 maybeApplyConfigOption 重新应用）
+  function applyConfigOption(configId, value) {
+    if (!value) return;
+    var saved = loadSavedConfigOptions();
+    saved[configId] = value;
+    saveSavedConfigOptions(saved);
+    if (!acpSessionId) {
+      QPLog('main', '已记录 ' + configId + '=' + value + '（无会话，将在下次会话生效）');
+      return;
+    }
+    var id = AcpClient.send('session/set_config_option', {
+      sessionId: acpSessionId, configId: configId, value: value
+    });
+    if (id !== null) {
+      pendingRequests[id] = { method: 'session/set_config_option' };
+      QPLog('main', 'set_config_option(' + configId + '=' + value + ') id=' + id);
+    }
+  }
+
+  // 从 localStorage 读取记住的 model/effort（按 server 隔离；会话级不跨会话，新会话需重新应用）
+  function loadSavedConfigOptions() {
+    try {
+      var raw = localStorage.getItem(configKey());
+      return (raw && JSON.parse(raw)) || {};
+    } catch (e) { return {}; }
+  }
+
+  function saveSavedConfigOptions(cfg) {
+    try { localStorage.setItem(configKey(), JSON.stringify(cfg)); } catch (e) {}
+  }
+
+  // 解析 session/new 响应的 configOptions（opencode model/effort/mode），填充配置行 UI
+  function parseConfigOptions(configOptions) {
+    if (!configOptions || !Array.isArray(configOptions)) return;
+    if (capabilities.switchSemantics !== 'config_option') return; // 仅 opencode 等 config_option 语义
+    currentConfigOptions = configOptions;
+    var modelOpt = null, effortOpt = null;
+    for (var i = 0; i < configOptions.length; i++) {
+      var o = configOptions[i];
+      if (o && o.id === 'model') modelOpt = o;
+      else if (o && o.id === 'effort') effortOpt = o;
+    }
+    var saved = loadSavedConfigOptions();
+    ChatUi.populateConfigOptions(modelOpt, effortOpt, saved.model, saved.effort);
   }
 
   // P14：清空对话按钮（确认弹窗）
@@ -566,6 +807,8 @@
                 }
                 QPLog('main', 'capabilities=' + JSON.stringify(capabilities));
               }
+              // Phase 3：能力差异说明随 server 变化更新（设置面板 UI）
+              updateCapabilityUI();
               QPLog('main', 'bridge /config 下发 wpsMcpEntry: ' + r.wpsMcpEntry);
               if (onSuccess) onSuccess();
               return;
@@ -606,6 +849,7 @@
     }
     bindClearButton();
     bindAttachButton(); // P6：附件上传
+    bindSettingsUI();   // Phase 3：设置按钮 + server/model/effort 下拉绑定
     tryAutoExpand();    // P7：自动展开侧边栏（尽力而为）
     // P1：初始状态（启动握手：ACP 连接中 + WPS 未激活）
     updateStatus();
@@ -640,6 +884,10 @@
 
       // P3：加载可用 agent 列表（从 bridge /agents），初始化下拉选择
       loadAgentList();
+
+      // Phase 3：加载可用 ACP server 列表（/servers）并填充设置面板下拉；
+      // 记住的上次选择与 bridge 当前不一致时自动切换（A7 配置持久化）
+      loadServerList();
 
       // 4. ACP 客户端：连接 + 会话管理
       AcpClient.onConnectionChange(onAcpConnChange);
@@ -972,21 +1220,31 @@
     }
   }
 
-  // Phase 2 C3（plan-2026-09-05 §5.2/§7，V11）：opencode agent/mode 切换 = 会话级
-  // session/set_config_option（configOptions 数组只读不生效；新建会话默认仍 build）。
-  // 会话建立成功后，若 server 是 config_option 语义且用户有记录的选择，把 mode 应用到新会话。
+  // Phase 2 C3 + Phase 3（plan-2026-09-05 §5.2/§7，V9/V11）：opencode 会话级配置应用。
+  // session/set_config_option（configOptions 数组只读不生效；且为会话级，新建会话默认仍 build/low）。
+  // 会话建立成功后：mode（agentCached）+ 记住的 model/effort（localStorage）都重新应用到新会话。
   function maybeApplyConfigOption(sessionId) {
     if (!sessionId) return;
     if (capabilities.switchSemantics !== 'config_option') return;
-    if (!agentCached || !agentCached.length) return;
+    // mode（V11：agent/mode 切换走 set_config_option，会话级）
+    if (agentCached && agentCached.length) {
+      applyConfigOptionOnSession('mode', agentCached, sessionId);
+    }
+    // Phase 3：记住的 model/effort（会话级不跨会话，新会话重新应用）
+    var saved = loadSavedConfigOptions();
+    if (saved.model) applyConfigOptionOnSession('model', saved.model, sessionId);
+    if (saved.effort) applyConfigOptionOnSession('effort', saved.effort, sessionId);
+  }
+
+  function applyConfigOptionOnSession(configId, value, sessionId) {
     var id = AcpClient.send('session/set_config_option', {
       sessionId: sessionId,
-      configId: 'mode',
-      value: agentCached
+      configId: configId,
+      value: value
     });
     if (id !== null) {
       pendingRequests[id] = { method: 'session/set_config_option' };
-      QPLog('main', 'set_config_option(mode=' + agentCached + ') 已应用到会话 ' + sessionId + ' id=' + id);
+      QPLog('main', 'set_config_option(' + configId + '=' + value + ') 已应用到会话 ' + sessionId + ' id=' + id);
     }
   }
 
@@ -1097,6 +1355,8 @@
         QPLog('main', req.method + ' 成功 sessionId=' + acpSessionId + (preamblePending ? '（待注入环境上下文）' : ''));
         ChatUi.setStatus('就绪');
         updateSendAvailability(); // P21：会话建立成功 → 启用发送
+        // Phase 3：解析 session/new 返回的 configOptions（opencode model/effort），填充配置行 UI
+        parseConfigOptions(result.configOptions);
         // Phase 2 C3：opencode 会话级 mode 应用（V11 set_config_option；qwenpaw restart 语义跳过）
         maybeApplyConfigOption(acpSessionId);
       } else if (req.method === 'session/load' && loadCachedSessionId(currentDocId)) {
@@ -1108,6 +1368,7 @@
         QPLog('P15', 'session/load 成功（未回 sessionId，复用缓存）=' + acpSessionId);
         ChatUi.setStatus('就绪');
         updateSendAvailability(); // P21：会话恢复成功 → 启用发送
+        parseConfigOptions(result.configOptions); // Phase 3：同 new 场景解析 configOptions
         maybeApplyConfigOption(acpSessionId); // Phase 2 C3：同 load 场景
       }
     } else if (req.method === 'session/prompt') {

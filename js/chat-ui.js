@@ -38,6 +38,14 @@ var ChatUi = (function () {
     els.showProcessToggle = document.getElementById('showProcess');
     els.typingIndicator = document.getElementById('typingIndicator');
     els.phaseLabel = document.getElementById('phaseLabel');
+    // Phase 3：设置面板（ACP server 选择 / opencode 模型 / 能力说明）
+    els.settingsPanel = document.getElementById('settingsPanel');
+    els.serverSelect = document.getElementById('serverSelect');
+    els.serverDesc = document.getElementById('serverDesc');
+    els.configOptionsRow = document.getElementById('configOptionsRow');
+    els.modelSelect = document.getElementById('modelSelect');
+    els.effortSelect = document.getElementById('effortSelect');
+    els.capabilityNotes = document.getElementById('capabilityNotes');
 
     if (opts) {
       if (opts.onSend) onSend = opts.onSend;
@@ -517,6 +525,91 @@ var ChatUi = (function () {
     if (els.stopBtn) els.stopBtn.style.display = busy ? 'inline-block' : 'none';
   }
 
+  // ── Phase 3：ACP server 设置面板（plan-2026-09-05 §7）──
+
+  /**
+   * Phase 3：切换设置面板显示状态
+   * @param {boolean} visible
+   */
+  function toggleSettings(visible) {
+    if (els.settingsPanel) els.settingsPanel.style.display = visible ? 'block' : 'none';
+  }
+
+  /**
+   * Phase 3：填充 ACP server 下拉（/servers 列表 + bridge 当前）
+   * @param {Array<{name:string,description?:string}>} servers
+   * @param {string} current
+   */
+  function setServerList(servers, current) {
+    if (!els.serverSelect) return;
+    while (els.serverSelect.firstChild) els.serverSelect.removeChild(els.serverSelect.firstChild);
+    if (!servers || !servers.length) {
+      var none = document.createElement('option');
+      none.value = '';
+      none.textContent = '(无可用 server)';
+      els.serverSelect.appendChild(none);
+      return;
+    }
+    for (var i = 0; i < servers.length; i++) {
+      var opt = document.createElement('option');
+      opt.value = servers[i].name;
+      opt.textContent = servers[i].name;
+      opt.title = servers[i].description || '';
+      if (current && servers[i].name === current) opt.selected = true;
+      els.serverSelect.appendChild(opt);
+    }
+  }
+
+  /**
+   * Phase 3：设置 server 描述文案（当前 server 的说明）
+   * @param {string} text
+   */
+  function setServerDesc(text) {
+    if (els.serverDesc) els.serverDesc.textContent = text || '';
+  }
+
+  /**
+   * Phase 3：设置能力差异说明（capability notes，如 opencode 无审批 / 中止=重建）
+   * @param {string} text
+   */
+  function setCapabilityNotes(text) {
+    if (els.capabilityNotes) els.capabilityNotes.textContent = text || '';
+  }
+
+  /**
+   * Phase 3：填充 model/effort 配置下拉（opencode session/new 的 configOptions）。
+   * @param {object|null} modelOpt - {id, currentValue, options:[{value,label?}]}
+   * @param {object|null} effortOpt - 同上
+   * @param {string|undefined} savedModel - localStorage 记住的模型（会话级不跨会话，新会话需重新应用）
+   * @param {string|undefined} savedEffort
+   */
+  function populateConfigOptions(modelOpt, effortOpt, savedModel, savedEffort) {
+    if (!els.configOptionsRow) return;
+    var show = !!(modelOpt || effortOpt);
+    els.configOptionsRow.style.display = show ? 'flex' : 'none';
+    if (modelOpt) fillConfigSelect(els.modelSelect, modelOpt, savedModel);
+    if (effortOpt) fillConfigSelect(els.effortSelect, effortOpt, savedEffort);
+  }
+
+  /** 内部：把一个 configOption 的 options 填进 select（选项形状 {value[,label]} | 字符串） */
+  function fillConfigSelect(sel, opt, savedValue) {
+    if (!sel) return;
+    while (sel.firstChild) sel.removeChild(sel.firstChild);
+    var opts = opt.options || [];
+    var target = savedValue !== undefined && savedValue !== null ? String(savedValue)
+      : (opt.currentValue !== undefined && opt.currentValue !== null ? String(opt.currentValue) : '');
+    for (var i = 0; i < opts.length; i++) {
+      var o = opts[i];
+      var val = (typeof o === 'object' && o !== null) ? (o.value !== undefined ? o.value : o.id) : o;
+      var label = (typeof o === 'object' && o !== null) ? (o.label || o.value || val) : o;
+      var el = document.createElement('option');
+      el.value = val;
+      el.textContent = label;
+      if (target && String(val) === target) el.selected = true;
+      sel.appendChild(el);
+    }
+  }
+
   function scrollBottom() {
     if (els.messages) els.messages.scrollTop = els.messages.scrollHeight;
   }
@@ -538,6 +631,11 @@ var ChatUi = (function () {
     setInputEnabled: setInputEnabled,
     setPlaceholder: setPlaceholder,
     setBusy: setBusy,
+    toggleSettings: toggleSettings,
+    setServerList: setServerList,
+    setServerDesc: setServerDesc,
+    setCapabilityNotes: setCapabilityNotes,
+    populateConfigOptions: populateConfigOptions,
     snapshot: snapshot,
     restore: restore,
     clear: clear,

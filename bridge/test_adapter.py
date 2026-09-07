@@ -154,6 +154,41 @@ def main():
         else:
             assert st == 400, f"/agent/set 空 target 应 HTTP 400: {st} {r}"
 
+        # 7) Phase 3：/servers（可用 server 列表 + 能力标志）与 /server/set 切换
+        st, r = req(port, "GET", "/servers", timeout=5)
+        servers = r.get("servers") or []
+        current = r.get("current")
+        names = [s.get("name") for s in servers]
+        print(f"7) /servers -> {names}, current={current}", flush=True)
+        assert current == server, f"/servers current 应为 {server}: {r}"
+        assert server in names, f"/servers 应包含 {server}: {names}"
+        for s in servers:
+            assert isinstance(s.get("capabilities"), dict) and s["capabilities"], f"server 缺 capabilities: {s}"
+            assert s.get("defaultAgent"), f"server 缺 defaultAgent: {s}"
+
+        # 8) /server/set 切到另一 server（两种都注册了才切；切换会重启子进程）
+        other = next((n for n in names if n != server), None)
+        if other:
+            st, r = req(port, "POST", f"/server/set?server={other}", timeout=30)
+            print(f"8) /server/set {server}->{other} -> ok={r.get('ok')} server={r.get('server')} error={r.get('error')} (http={st})", flush=True)
+            assert r.get("ok"), f"/server/set 切到 {other} 失败: {r}"
+            st, cfg = req(port, "GET", "/config", timeout=5)
+            assert cfg.get("acpServer") == other, f"/config acpServer 应为 {other}: {cfg}"
+            # 切回原 server（保持与启动参数一致，避免影响后续）
+            st, r = req(port, "POST", f"/server/set?server={server}", timeout=30)
+            assert r.get("ok"), f"/server/set 切回 {server} 失败: {r}"
+            st, cfg = req(port, "GET", "/config", timeout=5)
+            assert cfg.get("acpServer") == server, f"/config acpServer 应切回 {server}: {cfg}"
+        else:
+            # 单 server 环境：测空 target 拒绝路径
+            st, r = req(port, "POST", "/server/set?server=", timeout=5)
+            assert st == 400, f"/server/set 空 target 应 HTTP 400: {st} {r}"
+
+        # 9) /server/set 未知 server -> HTTP 400
+        st, r = req(port, "POST", "/server/set?server=does_not_exist", timeout=5)
+        print(f"9) /server/set 未知 -> http={st} error={r.get('error')}", flush=True)
+        assert st == 400, f"/server/set 未知 server 应 HTTP 400: {st} {r}"
+
         print(f"\n✅ {server} adapter E2E PASS", flush=True)
         return 0
     finally:

@@ -338,6 +338,70 @@ html, body {
     background: #fdecea;
 }
 
+/* Phase 3：设置按钮 + 设置面板（ACP server 选择 / opencode 模型 / 能力说明） */
+.settings-btn {
+    padding: 2px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    color: #666;
+    font-size: 13px;
+    cursor: pointer;
+    line-height: 1.2;
+}
+
+.settings-btn:hover {
+    border-color: #2b579a;
+    color: #2b579a;
+}
+
+.settings-panel {
+    display: block;
+    padding: 8px 12px;
+    border-top: 1px solid #e0e0e0;
+    background: #f0f2f5;
+    flex-shrink: 0;
+}
+
+.settings-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.settings-label {
+    font-size: 11px;
+    color: #555;
+    white-space: nowrap;
+}
+
+.server-select, .config-select {
+    max-width: 160px;
+    font-size: 11px;
+    padding: 2px 4px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    color: #333;
+}
+
+.server-desc {
+    font-size: 11px;
+    color: #888;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.capability-notes {
+    font-size: 11px;
+    color: #7a7a7a;
+    line-height: 1.4;
+    word-break: break-all;
+}
+
 .tool-status {
     font-size: 11px;
     color: #888;
