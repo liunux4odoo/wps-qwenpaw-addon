@@ -58,6 +58,10 @@
 
 ### 变更历史
 
+- **v0.26（加载项 main.js 拆分，2026-09-07）**：
+  - **`js/main.js`（原 1987 行）按域拆为十个控制器模块**：`app-state`（全局状态容器 QP + QPLog + localStorage 持久化）/ `doc-state`（P8 文档隔离 + P16 环境上下文）/ `bridge-config`（/config + poll 端口）/ `session`（会话生命周期 + 看门狗）/ `agents`（P3 agent + Phase 3 server + 设置面板）/ `acp-events`（响应/流式/审批）/ `watchdog`（P2 中断恢复）/ `actions`（发送/停止/清空/附件 + UI 状态）/ `poll`（角色 B 分发）/ `ribbon`（taskpane 创建/切换）；`main.js` 仅剩 initTaskpane 接线 + 对外接口（136 行）
+  - **形态**：无 ES module / 构建工具（manifest + 两份 HTML 普通 `<script>` 顺序加载），采用**IIFE 包裹 + 单一状态容器 `QP`**——可变状态集中在 `app-state.js` 的 `QP.state`（各控制器 IIFE 内 `var S = QP.state`，闭包私有不落全局）；跨文件函数经 `globalThis.<fn>` **最小导出**（仅导出被引用者，内部函数/常量留在闭包）。**加载顺序固定** `app-state → doc-state → bridge-config → session → agents → acp-events → watchdog → actions → poll → ribbon → main`（main.js 最末）
+  - **验收**：`node --check` 全绿；node 模拟浏览器全局作用域加载 10 个新文件全部通过（含「window.S 已收敛」「内部函数无全局泄漏」「POLL_ACTION_MAP/WPS_Enum 闭包私有」断言）；端到端行为验证（init→/config→连接→session/new→发送→preamble 注入→流式累积→prompt 完成→审批→stop→poll 分发）全绿；ribbon 上下文（isTaskpane=false 不 init）验证通过；叶子模块（acp-client/wps-bridge/chat-ui/wps-poll-client）零改动
 - **v0.25（ACP server 支持范围定案，2026-09-07）**：
   - **决策**：ACP server 兼容**到此为止**（不再新增第三 server）；**qwenpaw 为主目标**（默认，完整体验），**opencode 为替代**（用户无法安装或不愿安装 qwenpaw 时的第二后端，已能完整体验本项目功能，够用）；claudecode / kimicode / qcoder 等其它 code agent 支持**推迟**，等有需要再说
   - **同步更新**：README / docs/README / INSTALL（AI 后端二选一）/ DEV-PLAN-Phase3 F1 / plan-2026-09-05（kilocode 相关条目标"推迟"）/ acp-servers/opencode.md（唯一计划内替代）/ AGENTS.md；§6.3 扩展方向收敛、§10 决策表新增本决策
@@ -103,8 +107,9 @@
   - **数据契约对齐 wps-office-mcp 工具**：`insertText` 回 `{success,message,position,textLength}`、`getDocumentText` 回 `{text,length,truncated,maxLength}`、`findReplace` 回 `{count,findText,replaceText,message}` 等，与 `wps-office-mcp` 各 tool handler 读取字段一一对应（§8.4）
   - **验证**：Node 模拟 WPS jsapi 环境跑 43 项命令契约测试全过（含 execute_method 白名单/黑名单）；`node --check` 语法通过
   - **审查加固（2026-09-03，code review 后）**：①`findReplace` Wrap 参数 bug——Replace 模式改 `Replace=1(wdReplaceOne)` + `Wrap=0(wdFindStop)` 逐次替换计数（原先 `wdReplaceAll` 只回布尔导致 count 恒为 1）；查找计数模式 `Wrap` 位置参数改传 0（原先传 1=wdFindContinue 到文末回卷导致死循环冻结 + 计数错误）；②`executeMethod` 收紧——新增 `.Application`/`.Parent` 回引段与 `__proto__`/`constructor`/`prototype` 原型链段拒绝（addon 侧是实际解析执行点，前缀白名单可被 `Application.ActiveDocument.Application.*` 绕过）；③`findInDocument` 段落索引改增量统计（原先每命中从 0 重扫 O(n·m)）；④删除遗留无调用的 `getSelectedText()`
-  - **⚠️ 部署配套（必须）**：`js/main.js` 与 `js/wps-bridge.js` **必须一起**同步到已安装 addon 目录并**完全重启 WPS** 才生效（两者原子耦合：只同步其一会出现 `未支持的命令` 或返回形状错位）：
-    `cp js/main.js js/wps-bridge.js ~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`
+  - **⚠️ 部署配套（必须）**：`js/main.js`、`js/wps-bridge.js` 与全部控制器模块（`app-state.js` 等十一个，见 §4.1）**必须一起**同步到已安装 addon 目录并**完全重启 WPS** 才生效（原子耦合：只同步其一会出现 `ReferenceError` 或 `未支持的命令`）。整目录同步或一键安装：
+    `cp -r js/* ~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`
+    （或直接 `./scripts/install.sh`，勿手动零散拷贝）
   - **待办**：WPS 实机重开侧边栏端到端验证编辑命令（§8.4 停止门：把"foo"改成"bar"真能改成功）
 
 - **v0.17（code 实施，2026-09-03 已落地，待实机重开侧边栏验证）**：
@@ -527,9 +532,21 @@ wps-office-mcp（Node.js 子进程，每 session 一个，各自监听独立 pol
 | `js/wps-bridge.js` | WPS JS API 轻量封装（选区/光标查询） | 零依赖 |
 | `js/chat-ui.js` | 聊天界面渲染（纯 DOM 操作） | 零依赖 |
 | `js/wps-poll-client.js` | 角色 B：连 :58891 拉取/回传命令 | 零依赖 |
-| `js/main.js` | 入口胶水层，串起上面四块 | 上述四个 |
+| `js/app-state.js` | 全局状态容器 `QP`（常量 + QPLog + localStorage 持久化工具），控制器层唯一状态源 | `QP` 内部零依赖 |
+| `js/doc-state.js` | P8 文档隔离 / P15 历史缓存 / P16 环境上下文（getDocId/switchToDoc/buildPreamble…） | `QP`、ChatUi |
+| `js/bridge-config.js` | bridge `/config` 拉取 + 路线 P poll 端口分配 | `QP`、AcpClient、WpsPollClient |
+| `js/session.js` | ACP 会话生命周期 + 会话建立看门狗 | `QP`、AcpClient |
+| `js/agents.js` | P3 agent / Phase 3 server 选择 + 设置面板 | `QP`、AcpClient |
+| `js/acp-events.js` | ACP 响应 / 流式 / 服务端请求处理 | `QP`、AcpClient |
+| `js/watchdog.js` | P2 中断恢复看门狗 | `QP`、ChatUi |
+| `js/actions.js` | 用户动作（发送/停止/清空/重试/重建/附件）+ UI 状态 | `QP`、AcpClient |
+| `js/poll.js` | 角色 B 轮询命令分发（action → WpsBridge 方法） | `QP`、WpsBridge |
+| `js/ribbon.js` | ribbon 上下文（taskpane 创建/切换回调） | `QP` |
+| `js/main.js` | 入口胶水层，串起上面所有控制器模块 | 上述全部 |
 
 > **注**：另含 `bridge/` 目录（acp-bridge.py 桥接服务 + 测试脚本，见 §3.4/§8.2），不属于加载项沙箱内代码，是独立 Python 进程。
+
+> **注（v0.22 拆分）**：`js/main.js`（原 1987 行）按域拆为上述 `app-state/doc-state/bridge-config/session/agents/acp-events/watchdog/actions/poll/ribbon` 十个控制器模块。由于加载项无 ES module / 构建工具（manifest 与两份 HTML 以普通 `<script>` 顺序加载），控制器模块采用**IIFE 包裹 + 单一状态容器 `QP`** 的形态：全部可变状态集中在 `app-state.js` 的 `QP.state`（各控制器 IIFE 内 `var S = QP.state`，闭包私有、不落全局 `S`）；跨文件函数经 `globalThis.<fn> = <fn>` **最小导出**（仅导出被其他模块/入口引用的函数，内部辅助函数与 `POLL_ACTION_MAP`/`WPS_Enum` 等常量留在闭包内，不污染全局）。**加载顺序固定**：`app-state → doc-state → bridge-config → session → agents → acp-events → watchdog → actions → poll → ribbon → main`（`main.js` 必须最末）。
 
 ### 4.2 模块边界硬约束
 
@@ -537,7 +554,7 @@ wps-office-mcp（Node.js 子进程，每 session 一个，各自监听独立 pol
 - **`wps-bridge.js` 只懂 WPS JS API**——不知道 ACP 是什么、不知道聊天 UI 是什么
 - **`chat-ui.js` 只懂 DOM 渲染**——不知道协议、不知道文档
 - **`wps-poll-client.js` 只懂 wps-office-mcp 的轮询协议**——不知道 ACP 是什么、不知道 UI 是什么
-- **`main.js` 是唯一的耦合点**——它知道所有其他模块，但其他模块互不依赖
+- **`main.js` 是唯一的耦合点**——它知道所有其他模块，但其他模块互不依赖。拆分后此语义不变：`app-state.js` 等十个控制器模块共同构成「控制器层」，仍由 `main.js` 完成唯一接线（`initTaskpane`），叶子模块（acp-client/wps-bridge/chat-ui/wps-poll-client）保持对控制器层零反向依赖
 
 ### 4.3 加载项对外暴露的接口（仅 `main.js`）
 

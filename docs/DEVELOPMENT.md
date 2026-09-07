@@ -31,7 +31,7 @@
 ## 部署约定
 
 - 加载项最终安装到 `~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/`（WPS Linux）
-- `js/main.js` 与 `js/wps-bridge.js` **必须一起**同步到已安装 addon 目录并**完全重启 WPS** 才生效（两者原子耦合）
+- `js/main.js`、`js/wps-bridge.js` 与全部控制器模块（`app-state.js`、`doc-state.js`、`bridge-config.js`、`session.js`、`agents.js`、`acp-events.js`、`watchdog.js`、`actions.js`、`poll.js`、`ribbon.js`）**必须一起**同步到已安装 addon 目录并**完全重启 WPS** 才生效（原子耦合，见 ARCHITECTURE §4.1）
 - 一键安装/更新请用 `scripts/install.sh`，不要手动零散拷贝
 
 ## 验证命令
@@ -42,11 +42,7 @@ conda run -n py312 python -m py_compile bridge/acp-bridge.py
 conda run -n py312 python bridge/test_bridge.py
 
 # JS（加载项）
-node --check js/main.js
-node --check js/acp-client.js
-node --check js/wps-bridge.js
-node --check js/chat-ui.js
-node --check js/wps-poll-client.js
+node --check js/*.js
 
 # wps-office-mcp（submodule 内，安装时自动执行）
 cd third_party/opencode-wps/wps-office-mcp && npm run build && npm test

@@ -26,6 +26,16 @@
         <script src="js/markdown.js"/>
         <script src="js/acp-client.js"/>
         <script src="js/wps-poll-client.js"/>
+        <script src="js/app-state.js"/>
+        <script src="js/doc-state.js"/>
+        <script src="js/bridge-config.js"/>
+        <script src="js/session.js"/>
+        <script src="js/agents.js"/>
+        <script src="js/acp-events.js"/>
+        <script src="js/watchdog.js"/>
+        <script src="js/actions.js"/>
+        <script src="js/poll.js"/>
+        <script src="js/ribbon.js"/>
         <script src="js/main.js"/>
     </scripts>
 </manifest>
