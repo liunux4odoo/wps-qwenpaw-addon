@@ -1,6 +1,7 @@
 # ACP Server Adapter 改造方案（v0.3：以兼容 opencode 为第一实施目标）
 
-> **文档状态**：v0.5（2026-09-07，Phase 3 完成）
+> **文档状态**：v0.5（2026-09-07，Phase 3 完成）→ **2026-09-07 定案：ACP server 兼容到此为止，本文档关闭后续扩展**
+> **定案（v0.5 补记，2026-09-07）**：**qwenpaw 为主目标**（默认，完整体验），**opencode 为替代**（用户无法安装或不愿安装 qwenpaw 时的第二后端，已能完整体验本项目功能，够用）；claudecode / kimicode / qcoder 等其它类似 code agent 支持**推迟**，等有需要再说。Phase 0-3 已全部落地，`bridge/servers.py` 保持 qwenpaw + opencode 两个 adapter，**不再新增第三 server**。详见 ARCHITECTURE.md v0.25 决策。
 > **v0.4 → v0.5 变更**：Phase 3 落地完成（UI 配置化 F1）：bridge 新增 `/servers`（可用 server 列表 + 能力标志）与 `/server/set`（运行时切换 adapter + 重启子进程，agent 复位为该 server 默认）；前端设置面板（⚙）选择 ACP server、localStorage 持久化（A7：重启加载项仍生效，启动自动对齐 bridge 当前并自动切换）、能力差异说明（无审批 / 中止=重建 / 会话级配置）；opencode 特有 model/effort 选择（session/new 的 configOptions 解析填充 + set_config_option 应用 + 按 server 持久化，新会话自动重新应用）；agent 选择按 server 隔离（agentKey server-scoped，旧全局 key 兼容迁移）。test_adapter.py 新增 /servers + /server/set 覆盖（含真实双向切换 E2E）。qwenpaw 零回归（全测试绿）。
 > **review 修复（2026-09-07）**：① server 切换后 `resetAfterServerSwitch` 必须清掉在途 session/new|load 的 pending——否则 ensureSession 被 stale pending 挡住（旧子进程已 kill、响应永不到达 → 25s 看门狗误报"会话建立失败"）；② `/server/set` 失败回滚用 `loadServerList(skipAutoSwitch)`，防自动切换→失败→回滚→再切换的无限循环；③ bridge `switch_server` 失效 agent 缓存须在 `_agents_lock` 内做，防 list_agents 持锁中旧 adapter 结果写回残留；④ `_restart_proc` 日志加 reason（agent/server 区分）。新增前端测试 Scenario E（切换竞态 stale pending 清理）+ Scenario F（失败回滚不循环）。
 > **v0.3 → v0.4 变更**：Phase 2 落地完成（C4-C8）：看门狗任意下行续命 / 审批按标志分支（非 auto 弹 UI 手动确认不盲选）/ 中止按标志（cancel:false 走 session/close+重建）/ session/load 按 loadSession 门禁 / opencode agent 切换 set_config_option 应用（V11 实测）/ tool_call 工具卡片；capabilities 新增 switchSemantics；qwenpaw 零回归（adapter E2E 全绿）。A7 属 Phase 3 范围。
@@ -34,7 +35,7 @@
 1. **已完成 Phase 0 实测**：opencode 1.18.23 的 ACP 实现已逐项验证（V1/V2/V3/V4/V5/V7），可行性已确认
 2. **已配置可用模型**：`~/.config/opencode/opencode.json` 已加入 deepseek provider（`deepseek/deepseek-v4-flash`，OpenAI 兼容端点 `http://120.26.36.89:18080/v1`）并设为默认，探针全链路跑通
 3. **qwenpaw 保持默认**：`--acp-server qwenpaw` 现状零回归；opencode 作为第一个"第二 server"落地
-4. **kilocode 推迟**：CLI 被配置错误挡住（`/home/zero/.config/kilo/kilo.jsonc` 的 `Unrecognized key: web_search`），待用户修复后再补测
+4. **其它 code agent 推迟（2026-09-07 定案）**：kilocode 当初被配置错误挡住（`/home/zero/.config/kilo/kilo.jsonc` 的 `Unrecognized key: web_search`）；现决定**不再补测**——ACP server 兼容到此为止，claudecode / kimicode / qcoder 等一律推迟，等有需要再说
 
 ### 0.3 范围界定
 
@@ -44,7 +45,7 @@
 | 前端协议偏好假设（审批 / 看门狗 / load / 中止）按能力标志适配 | 非 ACP 协议的后端（HTTP API 类）——不存在"迁移"，是重写，不在本文档 |
 | opencode 适配落地（本阶段目标） | 前端传输层重写（HTTP 轮询是 bridge 抽象，已通用） |
 | 插件页面 ACP server 配置 UI | 多 server 同时热切换的复杂编排（先单 server 切换） |
-| kilocode 能力补测（配置修复后） | 协议归一化层（见 D1） |
+| ~~kilocode 能力补测（配置修复后）~~（2026-09-07 推迟） | 协议归一化层（见 D1） |
 
 ### 0.4 跨层分类说明（沿用 DEV-PLAN-Phase3 惯例）
 
@@ -85,14 +86,14 @@
 - ❌ 非 ACP 后端支持（HTTP API 类）
 - ❌ 多 server 同时在线热切换的编排（先单 server 切换）
 - ❌ 改 wps-office-mcp 源码（零 fork 铁律不变）
-- ❌ kilocode 落地（配置修复前不实施，见 D7）
+- ❌ ~~kilocode 落地~~（2026-09-07 推迟：兼容到此为止，见 D7/D10）
 
 ---
 
 ## 3. 方案总览（四阶段，前两个是门）
 
 ```
-Phase 0  目标 server 能力验证（阻塞门）→ opencode 已全部完成（V1-V11 ✅），kilocode 待补
+Phase 0  目标 server 能力验证（阻塞门）→ opencode 已全部完成（V1-V11 ✅）；其它 server（kilocode 等）推迟（2026-09-07 定案）
 Phase 1  bridge server adapter 抽象（C1-C3/C8/C9）→ ✅ 已完成（2026-09-06）：--acp-server qwenpaw|opencode，
          bridge/servers.py adapter，qwenpaw 零回归 + opencode 可建会话（test_adapter.py / test_switch_race.py / test_bridge.py 全绿）
 Phase 2  前端协议偏好按能力标志适配（C4-C8）→ ✅ 已完成（2026-09-07）：opencode 差异显式化
@@ -138,9 +139,9 @@ Phase 3  UI 配置化（F1 完整形态）→ ✅ 已完成（2026-09-07）：/s
 | ~~V10~~ | opencode **无 initialize 直接 session/new** 是否被接受（C9） | Phase 1 spawn/建会话（C9） | ✅ 已实测：**接受**，直接返回 sessionId（无需握手注入，D9 落地为"前端不发送 initialize，bridge 纯传输不变"） |
 | ~~V11~~ | opencode `session/new` 的 `configOptions` 改 **mode** 是否生效 | Phase 2/3 agent 切换语义（C3 / §5.2 / §7） | ✅ 已实测：**configOptions 数组不生效（mode 仍 build，同 V9 model 只读结论）；`session/set_config_option` 生效（currentValue 变 plan）且为会话级（新建会话默认仍 build）**。agent 切换只能用 set_config_option |
 
-### 4.4 kilocode 状态
+### 4.4 kilocode / claudecode / kimicode / qcoder 等其它 code agent
 
-**blocker**：CLI 报 `Unrecognized key: web_search`（`/home/zero/.config/kilo/kilo.jsonc` 新版严格校验）。修复配置后按 V1-V8 流程补测。未修复前不进入 Phase 1/2。
+**状态（2026-09-07 定案）：推迟，等有需要再说。** 当初 kilocode 的 blocker 是 CLI 报 `Unrecognized key: web_search`（`/home/zero/.config/kilo/kilo.jsonc` 新版严格校验），但现已**不计划**修复后补测——ACP server 兼容到此为止：qwenpaw 为主目标，opencode 为替代（够用），不再为其它类似 code agent 投入。若将来确有需要，再按 V1-V8 流程补测决定是否进入。
 
 ---
 
@@ -196,7 +197,7 @@ adapter 是 bridge 内部的一个**配置化描述**（不是代码插件），
 ### 6.1 路线 P 注入（C4）——opencode ✅
 
 - **V2 实测通过**：opencode 完整透传 `mcpServers[].env`，注入逻辑**保持现状**
-- 其它 server（如 kilocode）V2 未测，走"先验后定"：不通则降级单 wps-mcp（见下）
+- 其它 server 未测（且已冻结扩展，见定案）——如将来有需要再"先验后定"：不通则降级单 wps-mcp（见下）
 - **验收**：opencode 下多窗口独立端口隔离正常（WPS_POLL_PORT 各自独立）
 
 ### 6.2 审批自动批准（C5）——opencode 默认无审批 ✅
@@ -263,7 +264,8 @@ Phase 2（前端能力适配）→ ✅ 已完成（2026-09-07）：C4-C8 + openc
          qwenpaw 零回归（adapter E2E 全绿）；门：opencode 全链路可用或显式降级（WPS 实机验收待做）
 Phase 3（UI 配置）→ ✅ 已完成（2026-09-07）：/servers + /server/set + 设置面板选 server + 持久化（A7）
          + 能力差异说明 + opencode model/effort；门：UX 验收（WPS 实机目验待做）
-kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
+其它 code agent（kilocode / claudecode / kimicode / qcoder 等）→ ⏸ **推迟（2026-09-07 定案）**：ACP server 兼容到此为止，
+         qwenpaw 主 + opencode 替代（够用），不再补测新 server
 ```
 
 - **Phase 0 单独先做**就值回票价：验证结果决定"迁移"是真可行还是该砍掉重想（opencode 已验证可行）
@@ -296,7 +298,7 @@ kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 | ~~V9~~ | opencode 切换模型参数格式 | Phase 3 模型选择 | ✅ 已实测：用 set_config_option（configId）；session/new configOptions 只读 |
 | V10 | ~~opencode 无 initialize 直接 session/new（C9）~~ | Phase 1 spawn/建会话 | ✅ 已实测：接受直接 session/new，无需握手注入 |
 | V11 | ~~opencode `configOptions` 改 mode 是否生效~~ | Phase 2/3 agent 切换（C3） | ✅ 已实测：configOptions 只读；`set_config_option` 生效且会话级 |
-| kilocode V1-V8 | 修复 `kilo.jsonc` 的 web_search 键后全流程补测 | 是否进入 Phase 1/2 | ⏸ blocker（待用户修配置） |
+| kilocode V1-V8 | ~~修复 `kilo.jsonc` 的 web_search 键后全流程补测~~ | ~~是否进入 Phase 1/2~~ | ⏸ **推迟（2026-09-07 定案）**：ACP server 兼容到此为止；claudecode / kimicode / qcoder 等类似 code agent 一律推迟，等有需要再说 |
 
 **opencode 的 V1-V11 已全部验证完成，进入 Phase 1/2 无阻塞。**
 
@@ -312,7 +314,8 @@ kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 | D4 | 默认仍 qwenpaw（`--acp-server qwenpaw`） | 默认空/要求显式选择 | 现状零破坏，现有部署/测试不回归 |
 | D5 | 非 ACP 后端明确排除 | 顺带支持 HTTP API | 不是"迁移"是重写，范围失控 |
 | D6 | **第一实施目标 = opencode** | 泛化多 server 齐头并进 | opencode 已完成 Phase 0 实测 + 已配可用模型（deepseek），可行性格最低；先落地一个真实第二 server 再泛化 |
-| D7 | **kilocode 推迟** | 与 opencode 并行 | 配置错误（web_search 键）挡 CLI，修前无法测；不阻塞 opencode 主线 |
+| D7 | **其它 code agent 推迟（2026-09-07 升级为定案）** | 与 opencode 并行扩展 / 修复 kilocode 配置后补测 | 当初：kilocode 配置错误（web_search 键）挡 CLI；现定案：**ACP server 兼容到此为止**——qwenpaw 主目标 + opencode 替代（够用），claudecode / kimicode / qcoder 等一律推迟，等有需要再说 |
+| D10 | **兼容范围冻结：仅 qwenpaw + opencode** | 继续扩展第三 server | 本项目以 qwenpaw 为目标，opencode 已能覆盖"无法/不愿装 qwenpaw"用户的完整体验，不再为低概率的其它 code agent 需求持续投入 |
 | D8 | **opencode 中止走 session/close**（破坏会话）而非 cancel | 硬等自然结束 / 找非标 cancel | opencode 明确无 session/cancel；close 是 ACP 标准能力，语义可接受（中止=放弃该会话） |
 | D9 | **initialize 握手：前端不发送，bridge 保持纯传输**（V10 实测 opencode 容忍无 initialize 直接建会话） | bridge 内自动注入 initialize | V10 确认 opencode 无需握手即接受 session/new；注入是多余改动且违背 bridge 纯传输铁律 |
 
@@ -320,7 +323,7 @@ kilocode → 配置修复后按 V1-V8 补测，再决定是否进入 Phase 1/2
 
 ## 12. 文档路由
 
-- 架构总纲：`docs/ARCHITECTURE.md`——本文档落地后，§3.4（ACP 桥接服务）补 adapter 层说明、§6.3（允许的扩展方向）登记"多 ACP 后端"、版本头更新（v0.23+）
-- 阶段 3：`docs/DEV-PLAN-Phase3.md` §3 F1 状态从"仅规划"改为"已实施（见本计划）"
-- 目标 server 能力表：`docs/acp-servers/opencode.md`（✅ 已生成，Phase 0 输出）
-- 项目记忆：决策链沉淀到 ARCHITECTURE.md §13（新增 §13.x 多 ACP adapter 决策）
+- 架构总纲：`docs/ARCHITECTURE.md`——本文档落地后，§3.4（ACP 桥接服务）补 adapter 层说明、§6.3（允许的扩展方向）登记"多 ACP 后端"、版本头更新（v0.23+）；**v0.25 兼容范围定案**已记录于 §0 变更历史 + §6.3 + §10 决策表
+- 阶段 3：`docs/DEV-PLAN-Phase3.md` §3 F1 状态从"仅规划"改为"已实施（见本计划）"，v0.25 更新为"已实施并冻结"
+- 目标 server 能力表：`docs/acp-servers/opencode.md`（✅ 已生成，Phase 0 输出；v0.25 补状态：唯一计划内替代后端）
+- 项目记忆：多 ACP adapter 决策沉淀到 ARCHITECTURE.md §10 决策表（§13 为 wps MCP 路线 P 专用，不混入）

@@ -52,12 +52,16 @@
 
 ## §0 文档元信息
 
-- **方案版本**：v0.24（多 ACP server 配置化落地，2026-09-07）
-- **上一里程碑**：v0.23 多 ACP server adapter 抽象（docs/plan-2026-09-05）；v0.24 新增 Phase 3 UI 配置化（/servers + /server/set + 设置面板选 server + opencode model/effort 会话级选择）
+- **方案版本**：v0.25（ACP server 兼容范围定案，2026-09-07）
+- **上一里程碑**：v0.24 多 ACP server 配置化落地（docs/plan-2026-09-05）；v0.25 明确 ACP server 支持范围：qwenpaw 为主目标 + opencode 为替代，其余 code agent（claudecode/kimicode/qcoder 等）兼容冻结推迟
 - **变更控制**：任何架构层决策的修改需回到 discuss agent 重启讨论
 
 ### 变更历史
 
+- **v0.25（ACP server 支持范围定案，2026-09-07）**：
+  - **决策**：ACP server 兼容**到此为止**（不再新增第三 server）；**qwenpaw 为主目标**（默认，完整体验），**opencode 为替代**（用户无法安装或不愿安装 qwenpaw 时的第二后端，已能完整体验本项目功能，够用）；claudecode / kimicode / qcoder 等其它 code agent 支持**推迟**，等有需要再说
+  - **同步更新**：README / docs/README / INSTALL（AI 后端二选一）/ DEV-PLAN-Phase3 F1 / plan-2026-09-05（kilocode 相关条目标"推迟"）/ acp-servers/opencode.md（唯一计划内替代）/ AGENTS.md；§6.3 扩展方向收敛、§10 决策表新增本决策
+  - **实施范围**：纯文档决策，无代码改动（`bridge/servers.py` 保持 qwenpaw + opencode 两个 adapter，`--acp-server` 默认 qwenpaw 零回归）
 - **v0.24（多 ACP server 配置化，2026-09-07）**：
   - **运行时 server 切换**：bridge 新增 `GET /servers`（可用 server 列表 + capabilities + defaultAgent + 描述）与 `POST /server/set`（换 adapter + 重启子进程 + agent 复位为该 server 默认 + 失效 agent 缓存；server 可执行文件未安装时提前报错，不切坏状态）
   - **Phase 3 UI 配置化**（plan-2026-09-05 §7）：设置面板（⚙）选择 ACP server、localStorage 持久化（`qp.server`，重启加载项自动对齐 bridge 当前并自动切换，A7）；能力差异说明展示（无审批 / 中止=重建 / 会话级配置）；opencode 特有 model/effort 选择（session/new 的 configOptions 解析填充 + `session/set_config_option` 应用 + 按 server 持久化，新会话自动重新应用，V9/V11）；agent 选择按 server 隔离（`qp.agent.<server>`，旧全局 key 兼容回退）
@@ -428,9 +432,10 @@ acp-bridge **不做任何业务逻辑**，只做传输层转发（WebSocket ↔ 
 
 **server adapter 层（v0.23，plan-2026-09-05）**：
 - bridge 的 spawn / agent 发现 / 切换语义 / 能力标志 由 `bridge/servers.py` 的 per-server adapter 提供（配置化描述，非协议归一化层，守"bridge 不做业务逻辑"铁律）
-- 启动参数 `--acp-server <name>`（默认 `qwenpaw`，现状零回归）；当前支持的 adapter：
-  - **qwenpaw**：`qwenpaw acp --agent X`，kill+restart 切换，daemon/CLI agent 发现（行为不变）
-  - **opencode**：`opencode acp --cwd`（无 --agent），`mcpServers:[]` 兜底建会话，无 initialize 握手（V10 ✅），agent 枚举走 `opencode agent list`（mode/自定义 agent），mode 切换 = `session/set_config_option`（会话级，V11 ✅）
+- 启动参数 `--acp-server <name>`（默认 `qwenpaw`，现状零回归）；当前支持的 adapter（**v0.25 定案：兼容到此为止，仅此两个**）：
+  - **qwenpaw**：`qwenpaw acp --agent X`，kill+restart 切换，daemon/CLI agent 发现（行为不变）——**主目标，默认**
+  - **opencode**：`opencode acp --cwd`（无 --agent），`mcpServers:[]` 兜底建会话，无 initialize 握手（V10 ✅），agent 枚举走 `opencode agent list`（mode/自定义 agent），mode 切换 = `session/set_config_option`（会话级，V11 ✅）——**替代后端**（用户无法/不愿安装 qwenpaw 时，可完整体验本项目功能）
+  - ~~kilocode 等其它 code agent~~：**推迟**（claudecode / kimicode / qcoder 等类似后端，等有需要再扩展）
 - `/config` 下发 `acpServer` + `capabilities`（能力标志，Phase 2 前端按标志适配：approval/thoughtHeartbeat/cancel/loadSession/honorMcpEnv/agents）
 - **Phase 3 配置面（v0.24）**：
   - `GET /servers`：可用 server 列表（name + capabilities + defaultAgent + description，源自 `servers.py::list_adapters()`），供设置面板选择
@@ -685,7 +690,7 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 
 ### 6.3 允许的扩展方向（MVP 之后）
 
-- **多 ACP server 后端（v0.23/v0.24 已落地）**：bridge server adapter 抽象（`bridge/servers.py`）支持 `--acp-server qwenpaw|opencode`；opencode 已可 spawn/建会话/对话/agent 枚举。Phase 2 前端按能力标志适配协议偏好（审批/看门狗/中止/load），Phase 3 UI 配置化已完成（/servers + /server/set + 设置面板选 server + opencode model/effort 会话级选择）。后续可加 kilocode（待其配置修复）、更多 server
+- **多 ACP server 后端（v0.23/v0.24 已落地，v0.25 冻结范围）**：bridge server adapter 抽象（`bridge/servers.py`）支持 `--acp-server qwenpaw|opencode`；opencode 已可 spawn/建会话/对话/agent 枚举。Phase 2 前端按能力标志适配协议偏好（审批/看门狗/中止/load），Phase 3 UI 配置化已完成（/servers + /server/set + 设置面板选 server + opencode model/effort 会话级选择）。**支持范围定案（v0.25）**：qwenpaw 为主目标（默认），opencode 为替代（用户无法/不愿安装 qwenpaw 时可完整体验）；claudecode / kimicode / qcoder 等其它 code agent **暂不支持**，兼容到此为止，等有需要再扩展
 - 添加 Excel/PPT 工具（MCP 侧挂更多工具）
 - 添加 Mac/Windows 支持（wps-office-mcp 已支持，验证即可）
 - 添加撤销/重做 UI（QwenPaw 会话记忆 + 加载项 UI）
@@ -911,6 +916,7 @@ QwenPaw 通过 `qwenpaw acp` 命令暴露 ACP agent（**纯 stdio 模式，阶�
 | WPS 崩溃短期方案 | **noop 脚本替换 `wps-auto.sh`**（v0.13） | 改 wps-mcp 源码（违反零 fork）/ 完全不操作 WPS（丢失功能） | wps-mcp 强制应用切换是设计问题，零 fork 约束下只能绕外圈；setCurrentApp 已存在但无 HTTP 接口 = 作者预留扩展点；`switchScriptPath` 硬编码无法配置，文件替换是唯一非 fork 路径；用户不用 opencode-wps，opencode 功能受损无影响 |
 | WPS 崩溃长期方案 | **issue 追踪：暴露 setCurrentApp 为 POST /set-current-app HTTP 端点**（v0.13） | 维护 wps-mcp fork / 加 SWITCH_APP_DISABLED 环境变量 / 接受持续 WPS 崩溃 | 杠杆方向对：只建议一个聚焦改动（顺势暴露作者已预留的 setCurrentApp 入口），issue 被采纳概率高；不加环境变量避免分散焦点（作者会问"setCurrentApp 不就够了？"）；issue 合并后可切回标准部署 |
 | 侧边栏方案 | **WPS 内嵌 CreateTaskPane + HTTP 托管 UI** | 外部浏览器（类 opencode） | 内嵌体验更好（用户不用切换窗口）；acp-bridge 已有 HTTP server，加静态文件服务增量小；外部浏览器作为备选方案 |
+| ACP server 支持范围（v0.25） | **qwenpaw 主目标 + opencode 替代，兼容到此为止** | 持续扩展 claudecode / kimicode / qcoder 等 | 本项目以 qwenpaw 为目标，opencode 作为用户无法/不愿安装 qwenpaw 时的替代已能完整体验功能、够用；其它类似 code agent 支持推迟，等有需要再说（避免为低概率需求持续投入） |
 
 ---
 

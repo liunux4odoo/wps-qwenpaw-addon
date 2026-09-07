@@ -3,7 +3,8 @@
 > **server**：opencode 1.18.23（PATH 中的 `opencode`；bridge 以 `OPENCODE_BIN` env / PATH 解析）
 > **验证日期**：2026-09-05
 > **验证方法**：真实 wps-office-mcp（`third_party/opencode-wps/wps-office-mcp/dist/index.js`）+ 一次性探针脚本（`/tmp/acp_probe*.py`）
-> **关联**：`docs/plan-2026-09-05-acp-server-adapter.md`（v0.3，D6：第一实施目标 = opencode；V10/V11 待补测见 §7）
+> **关联**：`docs/plan-2026-09-05-acp-server-adapter.md`（v0.5，D6：第一实施目标 = opencode；V10/V11 待补测见 §7）
+> **状态（2026-09-07 定案）**：opencode 是**唯一计划内的替代后端**——面向无法/不愿安装 QwenPaw 的用户，已能完整体验本项目功能。ACP server 兼容**到此为止**：qwenpaw 为主目标（默认），其余 code agent（claudecode / kimicode / qcoder 等）一律推迟，等有需要再说（详见 docs/ARCHITECTURE.md v0.25 §6.3）。
 
 ---
 

@@ -8,7 +8,8 @@
 |---|---|---|
 | **opencode-wps**（submodule） | 固定提交 `6b8b33c`（`third_party/opencode-wps/`） | GitHub: `lnxsun/opencode-wps`，上游 HEAD |
 | **wps-office-mcp**（opencode-wps 内） | v1.5.2 | 14 个直连工具 + 250+ Gateway 工具（包版本号见其 `package.json`） |
-| **QwenPaw** | v2.1.0 | `qwenpaw acp` 对外提供 ACP（纯 stdio）；py312 conda 环境 |
+| **QwenPaw** | v2.1.0 | `qwenpaw acp` 对外提供 ACP（纯 stdio）；py312 conda 环境。**主目标（默认后端）** |
+| **opencode**（可选） | ≥ 1.18 | `opencode acp` 提供 ACP（纯 stdio）；**替代后端**（用户无法/不愿安装 QwenPaw 时，能力表见 `docs/acp-servers/opencode.md`） |
 | **Node.js** | ≥ 18.0.0（wps-office-mcp `engines` 要求） | 本机以 node 直接运行 wps-mcp |
 | **Python** | 3.12（py312 conda 环境） | acp-bridge 运行环境 |
 | **websockets** | 15.0.1（py312） | acp-bridge 依赖 |

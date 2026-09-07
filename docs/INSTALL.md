@@ -10,9 +10,23 @@
 | WPS Office | Linux 版 12.1.x（[linux.wps.cn](https://linux.wps.cn)） | 加载项宿主；需能打开 Word/Excel/PPT 文档 |
 | Node.js | ≥ 18.0.0 | 运行 wps-office-mcp |
 | Python | 3.12 | 运行 acp-bridge（conda py312 环境） |
-| QwenPaw | v2.1.0 | 智能体后端；`qwenpaw acp` 提供 ACP（纯 stdio） |
+| AI 后端（ACP server） | **二选一**：QwenPaw v2.1.0（主目标，默认）或 opencode ≥ 1.18（替代） | 智能体后端；`qwenpaw acp` / `opencode acp` 提供 ACP（纯 stdio），详见 [§AI 后端选择](#ai-后端选择acp-server) |
 | opencode-wps | git submodule（固定提交 `6b8b33c`） | 内含 wps-office-mcp（v1.5.2） |
 | 网络 | 首次安装需访问 GitHub | 拉取 submodule |
+
+> **ACP server 支持范围（2026-09-07 定案）**：本项目以 **QwenPaw 为主目标**（默认后端，完整体验），**opencode 为替代**——面向无法安装或不愿安装 QwenPaw 的用户，已能完整体验本项目功能。claudecode / kimicode / qcoder 等其它 code agent **暂不支持**。
+
+## AI 后端选择（ACP server）
+
+本项目需要一个 ACP（Agent Client Protocol）后端提供智能体能力，**二选一**：
+
+| 后端 | 定位 | 说明 |
+|---|---|---|
+| **QwenPaw v2.1.0**（推荐） | **主目标，默认** | 完整体验：工具自动批准、中止（`session/cancel`）、历史恢复（`session/load`）、agent 切换（重启后端）。`bridge` 以 `--acp-server qwenpaw` 启动（默认值） |
+| **opencode ≥ 1.18** | **替代** | 面向**无法安装或不愿安装 QwenPaw** 的用户，已能**完整体验本项目功能**（对话、WPS 工具调用、多窗口隔离、历史恢复）。差异：无审批环节（默认直接执行）、中止=结束会话重建、模型/mode 会话级配置。能力表见 [docs/acp-servers/opencode.md](docs/acp-servers/opencode.md) |
+
+- 切换方式：bridge 启动参数 `--acp-server qwenpaw|opencode`；或运行后在侧边栏设置面板（⚙）选择并记住（localStorage 持久化）。
+- **其余 code agent（claudecode / kimicode / qcoder 等）暂不支持**——ACP server 兼容到此为止，等有需要再扩展。
 
 ## 一键安装（推荐）
 
@@ -83,7 +97,9 @@ cd wps-qwenpaw-addon
 git submodule update --init --recursive
 ```
 
-### 2. 安装 QwenPaw
+### 2. 安装 AI 后端（ACP server，二选一）
+
+**方案 A：QwenPaw（主目标，默认）**
 
 ```bash
 # 推荐 conda 环境（与 bridge 共用 py312）
@@ -93,6 +109,18 @@ conda run -n py312 qwenpaw --version          # 期望 v2.1.0
 ```
 
 > QwenPaw 需先完成其自身的初始化（agent/模型配置）。本项目通过 `qwenpaw acp --agent default` 连接，默认 agent 需可用。
+
+**方案 B：opencode（替代，用户无法/不愿安装 QwenPaw 时）**
+
+```bash
+# 按 opencode 官方方式安装（>= 1.18，需在 PATH 中，或用 OPENCODE_BIN 环境变量指定）
+opencode --version
+# 配置模型后可用 opencode acp 提供 ACP（能力表见 docs/acp-servers/opencode.md）
+```
+
+> opencode 已能完整体验本项目功能（对话、WPS 工具调用、多窗口隔离、历史恢复），差异仅为无审批环节 / 中止=重建会话 / 模型会话级配置。
+
+> **其余 code agent（claudecode / kimicode / qcoder 等）暂不支持**（2026-09-07 定案）。
 
 ### 3. 安装 opencode-wps（submodule）与构建 wps-office-mcp
 
@@ -132,14 +160,14 @@ chmod +x third_party/opencode-wps/opencode-wps-linux/wps-auto.sh
 # 依赖（conda py312 环境）
 conda run -n py312 pip install websockets
 
-# 自检：启动 bridge
-conda run -n py312 python bridge/acp-bridge.py --http-port 8766 --port 8765 --agent default
+# 自检：启动 bridge（--acp-server 选后端：qwenpaw 默认 / opencode 替代）
+conda run -n py312 python bridge/acp-bridge.py --http-port 8766 --port 8765 --acp-server qwenpaw --agent default
 ```
 
 bridge 会：
 - 监听 HTTP `127.0.0.1:8766`（加载项实际使用：`/acp/send`、`/acp/poll`、`/ui/*`、`/config`、`/poll-port/*`、`/status`）
 - 监听 WebSocket `127.0.0.1:8765`（调试/非 WPS）
-- spawn `qwenpaw acp --agent default` 子进程（崩溃自动重启）
+- spawn ACP server 子进程（默认 `qwenpaw acp --agent default`；`--acp-server opencode` 则为 `opencode acp`；崩溃自动重启）
 
 验证：
 
@@ -165,11 +193,13 @@ cp -r manifest.xml ribbon.xml index.html taskpane.html css js "$ADDON_DIR/"
 
 1. **启动 acp-bridge**（若未运行）：
    ```bash
-   conda run -n py312 python bridge/acp-bridge.py --agent default
+   conda run -n py312 python bridge/acp-bridge.py --acp-server qwenpaw --agent default
+   # 或选择 opencode 作为后端：
+   # conda run -n py312 python bridge/acp-bridge.py --acp-server opencode
    ```
 2. **启动 WPS** 并打开一个文档（Word/Excel/PPT 均可）。
 3. 功能区出现 **QwenPaw AI** 标签，点击 **AI 侧边栏** 打开对话侧边栏。
-4. 在输入框下达自然语言指令（如"把第三段润色一下"），AI 经 QwenPaw → wps-office-mcp 操作文档。
+4. 在输入框下达自然语言指令（如"把第三段润色一下"），AI 经 ACP server（QwenPaw/opencode）→ wps-office-mcp 操作文档。
 
 > 打开文档是必须的：WPS 加载项引擎（CEF）在打开文档后才启动。
 

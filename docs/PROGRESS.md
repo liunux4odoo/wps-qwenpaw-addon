@@ -4,7 +4,9 @@
 
 ## 当前状态
 
-**方案版本 v0.22**（阶段 0/0.5/1/2 代码完成；wps MCP 路线 P 已落地，待 WPS 实机重开侧边栏端到端验收）
+**方案版本 v0.25**（阶段 0/0.5/1/2 代码完成；wps MCP 路线 P 已落地，待 WPS 实机重开侧边栏端到端验收；ACP server 兼容范围已定案：qwenpaw 主目标 + opencode 替代，其余 code agent 推迟）
+
+> **2026-09-07 ACP server 兼容定案**：qwenpaw 为主目标（默认，完整体验），opencode 为替代（用户无法/不愿安装 qwenpaw 时可完整体验本项目功能，够用）；claudecode / kimicode / qcoder 等其它 code agent **暂不支持**，兼容到此为止，等有需要再扩展（详见 docs/ARCHITECTURE.md v0.25 / §6.3）。
 
 ## 阶段 0：环境验证 ✅ 已完成（2026-08-28）
 

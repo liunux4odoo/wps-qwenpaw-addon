@@ -19,6 +19,7 @@
 - 不允许 acp-bridge 实现任何 ACP 业务逻辑（纯传输层转发）
 - 不允许 acp-bridge 绑定 0.0.0.0 或暴露到局域网（只绑 `127.0.0.1`）
 - 不允许绕过 wps-mcp 应用切换的 noop 脚本替换（缺失会导致 WPS 被强杀）
+- **不允许新增 ACP server adapter 或为其它 code agent 做适配**（2026-09-07 定案：qwenpaw 为主目标，opencode 为替代，兼容到此为止；claudecode / kimicode / qcoder 等推迟，见 ARCHITECTURE.md v0.25 / §6.3）
 
 ## 依赖管理（submodule）
 

@@ -26,6 +26,7 @@ node --check js/main.js                       # 语法检查加载项 JS（其�
 
 - **硬约束**（不允许动）：见 docs/ARCHITECTURE.md §6。wps-office-mcp 零 fork（唯一例外：`WPS_POLL_PORT` env 支持，1 行加法）；acp-bridge 纯传输层不实现 ACP 业务逻辑；只绑 `127.0.0.1`；文档操作必须经 QwenPaw→MCP→wps-mcp。
 - **server adapter**：bridge 的 spawn/agent 发现/切换语义/能力标志由 `bridge/servers.py` 提供（`--acp-server qwenpaw|opencode`，默认 qwenpaw 零回归）；qwenpaw 专属逻辑在 QwenpawAdapter，opencode 在 OpencodeAdapter（docs/plan-2026-09-05 §5）。
+- **ACP server 支持范围（2026-09-07 定案，勿扩展）**：**qwenpaw 为主目标（默认）**，**opencode 为替代**（用户无法/不愿安装 qwenpaw 时可完整体验本项目功能，够用）；claudecode / kimicode / qcoder 等其它 code agent **暂不支持**，兼容到此为止，不要新增 adapter 或为其它 server 做适配。
 - **入口**：`js/main.js` 是唯一耦合点（知道所有模块，其他模块互不依赖）。
 - **wps 路线 P**：每 ACP session 一个 wps-mcp 子进程，bridge 集中分配 `WPS_POLL_PORT`（59000+），多窗口并发合法（docs/ARCHITECTURE.md §13）。
 - **WPS Linux 沙箱**：只放行 HTTP，拦 WebSocket → 加载项走 HTTP 短轮询（bridge :8766）；CreateTaskPane 只能 HTTP URL（bridge /ui/* 托管）。
