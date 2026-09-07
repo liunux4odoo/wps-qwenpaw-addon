@@ -43,6 +43,7 @@ conda run -n py312 python bridge/test_bridge.py
 
 # JS（加载项）
 node --check js/*.js
+node bridge/test_frontend_race.js   # 前端行为验证（vm sandbox 按 manifest 顺序加载控制器模块，A-F 场景）
 
 # wps-office-mcp（submodule 内，安装时自动执行）
 cd third_party/opencode-wps/wps-office-mcp && npm run build && npm test

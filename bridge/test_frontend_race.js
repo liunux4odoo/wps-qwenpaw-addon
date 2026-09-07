@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 /**
- * Frontend 行为验证：每个场景用**全新环境**加载真实 js/main.js（vm sandbox + DOM/XHR/AcpClient 桩），
+ * Frontend 行为验证：每个场景用**全新环境**按 manifest 顺序加载控制器模块 + main.js
+ * （vm sandbox + DOM/XHR/AcpClient 桩；叶子模块 acp-client/wps-bridge/chat-ui/
+ * wps-poll-client/markdown 以桩替代，测试借此录制调用）。
  * 验证 plan-2026-09-04 §6.2（会话建立看门狗：超时清 pending + 重试 ≤1 + 可见错误）
  * 与 §6.3（/config 不可达：不静默带相对路径 spawn；恢复后能继续）。
+ *
+ * 加载顺序对齐 manifest.xml / index.html / taskpane.html（app-state 最先、main 最末，
+ * 依赖 app-state 先定义 QP，各控制器 IIFE 内 `var S = QP.state`）。
  *
  * 用法：node /tmp/kilo/test_frontend_race.js
  */
@@ -11,7 +16,12 @@ const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 
-const MAIN_JS = path.join(__dirname, '..', 'js', 'main.js');
+const JS_DIR = path.join(__dirname, '..', 'js');
+// 控制器模块（叶子模块已桩化，不加载真实文件）；顺序与 manifest.xml <scripts> 一致
+const MODULE_ORDER = [
+  'app-state.js', 'doc-state.js', 'bridge-config.js', 'session.js', 'agents.js',
+  'acp-events.js', 'watchdog.js', 'actions.js', 'poll.js', 'ribbon.js', 'main.js'
+];
 const WATCHDOG_MS = 25000;
 
 function loadEnv(initialConfigMode, opts) {
@@ -65,7 +75,7 @@ function loadEnv(initialConfigMode, opts) {
     setInputEnabled() {}, setPlaceholder() {}, setBusy() {}, appendAssistantChunk() {}, finishAssistant() {},
     addToolCard() { return {}; }, markToolCard() {},
     toggleSettings() {}, setServerList() {}, setServerDesc() {}, setCapabilityNotes() {},
-    populateConfigOptions() {},
+    populateConfigOptions() {}, addApprovalCard() {},
   };
 
   const AcpClientStub = {
@@ -151,13 +161,15 @@ function loadEnv(initialConfigMode, opts) {
     setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
     setInterval: fakeSetInterval, clearInterval: fakeClearInterval,
     XMLHttpRequest: XHRStub, localStorage: localStorageStub,
-    document: documentStub, alert() {},
+    document: documentStub, alert() {}, confirm() { return true; },
     ChatUi: ChatUiStub, AcpClient: AcpClientStub,
     WpsPollClient: WpsPollClientStub, WpsBridge: WpsBridgeStub,
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(MAIN_JS, 'utf8'), sandbox, { filename: 'main.js' });
+  for (const f of MODULE_ORDER) {
+    vm.runInContext(fs.readFileSync(path.join(JS_DIR, f), 'utf8'), sandbox, { filename: f });
+  }
 
   return {
     setConfig(mode) { configMode = mode; },

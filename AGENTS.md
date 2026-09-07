@@ -20,6 +20,7 @@ git submodule update --init --recursive       # 拉取 third_party/opencode-wps
 conda run -n py312 python bridge/acp-bridge.py --agent default   # 前台启动 bridge（--acp-server qwenpaw|opencode 选 adapter）
 conda run -n py312 python -m py_compile bridge/acp-bridge.py bridge/servers.py   # 语法检查 bridge + adapter
 node --check js/*.js                               # 语法检查加载项全部 JS
+node bridge/test_frontend_race.js                  # 前端行为验证（按 manifest 顺序加载控制器模块，A-F 场景）
 ```
 
 ## Architecture (critical)
