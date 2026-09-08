@@ -81,6 +81,8 @@
       S.gotFirstChunk = false;
       clearPromptTimers();
       S.lastPromptReqId = null;
+      // P8：响应结束 → 执行在途期间被延迟的文档切换（AI 工具切文档不中止自身响应）
+      try { if (typeof flushDeferredDocSwitch === 'function') flushDeferredDocSwitch(); } catch (e) {}
       ChatUi.finishAssistant();
       ChatUi.hideTyping();
       updateSendAvailability(); // P21：回复结束 → 恢复可发送（若会话仍有效）

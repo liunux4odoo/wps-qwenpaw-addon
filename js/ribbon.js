@@ -77,19 +77,69 @@
     }
   }
 
+  // 自动打开侧边栏（用户需求：点击进入插件时自动打开侧边栏）。
+  // v0.11 教训：WPS 启动瞬间（无文档/CEF 未就绪）CreateTaskPane 会得到空白窗格并被缓存。
+  // 因此仅在"活动文档就绪"后才创建；无文档时延迟重试（有限次数），文档出现后自动打开一次。
+  // autoOpenDone 仅在 createTaskPane 成功后置位（失败可重试），并防止与手动打开重复。
+  var autoOpenDone = false;
+  var AUTO_OPEN_MAX_RETRIES = 60; // 60s 上限：无文档且用户不操作时停止自旋
+
+  function docReady() {
+    try {
+      var app = (typeof window !== 'undefined' && window.WPS && window.WPS.Application)
+        || (typeof window !== 'undefined' && window.Application)
+        || (typeof Application !== 'undefined' ? Application : null);
+      if (!app) return false;
+      return !!(app.ActiveDocument || app.ActiveWorkbook || app.ActivePresentation);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function autoOpenSidebarWhenReady(attempt) {
+    if (autoOpenDone) return;
+    if (docReady()) {
+      autoOpenDone = true; // 置位防并发重入；失败则下方恢复以便重试
+      var okPane = false;
+      try {
+        // 同步创建窗格：成功（返回非空且已可见）才视为完成；失败恢复 autoOpenDone 以便后续重试
+        var tp = createTaskPane();
+        okPane = !!(tp && tp.ID);
+      } catch (e) {
+        okPane = false;
+      }
+      if (!okPane) {
+        autoOpenDone = false;
+        QPLog('main', '自动打开侧边栏失败，稍后重试');
+        scheduleAutoOpen(attempt + 1);
+        return;
+      }
+      QPLog('main', '自动打开侧边栏（进入插件时）');
+      return;
+    }
+    scheduleAutoOpen(attempt + 1);
+  }
+
+  function scheduleAutoOpen(attempt) {
+    if (autoOpenDone || (attempt || 0) >= AUTO_OPEN_MAX_RETRIES) return;
+    setTimeout(function () { autoOpenSidebarWhenReady(attempt); }, 1000);
+  }
+
   // ribbon onLoad 回调
   window.OnAddinLoad = function (ui) {
     QP.state.ribbonUI = ui;
     QPLog('main', '加载项已加载 (ribbon)');
     console.log('[main] WPS QwenPaw AI 加载项已加载 (ribbon)');
-    // 不自动打开侧边栏：启动时文档/CEF 引擎未就绪，自动 CreateTaskPane 会得到空白窗格，
-    // 且其 ID 被缓存后，后续点按钮会复用空白窗格（表现为"按钮没反应"）。由用户点击 ribbon 按钮打开。
+    // 自动打开侧边栏：仅在文档就绪后执行（避免 v0.11 启动空白窗格被缓存的问题）；
+    // 无文档时轮询等待（有限次数），用户新建/打开文档后自动打开一次。
+    autoOpenSidebarWhenReady(0);
     return true;
   };
 
   // 按钮：打开/切换侧边栏
   // 总是新建正确的对话窗格（不复用可能为空白/失效的旧窗格）；先隐藏旧窗格避免堆积。
   window.OnShowTaskPane = function () {
+    autoOpenDone = true; // 用户手动打开后不再自动打开（防重复建窗格）
     if (taskpaneIdCache) {
       try {
         var old = window.Application.GetTaskPane(taskpaneIdCache);

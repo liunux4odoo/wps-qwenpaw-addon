@@ -17,6 +17,9 @@
     S.acpState = (state === 'connected') ? 'connected' : (state === 'connecting') ? 'connecting' : 'disconnected';
     updateStatus();
     if (state === 'connected') {
+      // 建会话前先即时复查活动文档（P8）：确保 currentDocId/sessionId 缓存落在正确文档上，
+      // 覆盖"先打开插件、再新建/打开文档"时周期检测未跑完的空档。
+      try { if (typeof checkDocNow === 'function') checkDocNow(); } catch (e) {}
       syncPollPort();  // 重连时同步权威端口（覆盖初始分配失败/bridge 重启场景）
       ensureSession();
     } else if (state === 'disconnected') {

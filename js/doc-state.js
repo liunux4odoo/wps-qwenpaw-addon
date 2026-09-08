@@ -141,14 +141,37 @@
     updateSendAvailability(); // P21：切换后按新文档会话状态刷新发送可用性
   }
 
+  // P8：立即复查当前活动文档（读取 docId，变化则切换）。
+  // 供周期检测与 poll 命令执行后调用——命令执行时 WPS 必然活跃、Application.ActiveDocument
+  // 读取可信，可即时覆盖"先打开插件、再新建/打开文档"时 3s 周期前的空档（activeDocument 不刷新）。
+  // 若 AI 正在回复（S.waitingResponse），不立即切换（switchToDoc 会中止在途响应），
+  // 仅标记 docSwitchDeferred，待响应结束由 flushDeferredDocSwitch() 再切换。
+  function doSwitchIfChanged() {
+    var id;
+    try { id = getDocId(); } catch (e) { return; }
+    if (id && id !== S.currentDocId) switchToDoc(id);
+  }
+
+  function checkDocNow() {
+    if (S.waitingResponse) {
+      S.docSwitchDeferred = true;
+      return;
+    }
+    doSwitchIfChanged();
+  }
+
+  // P8：AI 在途响应结束（/停止/中断/清空/服务器切换）后，执行被延迟的文档切换。
+  // 此处直接切换（不再受 waitingResponse 门控——调用方已在响应结束后调用）。
+  function flushDeferredDocSwitch() {
+    if (!S.docSwitchDeferred) return;
+    S.docSwitchDeferred = false;
+    doSwitchIfChanged();
+  }
+
   // P8：周期检测活动文档变化（同一 taskpane 实例内多文档隔离；每文档独立 taskpane 时是 no-op）
   function startDocCheck() {
     if (S.docCheckTimer) return;
-    S.docCheckTimer = setInterval(function () {
-      var id;
-      try { id = getDocId(); } catch (e) { return; }
-      if (id && id !== S.currentDocId) switchToDoc(id);
-    }, QP.DOC_CHECK_MS);
+    S.docCheckTimer = setInterval(checkDocNow, QP.DOC_CHECK_MS);
   }
 
   // 仅导出跨文件需要的函数（globalThis === window）
@@ -156,5 +179,7 @@
   globalThis.getSessionCwd = getSessionCwd;
   globalThis.buildPreamble = buildPreamble;
   globalThis.schedulePersist = schedulePersist;
+  globalThis.checkDocNow = checkDocNow;
+  globalThis.flushDeferredDocSwitch = flushDeferredDocSwitch;
   globalThis.startDocCheck = startDocCheck;
 })();

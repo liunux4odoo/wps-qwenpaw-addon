@@ -32,8 +32,9 @@
       if (wps === 'connected') {
         ChatUi.setWpsState('connected', 'WPS 已连接');
       } else {
-        // P1：懒启动端口连不上 = 预期行为（首次工具调用后才监听），显示"未激活"，不显示红色"错误"
-        ChatUi.setWpsState('pending', 'WPS 未激活');
+        // P1/P20：懒启动端口连不上 = 预期行为（首次工具调用后才监听）。
+        // 对话前显示"未激活"会误导用户以为异常——改为中性"待命"，不显示红色"错误"。
+        ChatUi.setWpsState('pending', 'WPS 待命');
       }
     }
   }
@@ -133,6 +134,8 @@
     ChatUi.setBusy(false);
     S.docStates[S.currentDocId] = { acpSessionId: null, messages: [] };
     QP.saveHistory(S.currentDocId, []);
+    // P8：响应结束后执行在途期间被延迟的文档切换（先清当前文档，再切到实际活动文档）
+    try { if (typeof flushDeferredDocSwitch === 'function') flushDeferredDocSwitch(); } catch (e) {}
     // P19：清空后立即新建空会话（防止惰性新建与旧上下文串；新建失败由会话看门狗给可见错误+可重试，
     // 不清空动作不回滚）。新会话沿用 P16：session/new 成功置 preamblePending → 首条 prompt 重新注入
     // 环境上下文（重新现取当前文档身份）。
@@ -190,6 +193,8 @@
         updateSendAvailability(); // P21：重建期间会话未建 → 发送按钮禁用
       }
     }
+    // P8：停止后执行在途期间被延迟的文档切换
+    try { if (typeof flushDeferredDocSwitch === 'function') flushDeferredDocSwitch(); } catch (e) {}
   }
 
   // ── 用户发送 ──

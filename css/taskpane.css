@@ -72,7 +72,7 @@ html, body {
     text-overflow: ellipsis;
 }
 
-/* 未激活 = 预期状态（懒启动端口），非错误，用中性色 */
+/* 待命 = 预期状态（懒启动端口），非错误，用中性色 */
 .wps-label.pending { background: rgba(255,255,255,0.18); color: #ffe0a3; }
 .wps-label.connected { background: rgba(46,204,113,0.3); color: #d5f5e3; }
 
@@ -436,6 +436,7 @@ html, body {
 }
 
 /* P6：附件按钮 */
+/* 图标用内联 SVG（不用 emoji 📎）：WPS CEF 无彩色 emoji 字体，补充平面 emoji 渲染为空白 */
 .attach-btn {
     align-self: flex-end;
     padding: 8px 10px;
@@ -446,6 +447,10 @@ html, body {
     font-size: 13px;
     cursor: pointer;
     line-height: 1;
+}
+
+.attach-btn .attach-icon {
+    display: block;
 }
 
 .attach-btn:hover {

@@ -77,6 +77,7 @@ var QP = (function () {
     // ── 阶段 3 批 2：P8 文档隔离 / P15 历史缓存 / P3 agent 选择 ──
     currentDocId: null,             // 当前活动文档 id（会话隔离 key）
     docStates: {},                  // docId -> {acpSessionId, messages}
+    docSwitchDeferred: false,       // P8：AI 在途响应期间检测到文档变化 → 延迟到响应结束再切换
     persistTimer: null,             // P15：历史落盘防抖
     agentList: [],                  // P3：可用 agent 列表
     agentCached: null,              // P3：localStorage 记住的上次 agent

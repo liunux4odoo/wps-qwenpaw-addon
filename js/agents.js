@@ -277,6 +277,8 @@
     S.currentConfigOptions = null;         // 不同 server 的 configOptions 不同
     ChatUi.populateConfigOptions(null, null); // 隐藏 model/effort 配置行
     updateCapabilityUI();                // 能力差异随 server 变化
+    // P8：服务器切换重置了在途响应 → 执行被延迟的文档切换（避免 docSwitchDeferred 滞留）
+    try { if (typeof flushDeferredDocSwitch === 'function') flushDeferredDocSwitch(); } catch (e) {}
     QPLog('main', 'server 切换：会话已重置，等待重建');
   }
 

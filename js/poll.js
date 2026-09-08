@@ -100,6 +100,9 @@
       QPLog('poll', '命令执行抛异常 action=' + action + ' err=' + (e && e.message ? e.message : e));
     }
     QPLog('poll', '命令完成 action=' + action + ' 耗时=' + (Date.now() - t0) + 'ms success=' + result.success + ' error=' + (result.error || ''));
+    // 命令执行后即时复查活动文档（P8）：命令在 WPS 活跃时执行，activeDocument 读取可信，
+    // 覆盖"先打开插件、再新建/打开文档"时周期检测前的空档（避免会话上下文不刷新）。
+    try { if (typeof checkDocNow === 'function') checkDocNow(); } catch (e) {}
     // P11：写操作/有结果操作给结构化侧边栏反馈（操作类型 + 结果摘要），只读查询不刷屏
     if (FEEDBACK_ACTIONS[action] && S.isTaskpane) {
       try {

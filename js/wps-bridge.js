@@ -21,6 +21,19 @@ var WpsBridge = (function () {
     }
   }
 
+  // 获取当前 Application 引用（每次调用重新解析，不持旧引用）。
+  // 修复：先打开插件、再新建/打开文档时 activeDocument 不刷新——若 WPS 的
+  // window.WPS.Application 是实时命名空间，持页面加载时的 window.Application 会读到旧文档。
+  // 优先级：window.WPS.Application > window.Application > 裸 Application（与 opencode-wps 参考一致）。
+  function getApplication() {
+    try {
+      if (typeof window !== 'undefined' && window.WPS && window.WPS.Application) return window.WPS.Application;
+      if (typeof window !== 'undefined' && window.Application) return window.Application;
+      if (typeof Application !== 'undefined' && Application) return Application;
+    } catch (e) {}
+    return null;
+  }
+
   // ── 统一响应封装（与轮询协议 /result 契约一致） ──
   function ok(data) {
     return { success: true, data: data || null, error: null };
@@ -37,8 +50,9 @@ var WpsBridge = (function () {
   /** 获取选中区域 Range；无选中/无活动窗口时返回 null（部分 WPS 抛错而非返回 null） */
   function getSelectionRange() {
     try {
-      if (!Application.Selection) return null;
-      return Application.Selection.Range;
+      var app = getApplication();
+      if (!app || !app.Selection) return null;
+      return app.Selection.Range;
     } catch (e) {
       return null;
     }
@@ -47,7 +61,9 @@ var WpsBridge = (function () {
   /** 获取活动文档（Word/WPS 文字）；无活动文档返回 null */
   function getActiveDoc() {
     try {
-      return Application.ActiveDocument || null;
+      var app = getApplication();
+      if (!app) return null;
+      return app.ActiveDocument || null;
     } catch (e) {
       return null;
     }
@@ -56,10 +72,11 @@ var WpsBridge = (function () {
   /** 获取当前应用类型：wps / et / wpp / unknown */
   function getAppType() {
     try {
-      if (typeof Application === 'undefined' || !Application) return 'unknown';
-      try { if (Application.ActiveDocument) return 'wps'; } catch (e) {}
-      try { if (Application.ActiveWorkbook) return 'et'; } catch (e) {}
-      try { if (Application.ActivePresentation) return 'wpp'; } catch (e) {}
+      var app = getApplication();
+      if (!app) return 'unknown';
+      try { if (app.ActiveDocument) return 'wps'; } catch (e) {}
+      try { if (app.ActiveWorkbook) return 'et'; } catch (e) {}
+      try { if (app.ActivePresentation) return 'wpp'; } catch (e) {}
     } catch (e) {}
     return 'unknown';
   }
@@ -123,7 +140,8 @@ var WpsBridge = (function () {
     try {
       var appType = getAppType();
       var appName = '';
-      try { appName = Application.Name || ''; } catch (e) {}
+      var app = getApplication();
+      try { appName = (app && app.Name) || ''; } catch (e) {}
       return ok({ appType: appType, appName: appName, platform: 'linux', version: 1 });
     } catch (e) {
       return ok({ appType: 'unknown', appName: '', platform: 'linux' });
@@ -135,7 +153,8 @@ var WpsBridge = (function () {
    */
   function isReady() {
     try {
-      var okv = !!(window.Application && window.Application.ActiveDocument);
+      var app = getApplication();
+      var okv = !!(app && app.ActiveDocument);
       log('wps', 'isReady -> ' + okv);
       return okv;
     } catch (e) {
@@ -153,13 +172,14 @@ var WpsBridge = (function () {
    */
   function getActiveDocumentInfo() {
     try {
-      if (typeof Application === 'undefined' || !Application) {
+      var app = getApplication();
+      if (!app) {
         log('wps', 'getActiveDocumentInfo: Application 不存在');
         return null;
       }
       // WPS / Word
       var doc = null;
-      try { doc = Application.ActiveDocument; } catch (e) {
+      try { doc = app.ActiveDocument; } catch (e) {
         log('wps', 'getActiveDocumentInfo: 读 ActiveDocument 异常: ' + e.message);
       }
       if (doc) {
@@ -176,14 +196,14 @@ var WpsBridge = (function () {
         }
       }
       // Excel
-      try { doc = Application.ActiveWorkbook; } catch (e) {}
+      try { doc = app.ActiveWorkbook; } catch (e) {}
       if (doc) {
         try {
           return { name: doc.Name || '', path: doc.Path || '', appType: 'et' };
         } catch (e) { return null; }
       }
       // PowerPoint
-      try { doc = Application.ActivePresentation; } catch (e) {}
+      try { doc = app.ActivePresentation; } catch (e) {}
       if (doc) {
         try {
           return { name: doc.Name || '', path: doc.Path || '', appType: 'wpp' };
@@ -205,17 +225,18 @@ var WpsBridge = (function () {
    */
   function getDocIdentity() {
     try {
-      if (typeof Application === 'undefined' || !Application) return null;
+      var app = getApplication();
+      if (!app) return null;
       var doc = null;
-      try { doc = Application.ActiveDocument; } catch (e) {}
+      try { doc = app.ActiveDocument; } catch (e) {}
       if (doc) {
         try { return { name: doc.Name || '', path: doc.Path || '', appType: 'wps' }; } catch (e) { return null; }
       }
-      try { doc = Application.ActiveWorkbook; } catch (e) {}
+      try { doc = app.ActiveWorkbook; } catch (e) {}
       if (doc) {
         try { return { name: doc.Name || '', path: doc.Path || '', appType: 'et' }; } catch (e) { return null; }
       }
-      try { doc = Application.ActivePresentation; } catch (e) {}
+      try { doc = app.ActivePresentation; } catch (e) {}
       if (doc) {
         try { return { name: doc.Name || '', path: doc.Path || '', appType: 'wpp' }; } catch (e) { return null; }
       }
@@ -247,7 +268,8 @@ var WpsBridge = (function () {
   function getSelectedTextCmd() {
     try {
       var sel = null;
-      try { sel = Application.Selection; } catch (e) {}
+      var app = getApplication();
+      try { sel = app && app.Selection; } catch (e) {}
       if (!sel) return fail('没有选中内容');
       var text = sel.Text || '';
       return ok({ text: text, length: text.length });
@@ -260,7 +282,8 @@ var WpsBridge = (function () {
   function setSelectedText(params) {
     try {
       var sel = null;
-      try { sel = Application.Selection; } catch (e) {}
+      var app = getApplication();
+      try { sel = app && app.Selection; } catch (e) {}
       if (!sel) return fail('没有选中的文本范围');
       var text = (params && params.text !== undefined && params.text !== null) ? String(params.text) : '';
       var appType = getAppType();
@@ -300,8 +323,9 @@ var WpsBridge = (function () {
         positionText = '文档结尾';
       } else {
         // 默认/光标/cursor/其他数字都按光标处插入
-        if (typeof Application !== 'undefined' && Application.Selection) {
-          Application.Selection.TypeText(text);
+        var app = getApplication();
+        if (app && app.Selection) {
+          app.Selection.TypeText(text);
         } else {
           doc.Content.InsertAfter(text);
           positionText = '文档结尾';
@@ -732,7 +756,9 @@ var WpsBridge = (function () {
       if (isNaN(rows) || rows < 1) return invalidParam('无效的行数: ' + params.rows + '（必须为正整数）');
       var cols = parseInt(params && params.cols, 10);
       if (isNaN(cols) || cols < 1) return invalidParam('无效的列数: ' + params.cols + '（必须为正整数）');
-      var table = doc.Tables.Add(Application.Selection.Range, rows, cols);
+      var app = getApplication();
+      if (!app || !app.Selection) return fail('没有打开的文档');
+      var table = doc.Tables.Add(app.Selection.Range, rows, cols);
       if (params.data && Array.isArray(params.data)) {
         for (var r = 0; r < Math.min(params.data.length, rows); r++) {
           var rowData = params.data[r];
@@ -784,7 +810,8 @@ var WpsBridge = (function () {
       var doc = getActiveDoc();
       if (!doc) return fail('没有打开的文档');
       if (!params || !params.text) return invalidParam('缺少 text');
-      doc.Comments.Add(Application.Selection.Range, params.text);
+      var app = getApplication();
+      doc.Comments.Add(app.Selection.Range, params.text);
       return ok({});
     } catch (e) {
       return fail('添加批注失败: ' + (e && e.message ? e.message : e));
@@ -797,7 +824,8 @@ var WpsBridge = (function () {
       var doc = getActiveDoc();
       if (!doc) return fail('没有打开的文档');
       if (!params || !params.name) return invalidParam('缺少 name');
-      doc.Bookmarks.Add(params.name, Application.Selection.Range);
+      var app = getApplication();
+      doc.Bookmarks.Add(params.name, app.Selection.Range);
       return ok({});
     } catch (e) {
       return fail('插入书签失败: ' + (e && e.message ? e.message : e));
@@ -857,7 +885,8 @@ var WpsBridge = (function () {
       var breakType = (params && params.breakType) || 'nextPage';
       var typeMap = { nextPage: 2, continuous: 3, evenPage: 4, oddPage: 5 };
       var type = typeMap[breakType] || 2;
-      Application.Selection.InsertBreak(type);
+      var app = getApplication();
+      app.Selection.InsertBreak(type);
       return ok({});
     } catch (e) {
       return fail('插入分节符失败: ' + (e && e.message ? e.message : e));
@@ -892,7 +921,8 @@ var WpsBridge = (function () {
 
   function getOpenDocuments() {
     try {
-      var docs = Application.Documents;
+      var app = getApplication();
+      var docs = app.Documents;
       var list = [];
       for (var i = 1; i <= docs.Count; i++) {
         var d = docs.Item(i);
@@ -906,7 +936,8 @@ var WpsBridge = (function () {
 
   function switchDocument(params) {
     try {
-      var docs = Application.Documents;
+      var app = getApplication();
+      var docs = app.Documents;
       var target = params && (params.name || params.index);
       var doc = null;
       if (typeof target === 'number') {
@@ -928,7 +959,8 @@ var WpsBridge = (function () {
     try {
       var filePath = params && (params.path || params.filePath);
       if (!filePath) return invalidParam('缺少 path');
-      var doc = Application.Documents.Open(filePath);
+      var app = getApplication();
+      var doc = app.Documents.Open(filePath);
       return ok({ name: doc.Name, path: doc.FullName });
     } catch (e) {
       return fail('打开文档失败: ' + (e && e.message ? e.message : e));
@@ -937,7 +969,8 @@ var WpsBridge = (function () {
 
   function createDocument() {
     try {
-      var doc = Application.Documents.Add();
+      var app = getApplication();
+      var doc = app.Documents.Add();
       return ok({ name: doc.Name });
     } catch (e) {
       return fail('创建文档失败: ' + (e && e.message ? e.message : e));
@@ -984,9 +1017,10 @@ var WpsBridge = (function () {
       else appType = getAppType();
 
       var docs = null;
-      if (appType === 'et') docs = Application.Workbooks;
-      else if (appType === 'wps') docs = Application.Documents;
-      else if (appType === 'wpp') docs = Application.Presentations;
+      var app = getApplication();
+      if (appType === 'et') docs = app.Workbooks;
+      else if (appType === 'wps') docs = app.Documents;
+      else if (appType === 'wpp') docs = app.Presentations;
       if (!docs) return fail('当前应用不支持打开文件: ' + appType);
       docs.Open(filePath);
       return ok({ path: filePath });
@@ -1001,14 +1035,15 @@ var WpsBridge = (function () {
 
   function getActiveWorkbook() {
     try {
-      var wb = Application.ActiveWorkbook;
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
       if (!wb) return fail('没有打开的工作簿');
       var sheets = [];
       for (var i = 1; i <= wb.Sheets.Count; i++) {
         sheets.push({ name: wb.Sheets.Item(i).Name, index: i });
       }
       var activeSheet = '';
-      try { activeSheet = Application.ActiveSheet ? Application.ActiveSheet.Name : ''; } catch (e) {}
+      try { activeSheet = app.ActiveSheet ? app.ActiveSheet.Name : ''; } catch (e) {}
       return ok({
         name: wb.Name,
         path: wb.FullName,
@@ -1024,7 +1059,8 @@ var WpsBridge = (function () {
 
   function getCellValue(params) {
     try {
-      var wb = Application.ActiveWorkbook;
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
       if (!wb) return fail('没有打开的工作簿');
       var sheet = getExcelSheet(wb, params && params.sheet);
       if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
@@ -1041,7 +1077,8 @@ var WpsBridge = (function () {
 
   function setCellValue(params) {
     try {
-      var wb = Application.ActiveWorkbook;
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
       if (!wb) return fail('没有打开的工作簿');
       var sheet = getExcelSheet(wb, params && params.sheet);
       if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
@@ -1060,7 +1097,8 @@ var WpsBridge = (function () {
 
   function getActivePresentation() {
     try {
-      var pres = Application.ActivePresentation;
+      var app = getApplication();
+      var pres = app.ActivePresentation;
       if (!pres) return fail('没有打开的演示文稿');
       return ok({ name: pres.Name, path: pres.FullName, slideCount: pres.Slides.Count, slides: [] });
     } catch (e) {
@@ -1104,7 +1142,8 @@ var WpsBridge = (function () {
         }
       }
       // 解析属性链
-      var obj = window.Application;
+      var obj = getApplication();
+      if (!obj) return fail('属性解析失败: Application 不可用');
       var parts = method.split('.').slice(1); // 去掉开头的 'Application'
       for (var pi = 0; pi < parts.length; pi++) {
         if (obj === null || obj === undefined) return fail('属性解析失败: ' + parts.slice(0, pi).join('.') + ' 为 null');

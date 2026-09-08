@@ -492,7 +492,7 @@ var ChatUi = (function () {
   /**
    * P1：设置头部 WPS 桥二级状态
    * @param {string} state - 'connected' | 'pending'
-   * @param {string} label - 如 "WPS 已连接" / "WPS 未激活"
+   * @param {string} label - 如 "WPS 已连接" / "WPS 待命"
    */
   function setWpsState(state, label) {
     if (!els.wpsLabel) return;

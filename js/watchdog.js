@@ -75,6 +75,8 @@
     S.lastPromptReqId = null;
     S.waitingResponse = false;
     S.gotFirstChunk = false;
+    // P8：在途期间被延迟的文档切换在响应结束后执行
+    try { if (typeof flushDeferredDocSwitch === 'function') flushDeferredDocSwitch(); } catch (e) {}
     clearPromptTimers();
     var cards = S.pendingToolCards.slice();
     S.pendingToolCards = [];

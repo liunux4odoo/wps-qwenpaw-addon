@@ -12,7 +12,7 @@
             <div id="statusArea">
                 <span id="statusDot" class="status-dot connecting" title="连接状态"></span>
                 <span id="connLabel" class="conn-label">连接中</span>
-                <span id="wpsLabel" class="wps-label pending" title="WPS 桥状态">WPS 未激活</span>
+                <span id="wpsLabel" class="wps-label pending" title="WPS 桥状态">WPS 待命</span>
             </div>
         </header>
 
@@ -52,7 +52,11 @@
 
         <div id="inputArea" class="input-area">
             <textarea id="input" rows="3" placeholder="输入指令，如：把第三段润色一下…（/help 查看指令）"></textarea>
-            <button id="attachBtn" class="attach-btn" title="添加附件（文本文件，图片暂不支持）">📎</button>
+            <button id="attachBtn" class="attach-btn" title="添加附件（文本文件，图片暂不支持）">
+                <svg class="attach-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
             <input type="file" id="attachFile" multiple style="display:none">
             <button id="stopBtn" class="stop-btn" style="display:none">停止</button>
             <button id="sendBtn" class="send-btn">发送</button>
