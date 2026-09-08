@@ -49,6 +49,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 from collections import deque
 from urllib.parse import unquote
@@ -83,6 +84,9 @@ POLL_PORT_END = 59999
 # 端口释放后到可复用前的宽限期：残留 wps-mcp 进程可能仍占端口，立即复用会 EADDRINUSE。
 # 正常 session/close 链路 qwenpaw 2s 内清进程；异常残留需时间自然释放，取 60s 防碰撞。
 POLL_PORT_REUSE_GRACE = 60.0
+# 残留进程占用端口的阻塞冷却期：OS 实测仍被占用后阻塞复用，冷却期满重新实测，
+# 残留进程死亡后可回收复用（防止"释放过/重启过"的端口被无限期废弃，同时绝不复用仍被占的端口）。
+POLL_PORT_OS_REPROBE = 60.0
 # 并发分配上限：远超真实多窗口规模（几十个以内），防止任意 clientId 把整段端口耗尽。
 POLL_PORT_POOL_CAP = 64
 # 端口租期：client 超过该时长无任何 ACP 流量则视为失联，分配时回收其端口（防泄漏）。
@@ -185,6 +189,7 @@ class AcpBridge:
         self._port_last_seen: dict[str, float] = {}   # client_id -> 最近活动时间（租期）
         self._session_port: dict[str, int] = {}       # session_id -> port
         self._port_released_at: dict[int, float] = {} # port -> 释放时间戳（宽限期防碰撞）
+        self._port_os_blocked: dict[int, float] = {}  # port -> 上次 OS 实测仍被占用时间（阻塞复用，冷却后重试）
         self._next_port = POLL_PORT_START
         # 子进程
         self.proc: asyncio.subprocess.Process | None = None
@@ -266,10 +271,30 @@ class AcpBridge:
         if client_id:
             self._port_last_seen[client_id] = time.time()
 
+    def _is_port_os_free(self, port: int) -> bool:
+        """OS 级探测：候选 poll 端口是否真的空闲可绑。
+
+        背景：bridge 端口簿记（_port_used/_port_released_at）与 OS 现实可能偏离——
+        残留 wps-mcp 进程（会话异常关闭/父进程退出未被清理的孤儿，见 ARCHITECTURE §13.5）
+        会无限期占着已"释放"的端口；60s 宽限期只覆盖正常清理场景，无法覆盖孤儿长驻。
+        分配前实测可绑，杜绝把仍被残留进程占用的端口再次发出去（新实例 EADDRINUSE
+        -> wps-mcp 报"poll port 已被残留的 WPS 轮询服务占用"）。
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((self.host, port))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
     def _grant_port(self, client_id: str, port: int) -> int:
         self._port_allocated[client_id] = port
         self._port_used.add(port)
         self._port_released_at.pop(port, None)
+        self._port_os_blocked.pop(port, None)
         self._touch_client(client_id)
         log.info("poll port %d allocated -> client %s", port, client_id)
         return port
@@ -282,7 +307,12 @@ class AcpBridge:
                 self._release_port(cid)
 
     def _allocate_port(self, client_id: str) -> int | None:
-        """为 client 分配唯一 poll 端口（幂等：已分配则返回原端口）。"""
+        """为 client 分配唯一 poll 端口（幂等：已分配则返回原端口）。
+
+        除簿记占用/宽限期外还做 OS 级实测：残留 wps-mcp 进程仍占着已释放（或 bridge
+        重启后遗忘）的端口时，该端口被阻塞复用（冷却期满重新实测，孤儿死亡后回收），
+        保证 bridge 只发出"OS 上确实可绑"的端口，守"残留进程只占资源不再影响功能"。
+        """
         if client_id in self._port_allocated:
             return self._port_allocated[client_id]
         # 池上限防护（先回收失联租期，再判满）
@@ -292,7 +322,7 @@ class AcpBridge:
                 log.error("poll port pool exhausted (cap %d)", POLL_PORT_POOL_CAP)
                 return None
         now = time.time()
-        # pass 1：从游标起找「未占用且不在宽限期」的端口
+        # pass 1：从游标起找「未占用、不在宽限期、且 OS 实测空闲」的端口
         for _ in range(POLL_PORT_END - POLL_PORT_START + 1):
             port = self._next_port
             self._next_port += 1
@@ -303,12 +333,23 @@ class AcpBridge:
             released = self._port_released_at.get(port)
             if released is not None and (now - released) < POLL_PORT_REUSE_GRACE:
                 continue
+            blocked_at = self._port_os_blocked.get(port)
+            if blocked_at is not None and (now - blocked_at) < POLL_PORT_OS_REPROBE:
+                continue  # 冷却期内：刚实测仍被残留进程占用，直接跳过，不重复探测
+            if not self._is_port_os_free(port):
+                # 残留进程仍占端口：阻塞复用（冷却期满后重新实测，孤儿死亡后可回收）
+                self._port_os_blocked[port] = now
+                log.warning("poll port %d 仍被残留进程占用，阻塞复用", port)
+                continue
+            self._port_os_blocked.pop(port, None)
             return self._grant_port(client_id, port)
-        # pass 2：整段都被宽限期占住 -> 复用最旧的释放端口（残留风险最低的兜底）
+        # pass 2：整段都被占住 -> 复用最旧的释放端口（残留风险最低的兜底，仍需 OS 实测）
         if self._port_released_at:
             port = min(self._port_released_at, key=self._port_released_at.get)
-            if port not in self._port_used:
+            if port not in self._port_used and self._is_port_os_free(port):
+                self._port_os_blocked.pop(port, None)
                 return self._grant_port(client_id, port)
+            self._port_os_blocked[port] = now
         log.error("no free poll port in %d-%d", POLL_PORT_START, POLL_PORT_END)
         return None
 
