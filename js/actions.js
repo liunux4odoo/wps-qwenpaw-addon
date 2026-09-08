@@ -64,7 +64,7 @@
   // ── P21：发送按钮可用性统一判定 ──
   // 可对话条件 = ACP 已连接 + 会话已建立（acpSessionId 非空）+ 无进行中请求。
   // 条件不满足时禁用发送按钮并给出占位提示；随状态变化自动启用（bridge 就绪/会话建立成功）。
-  // 注意：等待回复期间按钮禁用但"停止"仍可用（setBusy 独立控制 stopBtn，见 P5）。
+  // 注意：等待回复期间按钮禁用但"停止"仍可用（P5：发送/停止合并按钮，setBusy 切换并保持可点）。
   function updateSendAvailability() {
     var ready = (S.acpState === 'connected') && (S.acpSessionId !== null) && !S.waitingResponse;
     ChatUi.setInputEnabled(ready);

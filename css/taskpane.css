@@ -410,9 +410,10 @@ html, body {
     white-space: nowrap;
 }
 
-/* 输入区 */
+/* 输入区：输入框独占一行（满宽），按钮在下方工具行，尽量给输入框腾空间 */
 .input-area {
     display: flex;
+    flex-direction: column;
     gap: 8px;
     padding: 10px 12px;
     border-top: 1px solid #e0e0e0;
@@ -421,7 +422,7 @@ html, body {
 }
 
 #input {
-    flex: 1;
+    width: 100%;
     resize: none;
     border: 1px solid #ccc;
     border-radius: 6px;
@@ -435,11 +436,21 @@ html, body {
     border-color: #2b579a;
 }
 
+/* 输入框下方的按钮行：附件在左，发送/停止在右 */
+.input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.input-row-spacer {
+    flex: 1;
+}
+
 /* P6：附件按钮 */
 /* 图标用内联 SVG（不用 emoji 📎）：WPS CEF 无彩色 emoji 字体，补充平面 emoji 渲染为空白 */
 .attach-btn {
-    align-self: flex-end;
-    padding: 8px 10px;
+    padding: 6px 10px;
     border: 1px solid #ccc;
     border-radius: 6px;
     background: #fff;
@@ -458,9 +469,9 @@ html, body {
     color: #2b579a;
 }
 
+/* P5：发送/停止合并按钮 */
 .send-btn {
-    align-self: flex-end;
-    padding: 8px 16px;
+    padding: 6px 16px;
     border: none;
     border-radius: 6px;
     background: #2b579a;
@@ -474,19 +485,14 @@ html, body {
     cursor: not-allowed;
 }
 
-/* P5：停止按钮 */
-.stop-btn {
-    align-self: flex-end;
-    padding: 8px 16px;
-    border: 1px solid #c0392b;
-    border-radius: 6px;
+/* AI 响应期间：同一按钮切换为"停止"（红色描边样式） */
+.send-btn.busy {
     background: #fff;
     color: #c0392b;
-    font-size: 13px;
-    cursor: pointer;
+    border: 1px solid #c0392b;
 }
 
-.stop-btn:hover {
+.send-btn.busy:hover {
     background: #fdecea;
 }
 

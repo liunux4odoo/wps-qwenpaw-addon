@@ -8,7 +8,7 @@
  *   - P1：头部状态区（ACP 连接 + WPS 桥两级状态，合并右上角）
  *   - P2：可操作错误卡片（重试 / 重建会话按钮）
  *   - P4：显示过程开关（localStorage 持久化）、工具卡片、打字指示器 + 阶段切换
- *   - P5：停止按钮（AI 响应期间显示）
+ *   - P5：发送/停止合并按钮（AI 响应期间自动切换为"停止"）
  */
 var ChatUi = (function () {
   'use strict';
@@ -20,6 +20,8 @@ var ChatUi = (function () {
   var onRebuild = null;
   var onClearCommand = null;
   var showProcess = true;
+  var busy = false;
+  var inputEnabled = true;
   var md = (typeof MarkdownRenderer !== 'undefined') ? MarkdownRenderer : null;
 
   /**
@@ -30,7 +32,6 @@ var ChatUi = (function () {
     els.messages = document.getElementById('messages');
     els.input = document.getElementById('input');
     els.sendBtn = document.getElementById('sendBtn');
-    els.stopBtn = document.getElementById('stopBtn');
     els.statusDot = document.getElementById('statusDot');
     els.connLabel = document.getElementById('connLabel');
     els.wpsLabel = document.getElementById('wpsLabel');
@@ -78,10 +79,17 @@ var ChatUi = (function () {
     }
 
     if (els.sendBtn) {
-      els.sendBtn.addEventListener('click', handleSend);
-    }
-    if (els.stopBtn) {
-      els.stopBtn.addEventListener('click', handleStop);
+      // P5：发送/停止合并——AI 响应期间（busy）同一按钮切换为"停止"
+      els.sendBtn.addEventListener('click', function (e) {
+        if (busy) {
+          // 防双击误停：发送后按钮立即变"停止"（可点），双击序列的第二击会被浏览器判为
+          // 同一次双击（detail>1），若放行会在发送瞬间误中止刚发出的请求。
+          if (e.detail > 1) return;
+          handleStop();
+        } else {
+          handleSend();
+        }
+      });
     }
     if (els.input) {
       els.input.addEventListener('keydown', function (e) {
@@ -505,8 +513,10 @@ var ChatUi = (function () {
    * @param {boolean} enabled
    */
   function setInputEnabled(enabled) {
-    if (els.input) els.input.disabled = !enabled;
-    if (els.sendBtn) els.sendBtn.disabled = !enabled;
+    inputEnabled = !!enabled;
+    if (els.input) els.input.disabled = !inputEnabled;
+    // busy（AI 响应中）时按钮切换为"停止"，必须保持可点
+    if (els.sendBtn && !busy) els.sendBtn.disabled = !inputEnabled;
   }
 
   /**
@@ -518,11 +528,17 @@ var ChatUi = (function () {
   }
 
   /**
-   * P5：AI 响应期间显示"停止"按钮
-   * @param {boolean} busy
+   * P5：AI 响应期间同一按钮自动切换为"停止"（再点 = 中止）
+   * @param {boolean} b
    */
-  function setBusy(busy) {
-    if (els.stopBtn) els.stopBtn.style.display = busy ? 'inline-block' : 'none';
+  function setBusy(b) {
+    busy = !!b;
+    if (!els.sendBtn) return;
+    els.sendBtn.classList.toggle('busy', busy);
+    els.sendBtn.textContent = busy ? '停止' : '发送';
+    els.sendBtn.title = busy ? '停止当前 AI 响应' : '发送消息';
+    // busy 时必须可点（停止）；非 busy 时按发送可用性恢复
+    els.sendBtn.disabled = busy ? false : !inputEnabled;
   }
 
   // ── Phase 3：ACP server 设置面板（plan-2026-09-05 §7）──
