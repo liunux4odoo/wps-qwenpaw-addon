@@ -412,4 +412,5 @@
 - 本方案落地后：ARCHITECTURE.md §0 变更历史加 v0.22 条目（阶段 3 方案补 P14 清除对话历史 / P15 历史对话加载）
 - P16（session 环境注入，2026-09-04 登记，FE-only）不涉及架构层变更；若 preamble 行为规则实测无效需机制升级，先回 discuss agent
 - P17-P21（2026-09-05 登记，用户第二轮实机反馈）：P17（修订模式/回滚）跨层且触及 zero-fork 边界，V8 未决前**不委派开发**；P18/P19/P20/P21 均为 FE-only（P20 需先读 wps-poll-client 确认 V9），不涉及架构层变更
+- P22（自定义提示词模板按钮，2026-09-08 新增）：纯前段方案见 `docs/DEV-PLAN-PromptTemplates.md`，归入 Phase 3打磨，零跨层依赖；待用户拍板默认模板/按钮风格 → 进入 code agent 开发
 - 项目状态：`memory/projects/grga.md` 为 grga 项目记忆；本项目的决策链沉淀在 ARCHITECTURE.md §13；A-G 方向的原始讨论见 `memory/2026-09-03/wps-qwenpaw-addon-dev.md`

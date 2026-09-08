@@ -19,7 +19,7 @@ const path = require('path');
 const JS_DIR = path.join(__dirname, '..', 'js');
 // 控制器模块（叶子模块已桩化，不加载真实文件）；顺序与 manifest.xml <scripts> 一致
 const MODULE_ORDER = [
-  'app-state.js', 'doc-state.js', 'bridge-config.js', 'session.js', 'agents.js',
+  'app-state.js', 'doc-state.js', 'prompts.js', 'bridge-config.js', 'session.js', 'agents.js',
   'acp-events.js', 'watchdog.js', 'actions.js', 'poll.js', 'ribbon.js', 'main.js'
 ];
 const WATCHDOG_MS = 25000;

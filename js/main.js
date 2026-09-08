@@ -52,6 +52,7 @@
     bindClearButton();
     bindAttachButton(); // P6：附件上传
     bindSettingsUI();   // Phase 3：设置按钮 + server/model/effort 下拉绑定
+    QP.prompts.init();  // P22：提示词模板条 + 设置面板内管理 UI
     tryAutoExpand();    // P7：自动展开侧边栏（尽力而为）
     // P1：初始状态（启动握手：ACP 连接中 + WPS 未激活）
     updateStatus();

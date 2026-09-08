@@ -48,7 +48,21 @@
                 <select id="effortSelect" class="config-select" title="会话级思考强度"></select>
             </div>
             <div id="capabilityNotes" class="capability-notes"></div>
+
+            <!-- P22：提示词模板管理（设置面板内，纯前端 localStorage） -->
+            <div class="settings-row settings-title-row"><span class="settings-title">提示词模板</span></div>
+            <div id="promptList" class="prompt-list"></div>
+            <div class="settings-row prompt-add-row">
+                <input type="text" id="promptName" class="prompt-name-input" placeholder="模板名" title="模板名（必填）">
+                <button id="promptAddBtn" class="prompt-add-btn" title="添加到模板列表">添加</button>
+            </div>
+            <div class="prompt-text-row">
+                <textarea id="promptText" class="prompt-text-input" rows="2" placeholder="模板内容（必填），支持 {{date}} / {{filename}} / {{fullpath}} / {{selection}}"></textarea>
+            </div>
         </div>
+
+        <!-- P22：提示词模板条（点击填入输入框，不自动发送） -->
+        <div id="promptStrip" class="prompt-strip"></div>
 
         <div id="inputArea" class="input-area">
             <textarea id="input" rows="3" placeholder="输入指令，如：把第三段润色一下…（/help 查看指令）"></textarea>
@@ -70,6 +84,7 @@
     <script src="js/wps-poll-client.js"></script>
     <script src="js/app-state.js"></script>
     <script src="js/doc-state.js"></script>
+    <script src="js/prompts.js"></script>
     <script src="js/bridge-config.js"></script>
     <script src="js/session.js"></script>
     <script src="js/agents.js"></script>
