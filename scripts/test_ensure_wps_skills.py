@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ensure-wps-skills.py 单元测试 — 覆盖 docs/plan-2026-09-07 §5 边界表 10 个场景。
+"""ensure-wps-skills.py 单元测试 — 覆盖 docs/plan-2026-09-07 §5 边界表 12 个场景
+（原 10 + v2 新增 #11 缺块升级重装 / #12 源已含块幂等）。
 
 用法：
   conda run -n py312 python scripts/test_ensure_wps_skills.py
@@ -7,6 +8,13 @@
 做法：用临时目录 + 一个模拟 qwenpaw CLI 的脚本（fake-qwenpaw）做端到端断言，
 不触碰真实 QwenPaw 数据（不污染任何真实 agent 工作区）。每个测试用例独立 tmp 目录，
 互不泄漏。
+
+v2（2026-09-07 降级要求）额外覆盖：
+- 首次安装后每份 SKILL.md 末尾含「环境检查与降级要求」块，且只有一份；
+- transform 幂等：源已含块不重复追加（#12）；
+- 已安装但缺降级块 → 重新复制（#11），其余 skill 不动；
+- 含降级块但内容不一致 → 报告差异不覆盖（#10，transform 后基准）；
+- 源目录不被修改。
 
 fake-qwenpaw 行为与真实 qwenpaw 对齐（2026-09-07 实机核实）：
 - `agents list`：读 data_root/agents.json，输出 JSON {"agents": [{id, workspace_dir, ...}]}
@@ -27,6 +35,23 @@ import tempfile
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(SCRIPTS_DIR, "ensure-wps-skills.py")
 FAKE_QWENPAW = os.path.join(SCRIPTS_DIR, "_fake_qwenpaw.py")
+
+DEGRADATION_MARKER = "## ⚠️ 环境检查与降级要求"
+DEGRADATION_BLOCK = (
+    "## ⚠️ 环境检查与降级要求\n"
+    "\n"
+    "本 skill 依赖 wps-mcp 提供的 `wps_*` 工具。这些工具只在「WPS 侧边栏插件入口」\n"
+    "的会话中存在（该入口经 ACP 注入 wps-mcp）。\n"
+    "\n"
+    "**执行任何 WPS 操作前，先检查当前会话工具列表中是否有 `wps_` 前缀的工具。**\n"
+    "\n"
+    "- 有 → 正常执行本 skill 描述的操作。\n"
+    "- 没有（例如在 QwenPaw 网页控制台等其它入口对话时）→\n"
+    "  1. 不要尝试调用不存在的 wps 工具；\n"
+    "  2. 不要编造或猜测操作结果；\n"
+    "  3. 不要承诺「帮你打开 WPS」这类无法兑现的动作；\n"
+    "  4. 明确告知用户：当前入口未挂载 WPS 能力，请在 WPS 侧边栏插件入口操作。\n"
+)
 
 EXPECTED_SKILLS = ["wps-excel", "wps-office", "wps-ppt", "wps-proofread", "wps-word"]
 WITH_README = {"wps-office", "wps-word", "wps-excel", "wps-ppt"}  # wps-proofread 无 README
@@ -147,6 +172,12 @@ def test_first_run():
     for name in WITH_README:
         check("{} README.md 已复制".format(name),
               os.path.isfile(os.path.join(ws, "skills", name, "README.md")))
+    for name in EXPECTED_SKILLS:
+        with open(os.path.join(ws, "skills", name, "SKILL.md")) as f:
+            content = f.read()
+        check("{} 含降级块".format(name), DEGRADATION_MARKER in content)
+        check("{} 降级块只有一份".format(name), content.count(DEGRADATION_MARKER) == 1,
+              "count={}".format(content.count(DEGRADATION_MARKER)))
     sj = read_skill_json(tmp, "test-agent")
     check("skill.json 存在", sj is not None)
     if sj:
@@ -174,15 +205,22 @@ def test_all_installed_enabled():
 
 
 def test_installed_disabled():
-    print("## 边界5：已存在但 disabled → 只补 enable 不重新复制")
+    print("## 边界5：已装好（含降级块）但 disabled → 只补 enable 不重新复制")
     tmp = new_tmp()
     src_root, ws = setup(tmp)
-    make_skill_dir(os.path.join(ws, "skills"), "wps-office")
+    run_script(tmp, "test-agent")
+    skill_md = os.path.join(ws, "skills", "wps-office", "SKILL.md")
+    before = open(skill_md).read()
+    sj = read_skill_json(tmp, "test-agent")
+    sj["skills"]["wps-office"]["enabled"] = False
+    with open(os.path.join(tmp, "qdata", "workspaces", "test-agent", "skill.json"), "w") as f:
+        json.dump(sj, f)
     rc, out, err = run_script(tmp, "test-agent")
     check("退出码 0", rc == 0, "rc={} err={}".format(rc, err.strip()))
     sj = read_skill_json(tmp, "test-agent")
     check("wps-office enabled=true", sj["skills"]["wps-office"]["enabled"] is True)
     check("输出 repaired", "repaired" in out, out.strip())
+    check("未重新复制", open(skill_md).read() == before)
 
 
 def test_partial_missing():
@@ -259,20 +297,135 @@ def test_idempotent():
 
 
 def test_content_diff_no_overwrite():
-    print("## 边界10：同名但内容不同 → 报告差异但不覆盖")
+    print("## 边界10：含降级块但内容不一致 → 报告差异但不覆盖（transform 后基准）")
     tmp = new_tmp()
     src_root, ws = setup(tmp)
     run_script(tmp, "test-agent")
     target = os.path.join(ws, "skills", "wps-word", "SKILL.md")
+    with open(target) as f:
+        content = f.read()
+    tampered = content.replace("# wps-word", "# tampered")
+    check("夹具：保留降级块", DEGRADATION_MARKER in tampered)
     with open(target, "w") as f:
-        f.write("# tampered\n")
+        f.write(tampered)
     rc, out, _ = run_script(tmp, "test-agent")
     check("退出码 0", rc == 0, "rc={}".format(rc))
     check("报告差异", "内容不一致" in out, out.strip())
     with open(target) as f:
-        check("未覆盖", f.read() == "# tampered\n")
+        check("未覆盖", f.read() == tampered)
     check("skill 仍 enabled",
           read_skill_json(tmp, "test-agent")["skills"]["wps-word"]["enabled"] is True)
+
+
+def test_source_untouched():
+    print("## 附加：源目录未被修改（无降级块、内容原样）")
+    tmp = new_tmp()
+    src_root, ws = setup(tmp)
+    run_script(tmp, "test-agent")
+    for name in EXPECTED_SKILLS:
+        with open(os.path.join(src_root, name, "SKILL.md")) as f:
+            content = f.read()
+        check("源 {} 未被追加降级块".format(name), DEGRADATION_MARKER not in content)
+
+
+def test_missing_block_upgrade():
+    print("## 边界11：已安装但缺降级块 → 重新复制（带 transform），其余不动")
+    tmp = new_tmp()
+    src_root, ws = setup(tmp)
+    run_script(tmp, "test-agent")
+    src_md = os.path.join(src_root, "wps-office", "SKILL.md")
+    dst_md = os.path.join(ws, "skills", "wps-office", "SKILL.md")
+    with open(src_md) as f:
+        raw = f.read()
+    check("夹具：源内容无降级块", DEGRADATION_MARKER not in raw)
+    with open(dst_md, "w") as f:
+        f.write(raw)
+    before = {
+        n: open(os.path.join(ws, "skills", n, "SKILL.md")).read()
+        for n in EXPECTED_SKILLS if n != "wps-office"
+    }
+    rc, out, err = run_script(tmp, "test-agent")
+    check("退出码 0", rc == 0, "rc={} err={}".format(rc, err.strip()))
+    with open(dst_md) as f:
+        content = f.read()
+    check("已补降级块", DEGRADATION_MARKER in content)
+    check("降级块只有一份", content.count(DEGRADATION_MARKER) == 1,
+          "count={}".format(content.count(DEGRADATION_MARKER)))
+    check("其余内容仍为源原样", content.startswith(raw.rstrip("\n")))
+    after = {
+        n: open(os.path.join(ws, "skills", n, "SKILL.md")).read()
+        for n in EXPECTED_SKILLS if n != "wps-office"
+    }
+    check("其余 4 个 skill 未改动", before == after)
+    sj = read_skill_json(tmp, "test-agent")
+    check("全部仍 enabled",
+          all(sj["skills"][n]["enabled"] is True for n in EXPECTED_SKILLS))
+
+
+def test_source_has_block():
+    print("## 边界12：源已自带降级块 → transform 幂等，不重复追加")
+    tmp = new_tmp()
+    src_root = os.path.join(tmp, "src-skills")
+    os.makedirs(src_root, exist_ok=True)
+    for name in EXPECTED_SKILLS:
+        make_skill_dir(src_root, name)
+    with open(os.path.join(src_root, "wps-office", "SKILL.md"), "a") as f:
+        f.write("\n\n" + DEGRADATION_BLOCK)
+    ws = install_agent(tmp)
+    rc, out, err = run_script(tmp, "test-agent")
+    check("退出码 0", rc == 0, "rc={} err={}".format(rc, err.strip()))
+    for name in EXPECTED_SKILLS:
+        with open(os.path.join(ws, "skills", name, "SKILL.md")) as f:
+            content = f.read()
+        check("{} 降级块恰好一份".format(name), content.count(DEGRADATION_MARKER) == 1,
+              "count={}".format(content.count(DEGRADATION_MARKER)))
+    rc2, out2, _ = run_script(tmp, "test-agent")
+    check("再次运行退出码 0", rc2 == 0, "rc={}".format(rc2))
+    with open(os.path.join(ws, "skills", "wps-office", "SKILL.md")) as f:
+        content = f.read()
+    check("二次运行不重复追加", content.count(DEGRADATION_MARKER) == 1,
+          "count={}".format(content.count(DEGRADATION_MARKER)))
+
+
+def test_heading_only_not_installed():
+    print("## 附加：目标只含标题孤行（无正文）→ 视为未装好，重新复制补全")
+    tmp = new_tmp()
+    src_root, ws = setup(tmp)
+    run_script(tmp, "test-agent")
+    src_md = os.path.join(src_root, "wps-ppt", "SKILL.md")
+    dst_md = os.path.join(ws, "skills", "wps-ppt", "SKILL.md")
+    with open(src_md) as f:
+        raw = f.read()
+    with open(dst_md, "w") as f:
+        f.write(raw.rstrip("\n") + "\n\n" + DEGRADATION_MARKER + "\n")
+    rc, out, err = run_script(tmp, "test-agent")
+    check("退出码 0", rc == 0, "rc={} err={}".format(rc, err.strip()))
+    with open(dst_md) as f:
+        content = f.read()
+    check("已补全完整降级块",
+          content.rstrip("\n").endswith(DEGRADATION_BLOCK.rstrip("\n")))
+    check("降级块恰好一份", content.count(DEGRADATION_MARKER) == 1,
+          "count={}".format(content.count(DEGRADATION_MARKER)))
+
+
+def test_dry_run_recopy_enabled():
+    print("## 附加：dry-run 对已启用但缺块的 skill 报 re-copy（不虚报 enable）")
+    tmp = new_tmp()
+    src_root, ws = setup(tmp)
+    run_script(tmp, "test-agent")
+    src_md = os.path.join(src_root, "wps-office", "SKILL.md")
+    dst_md = os.path.join(ws, "skills", "wps-office", "SKILL.md")
+    with open(src_md) as f:
+        raw = f.read()
+    with open(dst_md, "w") as f:
+        f.write(raw)
+    rc, out, _ = run_script(tmp, "test-agent", ["--dry-run"])
+    check("退出码 0", rc == 0, "rc={}".format(rc))
+    check("dry-run 报 would re-copy 而非 re-copy+enable",
+          "would re-copy (dry-run)" in out, out.strip())
+    check("未虚报 enable", "would re-copy+enable" not in out, out.strip())
+    rc2, _, _ = run_script(tmp, "test-agent")
+    check("随后实跑退出码 0", rc2 == 0, "rc={}".format(rc2))
 
 
 def test_dry_run():
@@ -330,6 +483,11 @@ def main():
         test_enable_failure,
         test_idempotent,
         test_content_diff_no_overwrite,
+        test_source_untouched,
+        test_missing_block_upgrade,
+        test_source_has_block,
+        test_heading_only_not_installed,
+        test_dry_run_recopy_enabled,
         test_dry_run,
         test_unexpected_info_failure,
         test_json_output,

@@ -12,8 +12,12 @@ enable` 启用（**不手动改 skill.json**）。
   skill 存在/启用状态由 `qwenpaw skills info` 判定，启用只调 `qwenpaw skills
   enable`。不手动解析 QWENPAW_WORKING_DIR、不手动改 skill.json。
 - **语义 = ensure**：不满足则补齐，满足则无操作；幂等。
-- **缺失则复制**：SKILL.md 缺失才复制；同名但内容不一致 → 报告差异但不覆盖
-  （已知限制，升级覆盖语义需单独决策）。
+- **缺失则复制**：SKILL.md 缺失才复制；按「源 + 降级块」基准对比，内容不一致 →
+  报告差异但不覆盖（已知限制，升级覆盖语义需单独决策）。
+- **安装期 transform（v2）**：复制 SKILL.md 时统一追加「环境检查与降级要求」块
+  （标准文案见 docs/plan §12）。只写目标目录，源 submodule 保持原样。已安装但
+  缺降级块 → 视为未装好，重新复制（升级，§5 #11）；源或目标已含降级块则跳过
+  追加（transform 幂等，§5 #12）。
 - **不擅自创建 agent**：目标 agent 不存在 → 失败。
 - 单次 qwenpaw 调用超时 60s（QWENPAW_TIMEOUT），防挂死阻塞调用方。
 
@@ -53,6 +57,24 @@ STATUS_REPAIRED = "repaired"  # 本次补齐（复制/启用）后已就位
 STATUS_FAILED = "failed"     # 复制/启用失败，未就位
 STATUS_SKIPPED = "skipped"   # dry-run，本次未执行
 
+# v2 安装期 transform：降级块标准文案（docs/plan §12）。
+DEGRADATION_MARKER = "## ⚠️ 环境检查与降级要求"
+DEGRADATION_BLOCK = (
+    "## ⚠️ 环境检查与降级要求\n"
+    "\n"
+    "本 skill 依赖 wps-mcp 提供的 `wps_*` 工具。这些工具只在「WPS 侧边栏插件入口」\n"
+    "的会话中存在（该入口经 ACP 注入 wps-mcp）。\n"
+    "\n"
+    "**执行任何 WPS 操作前，先检查当前会话工具列表中是否有 `wps_` 前缀的工具。**\n"
+    "\n"
+    "- 有 → 正常执行本 skill 描述的操作。\n"
+    "- 没有（例如在 QwenPaw 网页控制台等其它入口对话时）→\n"
+    "  1. 不要尝试调用不存在的 wps 工具；\n"
+    "  2. 不要编造或猜测操作结果；\n"
+    "  3. 不要承诺「帮你打开 WPS」这类无法兑现的动作；\n"
+    "  4. 明确告知用户：当前入口未挂载 WPS 能力，请在 WPS 侧边栏插件入口操作。\n"
+)
+
 
 class QwenpawError(Exception):
     """qwenpaw CLI 不可用 / 调用失败。"""
@@ -65,7 +87,11 @@ class UsageError(Exception):
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="ensure-wps-skills.py",
-        description="确保 5 个 wps skill 在指定 QwenPaw agent 工作区已安装且启用。",
+        description=(
+            "确保 5 个 wps skill 在指定 QwenPaw agent 工作区已安装且启用。\n"
+            "安装期会向每份 SKILL.md 末尾追加「环境检查与降级要求」块\n"
+            "（源目录保持原样；已含该块则跳过，幂等）。"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "退出码契约（冻结，bridge 依赖）：\n"
@@ -205,20 +231,86 @@ def diff_files(src, dst):
     return not filecmp.cmp(src, dst, shallow=False)
 
 
+def content_has_degradation_block(content):
+    """内容是否已含完整降级块（transform 产物形态：整块位于内容末尾）。
+
+    只查标题子串会把「标题孤行 / 残缺块」误判为已装好（§5 #11 永不触发、
+    §5 #12 跳过追加导致正文缺失）；这里要求内容以完整降级块结尾。
+    """
+    return content.rstrip("\n").endswith(DEGRADATION_BLOCK.rstrip("\n"))
+
+
+def transform_skill_content(content):
+    """安装期 transform（v2）：SKILL.md 末尾统一追加降级块。
+
+    幂等：内容已以完整降级块结尾则原样返回（源或目标重复处理都安全，§5 #12）。
+    """
+    if content_has_degradation_block(content):
+        return content
+    return content.rstrip("\n") + "\n\n" + DEGRADATION_BLOCK
+
+
+def has_degradation_block(md_path):
+    """判断 SKILL.md 是否已含完整降级块（读取文件后走 content_has_degradation_block）。"""
+    try:
+        with open(md_path, encoding="utf-8") as f:
+            return content_has_degradation_block(f.read())
+    except OSError:
+        return False
+
+
+def skill_needs_install(dst_skill_md):
+    """SKILL.md 缺失，或已安装但缺降级块 → 需要（重新）复制（§5 #11）。
+
+    已含完整降级块视为「按 transform 基准已安装」；其余内容不一致不触发重装
+    （已知限制，只报告不覆盖，§5 #10）。
+    """
+    if not os.path.isfile(dst_skill_md):
+        return True
+    return not has_degradation_block(dst_skill_md)
+
+
 def copy_skill_files(skill_dir, dst_dir):
+    """复制 SKILL.md（带 transform 追加降级块）与 README.md（原样）。
+
+    只写目标目录，不改源目录（§3 约束 6）。
+    """
     os.makedirs(dst_dir, exist_ok=True)
     for fn in SKILL_FILES:
         src_file = os.path.join(skill_dir, fn)
-        if os.path.isfile(src_file):
-            shutil.copy2(src_file, os.path.join(dst_dir, fn))
+        if not os.path.isfile(src_file):
+            continue
+        dst_file = os.path.join(dst_dir, fn)
+        if fn == "SKILL.md":
+            with open(src_file, encoding="utf-8") as f:
+                content = f.read()
+            with open(dst_file, "w", encoding="utf-8") as f:
+                f.write(transform_skill_content(content))
+        else:
+            shutil.copy2(src_file, dst_file)
 
 
 def collect_diffs(skill_dir, workspace_dir, skill):
+    """对比目标与「源 + transform」基准，返回不一致的文件名（不覆盖，§5 #10）。
+
+    SKILL.md 的基准 = 源内容 + 降级块（transform 后预期内容）。
+    """
     diffs = []
     for fn in SKILL_FILES:
         src_file = os.path.join(skill_dir, fn)
         dst_file = os.path.join(workspace_dir, "skills", skill, fn)
-        if os.path.isfile(src_file) and diff_files(src_file, dst_file):
+        if not os.path.isfile(src_file):
+            continue
+        if fn == "SKILL.md":
+            with open(src_file, encoding="utf-8") as f:
+                expected = transform_skill_content(f.read())
+            if not os.path.isfile(dst_file):
+                diffs.append(fn)
+            else:
+                with open(dst_file, encoding="utf-8") as f:
+                    if f.read() != expected:
+                        diffs.append(fn)
+        elif diff_files(src_file, dst_file):
             diffs.append(fn)
     return diffs
 
@@ -226,18 +318,28 @@ def collect_diffs(skill_dir, workspace_dir, skill):
 def ensure_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir, dry_run):
     """处理单个 skill，返回 {"status", "action", "message", "diffs"}。
 
-    流程：缺 SKILL.md 先复制 → skills info 判定 → 未启用则 skills enable。
-    dry-run：不落盘，未安装报 would copy+enable，已装只读探测。
+    流程：SKILL.md 缺失或缺降级块先（重新）复制（带 transform）→ skills info
+    判定 → 未启用则 skills enable。dry-run：不落盘，仅报告将执行的动作。
     """
     dst_dir = os.path.join(workspace_dir, "skills", skill)
-    need_copy = not os.path.isfile(os.path.join(dst_dir, "SKILL.md"))
+    dst_skill_md = os.path.join(dst_dir, "SKILL.md")
+    need_install = skill_needs_install(dst_skill_md)
 
     if dry_run:
-        if need_copy:
+        if need_install:
+            if not os.path.isfile(dst_skill_md):
+                kind = "copy+enable"
+            else:
+                # 升级场景（缺降级块）：查询启用态，输出与实际运行一致的动作
+                try:
+                    info = skill_info(cmd, agent_id, skill)
+                    kind = "re-copy" if info["enabled"] else "re-copy+enable"
+                except QwenpawError:
+                    kind = "re-copy+enable"
             return {
                 "status": STATUS_SKIPPED,
-                "action": "copy+enable",
-                "message": "would copy + enable (dry-run)",
+                "action": kind,
+                "message": "would {} (dry-run)".format(kind),
                 "diffs": [],
             }
         info = skill_info(cmd, agent_id, skill)
@@ -264,9 +366,10 @@ def ensure_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir, dry_run):
         }
 
     actions = []
-    if need_copy:
+    if need_install:
+        was_installed = os.path.isfile(dst_skill_md)
         copy_skill_files(skill_dir, dst_dir)
-        actions.append("copy")
+        actions.append("copy" if not was_installed else "re-copy")
 
     info = skill_info(cmd, agent_id, skill)
     if not info["exists"]:
@@ -281,7 +384,7 @@ def ensure_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir, dry_run):
 
     if info["enabled"]:
         return {
-            "status": STATUS_OK,
+            "status": STATUS_REPAIRED if actions else STATUS_OK,
             "action": "+".join(actions) or "none",
             "message": "already enabled",
             "diffs": diffs,
