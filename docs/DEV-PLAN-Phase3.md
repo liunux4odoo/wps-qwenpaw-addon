@@ -1,8 +1,8 @@
 # 阶段 3 开发方案：体验打磨（MVP 验收）
 
-> **文档状态**：v1.5（2026-09-04，discuss agent 编制；v1.5 新增 P16 session 环境上下文注入；v1.4 更新 P2：看门狗阈值实测结论 + thinking 心跳接入）
+> **文档状态**：v1.6（2026-09-14，discuss agent 更新；v1.6 新增 P23 未保存文档 docId 唯一化 + 保存迁移，并**补正 v1.5 后失同步**：P17-P22 已登记但头部版本号未维护，本次一并把适用范围 P 范围修正为 P1-P23）
 > **独立文档**：从 `docs/ARCHITECTURE.md` §8.5 拆分并扩展而来（原 §8.5 仅 4 条清单，本节扩展为完整方案）
-> **适用范围**：加载项前端体验打磨（阶段 3），含打磨项统一清单 P1-P16（用户反馈 9 项 + 前端打磨方向 A-G 直接整合 + 用户补充：清除对话历史/历史对话加载 + discuss 提议并确认：session 环境上下文注入）+ 后续 ACP 多后端计划
+> **适用范围**：加载项前端体验打磨（阶段 3），含打磨项统一清单 P1-P23（用户反馈 9 项 + 前端打磨方向 A-G 直接整合 + 用户补充：清除对话历史/历史对话加载 + discuss 提议并确认：session 环境上下文注入 / 未保存文档 docId 修复）+ 后续 ACP 多后端计划
 > **关联文档**：架构总纲见 `docs/ARCHITECTURE.md`（v0.22）；本文档只写"体验打磨"，架构层决策变更需回 ARCHITECTURE.md / discuss agent
 
 ---
@@ -35,11 +35,11 @@
 
 ---
 
-## 1. 当前问题与打磨项清单（16 项）
+## 1. 当前问题与打磨项清单（23 项）
 
 > 每项含：现象 / 现状核实 / 方案 / 验收。标注跨层依赖。
 >
-> **来源**：P1-P9 为用户反馈 9 项问题；P10-P13 为前端打磨方向 A-G 中**无对应 P 项的独立新项**（A/E/F/G 快捷指令）；P14-P15 为用户补充功能（清除对话历史 / 同一文档加载历史对话）；P16 为 discuss agent 提议 + 用户确认新增（session 环境上下文注入，无 A-G 来源）。A-G 中与 P 项重叠的内容已**直接并入对应 P 项**（不再单列），来源追踪见 §2 映射表。
+> **来源**：P1-P9 为用户反馈 9 项问题；P10-P13 为前端打磨方向 A-G 中**无对应 P 项的独立新项**（A/E/F/G 快捷指令）；P14-P15 为用户补充功能（清除对话历史 / 同一文档加载历史对话）；P16 为 discuss agent 提议 + 用户确认新增（session 环境上下文注入，无 A-G 来源）；P17-P22 为用户第二轮实机反馈 / 后续功能补充（修订模式、think 过滤、清空新建、WPS 连接状态、发送按钮禁用、提示词模板）；P23 为 discuss agent 提议 + 用户确认新增（未保存文档 docId 唯一化 + 保存迁移，P15/P8 修复）。A-G 中与 P 项重叠的内容已**直接并入对应 P 项**（不再单列），来源追踪见 §2 映射表。
 
 ### P1. 启动时 WPS 桥连接错误误报（右上角状态）
 
@@ -305,6 +305,36 @@
 
 ---
 
+### P23. 未保存文档 docId 唯一化 + 保存时迁移到正确 docId（P15/P8 修复，discuss 提议 + 用户确认，2026-09-14）
+
+- **现象**：新建未保存文档（默认名「文字文稿1」），侧边栏对话后**关闭且未保存**；下次再新建一个未保存文档（WPS 重新分配默认名「文字文稿1」），侧边栏**把上次会话记录带了出来**（UI 历史 + AI 记忆都可能恢复）。
+- **根因（已核实，2026-09-14，读源码）**：
+  1. docId = `appType + ':' + path + ':' + name`（`js/doc-state.js` `getDocId()`）；未保存文档 `path=''`、`name=默认名（文字文稿1）` → docId = `wps::文字文稿1`
+  2. localStorage 缓存 key：`qp.history.<docId>` / `qp.session.<docId>`（`js/app-state.js:96-97`）；`schedulePersist()`/`saveDocState()` 对任意 docId（含未保存）无条件落盘
+  3. 关闭未保存文档**不触发清理** → 缓存残留；下次新建同名未保存文档 → docId 相同 → `switchToDoc()` 里 `QP.loadHistory(docId)` 命中旧缓存（UI 串台）
+  4. **AI 侧也串**：`ensureSessionSend()`（`js/session.js:59-60`）用 `QP.loadCachedSessionId(S.currentDocId)` 拿缓存 sessionId → 命中 `qp.session.wps::文字文稿1` → `session/load` 恢复旧 AI 上下文——用户会觉得"AI 记得上一个文档的事"
+  - **本质**：未保存文档**无稳定身份**（path 为空），name 会被 WPS 复用 → docId 对"不同实例的未保存文档"不唯一，被误当成同一文档
+- **方案（FE）**：
+  1. **未保存文档 docId 唯一化**：`getDocId()` 对 `path === ''` 的文档追加 per-taskpane 实例随机 token（如 `wps::unsaved:<token>:文字文稿1`）——同一 taskpane 内多个未保存文档（文字文稿1/2/3）互不碰撞；不同 taskpane/会话实例也不碰撞；**杜绝 localStorage 跨实例串台**
+  2. **未保存文档历史不落 localStorage**（内存 `docStates` 保留，同 taskpane 内切换隔离仍生效）——未保存文档是临时草稿，无跨会话身份，关闭即弃；避免 volatile key 长期堆积
+  3. **保存时迁移到正确 docId（用户要求）**：检测"未保存 → 已保存"转换，把当前会话状态从 volatile docId **迁移**到稳定 docId（`wps:/path/file.docx:文件名`）——**不是文档切换**：不新建 ACP 会话、不丢当前对话（AI 侧 sessionId 保持不变，仅前端缓存 key 迁移）
+  4. 迁移动作（`migrateDocId(oldId, newId)`，复用/扩展 doc-state.js）：`S.currentDocId = newId`；`S.docStates[newId] = S.docStates[oldId]`（delete old）；localStorage 把 `qp.history.<old>` → `qp.history.<new>`、`qp.session.<old>` → `qp.session.<new>`（delete old）；**不触发 ensureSession 新会话**
+  5. **保存检测机制（V10 决定，候选）**：
+     - a. WPS JSAPI 保存事件（`DocumentBeforeSave`/`AfterSave` 类）——最及时，若可用
+     - b. 轮询对象身份：`Application.ActiveDocument` 引用跨轮询是否稳定——若稳定，同一对象 name/path 变化 = 保存/另存为
+     - c. 轮询启发式：active 文档 name+path 变化且旧 docId 为 volatile（path 空→非空）→ 判定保存迁移；需防"切换到另一已保存文档"误判（用 name 连续性 + 无中间其它文档活跃作约束，或直接依赖 b 的对象身份）
+  6. **边界**：另存为（已保存 → 新路径）同样迁移；两个未保存文档同时打开（不同默认名）各自独立；保存后重开 → 稳定 docId 正常恢复历史；未保存关闭 → volatile 缓存清理（或实例级不落盘）
+- **验收（实机端到端为阻塞门）**：
+  1. 新建未保存文档 A → 对话 → 关闭不保存 → 新建未保存文档 B → 侧边栏为**全新会话**（不串台，UI + AI 记忆都不串）
+  2. 未保存文档对话 → 保存（改名）→ **会话不丢、继续可对话**；关闭重开已保存文档 → 历史恢复（稳定 docId 命中）
+  3. 同 taskpane 内切换未保存文档 A/B → 各自会话隔离不串
+  4. 已保存文档 → 另存为新路径 → 会话迁移到新 docId、旧缓存清理
+  5. localStorage 无 volatile 残留堆积（或随实例清理）
+- **待验证（V10）**：WPS JSAPI 保存事件可用性 + `Application.ActiveDocument` 对象引用跨轮询稳定性——决定保存检测走事件 / 对象身份 / 启发式
+- **优先级**：bug 修复（串台，且 AI 记忆串台比 UI 串台更严重），建议批 1 / 独立修复；依赖 P8/P15 既有 docId 机制
+
+---
+
 ## 2. 文档原阶段 3 打磨项 + A-G 来源追踪
 
 > **原 §8.5 4 项**与 **A-G 7 个方向**均已直接并入 P1-P13（不再有独立 §1.5）；P14-P15 为用户补充功能；P16 为 discuss 提议 + 用户确认新增（session 环境上下文注入，无 A-G 来源）。此处保留来源映射，便于回溯讨论出处。
@@ -342,7 +372,7 @@
 
 ### 4.1 分三批（P0 优先，都是高频使用痛感）
 
-> 所有打磨项已统一为 P1-P16；A-G 来源见 §2 映射表，P14-P15 为用户补充，P16 为 discuss 提议 + 用户确认新增。
+> 所有打磨项已统一为 P1-P23；A-G 来源见 §2 映射表，P14-P15 为用户补充，P16 为 discuss 提议 + 用户确认新增，P17-P22 为用户第二轮实机反馈 / 后续功能补充，P23 为 discuss 提议 + 用户确认新增（未保存文档 docId 修复，属 bug 修复，优先级高于常规打磨，建议 V10 确认后独立插批）。
 
 | 批次 | 任务 | 理由 |
 |---|---|---|
@@ -387,6 +417,7 @@
 | **UX19** | 清空新建空会话（P19） | 清空对话 → 确认 → 消息清空 + 立即新建空会话（状态回"就绪"）；清空后问"我刚才说了什么"AI 无记忆；preamble 在清空后新会话生效 |
 | **UX20** | WPS 连接状态（P20） | 正常启动+首次工具调用后状态变"WPS 已连接"（不再恒"未激活"）；未连接时真实反映、不误报 |
 | **UX21** | 发送按钮条件禁用（P21） | bridge 未就绪/会话未建时发送按钮禁用（不可点）；就绪+会话建立后自动启用；建立失败禁用+可见错误+可重试 |
+| **UX22** | 未保存文档 docId 隔离 + 保存迁移（P23） | 关闭未保存文档后新建同名未保存文档 → 侧边栏全新会话（UI + AI 记忆都不串台）；未保存对话保存后会话不丢、重开恢复历史（实机端到端为阻塞门） |
 
 ---
 
@@ -403,6 +434,7 @@
 | V7 | qwenpaw acp 是否有 `session/clear` / 清空 session state 的等价接口（清除对话历史用） | P14 | 查 ACP 协议 / qwenpaw 源码；无则退化为 `session/close` + `session/new` |
 | V8 | WPS 文档能否经现有 wps-mcp 工具/注入点触发原生 undo；插件侧快照对 word/excel/ppt 的可行性 | P17 | 实机验证 WPS 原生撤销（`ActiveDocument.Undo()` 类）；评估快照恢复对表格/图形/排版的覆盖 |
 | V9 | WPS 桥"已连接"的可靠判定信号（poll 端口响应 / WpsPollClient 连接事件 / 加载项探测） | P20 | 读 `js/wps-poll-client.js` + bridge 的 wps 状态来源；无可靠信号则降级为"未激活文案弱化/合并" |
+| V10 | WPS JSAPI 保存事件可用性（`DocumentBeforeSave`/`AfterSave` 类）+ `Application.ActiveDocument` 对象引用跨轮询稳定性 | P23 | 实机/查 WPS JSAPI：有保存事件优先走事件；否则验证对象引用跨轮询是否稳定（稳定则对象身份判保存，不稳则启发式 name+path） |
 
 ---
 
@@ -413,4 +445,5 @@
 - P16（session 环境注入，2026-09-04 登记，FE-only）不涉及架构层变更；若 preamble 行为规则实测无效需机制升级，先回 discuss agent
 - P17-P21（2026-09-05 登记，用户第二轮实机反馈）：P17（修订模式/回滚）跨层且触及 zero-fork 边界，V8 未决前**不委派开发**；P18/P19/P20/P21 均为 FE-only（P20 需先读 wps-poll-client 确认 V9），不涉及架构层变更
 - P22（自定义提示词模板按钮，2026-09-08 新增）：纯前段方案见 `docs/DEV-PLAN-PromptTemplates.md`，归入 Phase 3打磨，零跨层依赖；待用户拍板默认模板/按钮风格 → 进入 code agent 开发
+- P23（未保存文档 docId 唯一化 + 保存迁移，2026-09-14 登记，FE-only，P15/P8 修复）：V10 未决前**不委派开发**——保存检测机制（事件/对象身份/启发式）决定实现路径；先实机确认 V10 再进 code agent
 - 项目状态：`memory/projects/grga.md` 为 grga 项目记忆；本项目的决策链沉淀在 ARCHITECTURE.md §13；A-G 方向的原始讨论见 `memory/2026-09-03/wps-qwenpaw-addon-dev.md`

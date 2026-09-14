@@ -96,6 +96,18 @@ var QP = (function () {
   function historyKey(docId) { return 'qp.history.' + (docId || 'default'); }
   function sessionKey(docId) { return 'qp.session.' + (docId || 'default'); }
 
+  // P23：未保存文档（volatile docId）的历史/会话缓存一律不落 localStorage——
+  // 临时草稿无跨会话身份，关闭即弃，避免 volatile key 长期堆积 / 跨实例串台。
+  // 依赖 doc-state.js 的 isVolatileDocId（运行时存在；加载时序 app-state 最先、doc-state 随后，
+  // 所有持久化函数都在运行时调用，届时已定义）。
+  function isVolatileDocIdForPersist(docId) {
+    try {
+      return typeof globalThis.isVolatileDocId === 'function' && globalThis.isVolatileDocId(docId);
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Phase 3：agent 选择按 server 隔离（不同 server 的 agent 语义不同，opencode 是 mode）。
   // 旧版全局 key 'qp.agent' 兼容回退：server-scoped 无值时读旧 key（一次迁移）。
   var LEGACY_AGENT_KEY = 'qp.agent';
@@ -121,6 +133,7 @@ var QP = (function () {
   }
 
   function loadHistory(docId) {
+    if (isVolatileDocIdForPersist(docId)) return []; // P23：volatile 一律无历史
     try {
       var raw = localStorage.getItem(historyKey(docId));
       return (raw && JSON.parse(raw)) || [];
@@ -128,16 +141,19 @@ var QP = (function () {
   }
 
   function saveHistory(docId, msgs) {
+    if (isVolatileDocIdForPersist(docId)) return; // P23：volatile 不落盘
     try {
       localStorage.setItem(historyKey(docId), JSON.stringify((msgs || []).slice(-200)));
     } catch (e) {}
   }
 
   function loadCachedSessionId(docId) {
+    if (isVolatileDocIdForPersist(docId)) return null; // P23：volatile 无 sessionId 缓存（跨实例不复用）
     try { return localStorage.getItem(sessionKey(docId)) || null; } catch (e) { return null; }
   }
 
   function saveCachedSessionId(docId, sid) {
+    if (isVolatileDocIdForPersist(docId)) return; // P23：volatile 不落盘
     try {
       if (sid) localStorage.setItem(sessionKey(docId), sid);
       else localStorage.removeItem(sessionKey(docId));

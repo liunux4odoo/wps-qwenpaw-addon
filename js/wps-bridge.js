@@ -2822,6 +2822,55 @@ var WpsBridge = (function () {
     }
   }
 
+  // P23：判断指定名称的文档是否仍处于打开状态（按 appType 读对应集合）。
+  // 保存/另存为会让文档对象就地重命名（旧名从集合中消失），而"切换到另一仍打开的文档"旧名仍在集合中。
+  // @param {string} name - 文档名
+  // @param {string} appType - 'wps'|'et'|'wpp'（决定读 Documents/Workbooks/Presentations）
+  // @returns {boolean} true=名称仍在集合中（切换/未保存态）；false=名称已消失（可能已重命名保存）
+  function hasDocumentNamed(name, appType) {
+    try {
+      if (!name) return false;
+      var app = getApplication();
+      if (!app) return false;
+      var col = null;
+      try {
+        if (appType === 'et') col = app.Workbooks;
+        else if (appType === 'wpp') col = app.Presentations;
+        else col = app.Documents;
+      } catch (e) {}
+      if (!col) return false;
+      var count = 0;
+      try { count = col.Count || 0; } catch (e) { return false; }
+      for (var i = 1; i <= count; i++) {
+        try { if (col.Item(i).Name === name) return true; } catch (e) {}
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // P23：读取文档集合数量（按 appType 读 Documents/Workbooks/Presentations 的 Count）。
+  // 保存/另存为/就地重命名不会增减集合；关闭文档会使 Count 减小——用于区分
+  // "同一文档被保存"与"关闭旧文档后切到另一文档"（后者 Count 变化，判定为非保存）。
+  // @returns {number|null} 无法读取时返回 null（调用方对 null 跳过该约束，不误挡合法保存）
+  function getDocCount(appType) {
+    try {
+      var app = getApplication();
+      if (!app) return null;
+      var col = null;
+      try {
+        if (appType === 'et') col = app.Workbooks;
+        else if (appType === 'wpp') col = app.Presentations;
+        else col = app.Documents;
+      } catch (e) {}
+      if (!col) return null;
+      return col.Count || 0;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // ══════════════════════════════════════════════
   // 对外接口
   // ══════════════════════════════════════════════
@@ -2834,6 +2883,8 @@ var WpsBridge = (function () {
     getAppType: getAppType,
     getActiveDocumentInfo: getActiveDocumentInfo,
     getDocIdentity: getDocIdentity,
+    hasDocumentNamed: hasDocumentNamed,
+    getDocCount: getDocCount,
 
     // 阶段 2 编辑命令（轮询命令分发用）
     getActiveDocument: getActiveDocument,

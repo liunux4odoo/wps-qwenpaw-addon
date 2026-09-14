@@ -36,6 +36,9 @@ function loadEnv(initialConfigMode, opts) {
     currentServer: 'qwenpaw',
     serverSwitchedTo: null,
     deferredServers: [],   // opts.deferServers 时暂存 /servers 响应（flushServers 触发）
+    // P23：可控的活动文档身份与打开文档集合（Scenario G 用）
+    docIdentity: opts.docIdentity || null,
+    openDocs: (opts.openDocs || []).slice(),
   };
   // 预置记住的 server（Phase 3：qp.server）
   if (opts.savedServer) st.store['qp.server'] = opts.savedServer;
@@ -89,7 +92,13 @@ function loadEnv(initialConfigMode, opts) {
     onRequest(cb) { st.acpCbs.request = cb; },
   };
   const WpsPollClientStub = { init() {}, start() {}, stop() {} };
-  const WpsBridgeStub = {};
+  const WpsBridgeStub = {
+    // P23：活动文档身份与文档集合可控制（Scenario G/H/I/J 验证 volatile docId + 保存迁移 + 反例）
+    getDocIdentity() { return st.docIdentity ? Object.assign({}, st.docIdentity) : null; },
+    getActiveDocumentInfo() { return st.docIdentity ? Object.assign({}, st.docIdentity) : null; },
+    hasDocumentNamed(name) { return st.openDocs.indexOf(name) !== -1; },
+    getDocCount() { return st.openDocs.length; },
+  };
 
   const localStorageStub = {
     getItem(k) { return Object.prototype.hasOwnProperty.call(st.store, k) ? st.store[k] : null; },
@@ -187,6 +196,11 @@ function loadEnv(initialConfigMode, opts) {
       t.fired = true;
       t.fn();
     },
+    // P23：触发指定延迟的待触发定时器（如 schedulePersist 的 600ms 防抖）
+    fireMs(ms) {
+      const t = st.timers.find(x => !x.fired && x.ms === ms);
+      if (t) { t.fired = true; t.fn(); }
+    },
     fireAllTimers() {
       let guard = 0;
       for (;;) {
@@ -202,6 +216,14 @@ function loadEnv(initialConfigMode, opts) {
     sends() { return st.acpCalls.send; },
     sessionNewSends() { return st.acpCalls.send.filter(s => s.method === 'session/new'); },
     chat() { return st.chatCalls; },
+    // P23：Scenario G 控制活动文档身份 / 打开文档集合 / 触发文档复查 / 读状态与 localStorage
+    setDocIdentity(info) { st.docIdentity = info; },
+    setOpenDocs(list) { st.openDocs = (list || []).slice(); },
+    checkDoc() { if (typeof sandbox.checkDocNow === 'function') sandbox.checkDocNow(); },
+    state() { return sandbox.QP.state; },
+    store() { return st.store; },
+    QP() { return sandbox.QP; },
+    send(text) { if (sandbox.QwenPawAddon && sandbox.QwenPawAddon.sendUserMessage) sandbox.QwenPawAddon.sendUserMessage(text); },
   };
 }
 
@@ -333,6 +355,181 @@ console.log('Scenario F: server 切换失败回滚（不无限重试）');
   check('F2 未无限重试 /server/set（≤1 次）', env.serverSwitchedTo() === null,
     'serverSwitchedTo=' + env.serverSwitchedTo());
   check('F3 显示回滚为 bridge 当前 server', env.currentServer() === 'qwenpaw', 'current=' + env.currentServer());
+}
+
+// ══ Scenario G：P23 未保存文档 docId 唯一化 + 保存时迁移（不丢会话 / 不落盘 / 不串台）══
+console.log('Scenario G: P23 未保存文档 docId 唯一化 + 保存迁移');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: '文字文稿1', path: '', appType: 'wps' },
+    openDocs: ['文字文稿1'],
+  });
+  const volId = env.state().currentDocId;
+  check('G1 未保存文档 docId 为 volatile（含 ::unsaved:: + 实例 token）',
+    typeof volId === 'string' && volId.indexOf('::unsaved::') !== -1,
+    'docId=' + volId);
+  check('G2 volatile docId 以 appType::unsaved:: 开头', /^wps::unsaved::/.test(volId || ''), 'docId=' + volId);
+
+  // 建会话（volatile 无 sessionId 缓存 → 走 session/new）；直接回包，不触发看门狗
+  env.conn('connected');
+  const newSends = env.sessionNewSends();
+  check('G3 未保存文档无历史 sessionId 缓存 → session/new', newSends.length === 1,
+    'count=' + newSends.length);
+  env.respond(newSends[newSends.length - 1].id, { sessionId: 'S1' }, null);
+  check('G3b 会话建立成功（acpSessionId=S1）', env.state().acpSessionId === 'S1',
+    'sid=' + env.state().acpSessionId);
+
+  // volatile 历史不落 localStorage（直接调 saveHistory/saveCachedSessionId 验证守卫）
+  env.QP().saveHistory(volId, [{ role: 'user', text: 'x' }]);
+  env.QP().saveCachedSessionId(volId, 'S1');
+  check('G4 未保存文档历史不落 localStorage', !env.store()['qp.history.' + volId],
+    'keys=' + Object.keys(env.store()).filter(k => k.indexOf('qp.history.') === 0).join(','));
+  check('G5 未保存文档 sessionId 不落 localStorage', !env.store()['qp.session.' + volId],
+    'keys=' + Object.keys(env.store()).filter(k => k.indexOf('qp.session.') === 0).join(','));
+
+  // 模拟保存：改名 + path 非空 + 旧名从文档集合消失 → 触发迁移
+  env.setOpenDocs(['report.docx']);
+  env.setDocIdentity({ name: 'report.docx', path: '/home/u/Documents', appType: 'wps' });
+  env.checkDoc();
+  const stableId = 'wps:/home/u/Documents:report.docx';
+  const st1 = env.state();
+  const migratedDocId = st1.currentDocId; // 快照（st1 是 live state 对象，后续切换会变）
+  check('G6 保存后 docId 迁移到稳定 id', migratedDocId === stableId,
+    'docId=' + migratedDocId);
+  check('G7 迁移不丢会话（acpSessionId 保持 S1）', st1.acpSessionId === 'S1',
+    'sid=' + st1.acpSessionId);
+  check('G8 迁移不重建会话（session/new 仍仅 1 次）', env.sessionNewSends().length === 1,
+    'count=' + env.sessionNewSends().length);
+  check('G9 迁移后会话缓存落到稳定 docId', env.store()['qp.session.' + stableId] === 'S1',
+    'session=' + env.store()['qp.session.' + stableId]);
+
+  // 同实例再新建另一个未保存文档：token 相同但 name 不同 → 各自隔离（不串台）
+  env.setDocIdentity({ name: '文字文稿2', path: '', appType: 'wps' });
+  env.setOpenDocs(['report.docx', '文字文稿2']);
+  env.checkDoc();
+  const vol2Id = env.state().currentDocId;
+  check('G10 切换到另一未保存文档 → 新 volatile docId（隔离不串台）',
+    vol2Id !== migratedDocId && /^wps::unsaved::/.test(vol2Id || ''),
+    'docId=' + vol2Id);
+  check('G11 另一未保存文档无历史缓存残留（不落盘）', !env.store()['qp.history.' + vol2Id],
+    'keys=' + Object.keys(env.store()).filter(k => k.indexOf('qp.history.') === 0).join(','));
+}
+
+// ══ Scenario H：P23 反例——从"未保存文档"切换到"另一已打开的已保存文档"必须走文档切换，绝不误判保存迁移 ══
+console.log('Scenario H: P23 反例——切到另一已打开文档不误迁');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: '文字文稿1', path: '', appType: 'wps' },
+    openDocs: ['文字文稿1', 'report.docx'],
+  });
+  const volId = env.state().currentDocId;
+  env.conn('connected');
+  const newSends = env.sessionNewSends();
+  env.respond(newSends[newSends.length - 1].id, { sessionId: 'S1' }, null);
+
+  // 切换到另一已打开的已保存文档：旧名"文字文稿1"仍在文档集合中 → 判定为切换，不是保存
+  env.setDocIdentity({ name: 'report.docx', path: '/home/u/Documents', appType: 'wps' });
+  env.checkDoc();
+  const st = env.state();
+  check('H1 切到另一已打开文档 → docId 为稳定 id（正常切换）', st.currentDocId === 'wps:/home/u/Documents:report.docx',
+    'docId=' + st.currentDocId);
+  check('H2 会话按文档切换重建（acpSessionId 清空，重新建会话）', st.acpSessionId === null,
+    'sid=' + st.acpSessionId);
+  check('H3 未保存文档历史不落盘（不被误迁移落盘）', !env.store()['qp.history.' + volId],
+    'keys=' + Object.keys(env.store()).filter(k => k.indexOf('qp.history.') === 0).join(','));
+  check('H4 切换后发起新会话（session/new ≥2，未复用餐户缓存）', env.sessionNewSends().length >= 2,
+    'count=' + env.sessionNewSends().length);
+}
+
+// ══ Scenario I：P23 同名就地保存（未保存文档保持默认名直接保存，path '' -> 非空）→ 必须迁移 ══
+console.log('Scenario I: P23 同名就地保存迁移');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: '文字文稿1', path: '', appType: 'wps' },
+    openDocs: ['文字文稿1'],
+  });
+  const volId = env.state().currentDocId;
+  env.conn('connected');
+  const newSends = env.sessionNewSends();
+  env.respond(newSends[newSends.length - 1].id, { sessionId: 'S1' }, null);
+
+  // 同名就地保存：name 不变、path 变非空（旧名仍在集合中也无所谓——同名即同一文档）
+  env.setOpenDocs(['文字文稿1']);
+  env.setDocIdentity({ name: '文字文稿1', path: '/home/u/Documents', appType: 'wps' });
+  env.checkDoc();
+  const st = env.state();
+  check('I1 同名就地保存 → docId 迁移到稳定 id', st.currentDocId === 'wps:/home/u/Documents:文字文稿1',
+    'docId=' + st.currentDocId);
+  check('I2 会话不丢（acpSessionId 保持 S1）', st.acpSessionId === 'S1', 'sid=' + st.acpSessionId);
+  check('I3 会话缓存落到稳定 docId', env.store()['qp.session.wps:/home/u/Documents:文字文稿1'] === 'S1',
+    'session=' + env.store()['qp.session.wps:/home/u/Documents:文字文稿1']);
+  check('I4 未保存 docId 无残留缓存', !env.store()['qp.history.' + volId] && !env.store()['qp.session.' + volId],
+    'keys=' + Object.keys(env.store()).filter(k => k.indexOf('qp.') === 0).join(','));
+}
+
+// ══ Scenario J：P23 反例——关闭当前文档后另一文档自动激活（集合数量减小）→ 绝不误判为保存迁移 ══
+// 覆盖修复：未保存 A + 已保存 B 同时打开，A 关闭（丢弃）后 B 自动激活，旧名从集合消失，
+// 若无"集合数量变化"约束会被误判为改名保存 → 误把 A 的会话/历史迁到 B。
+console.log('Scenario J: P23 反例——关旧文档自动激活另一文档不误迁');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: '文字文稿1', path: '', appType: 'wps' },
+    openDocs: ['文字文稿1', 'report.docx'], // 两个文档同时打开（Count=2）
+  });
+  const volId = env.state().currentDocId;
+  env.conn('connected');
+  const newSends = env.sessionNewSends();
+  env.respond(newSends[newSends.length - 1].id, { sessionId: 'S1' }, null);
+  check('J1 初始集合数量已跟踪（Count=2）', env.store()['qp.history.' + volId] === undefined, 'sanity');
+
+  // 关闭当前未保存文档（丢弃）→ 集合 Count 2→1 → B 自动激活（旧名"文字文稿1"从集合消失）
+  env.setOpenDocs(['report.docx']);
+  env.setDocIdentity({ name: 'report.docx', path: '/home/u/Documents', appType: 'wps' });
+  env.checkDoc();
+  const st = env.state();
+  check('J2 关旧自动激活 → 正常文档切换（docId=稳定 B，非迁移）', st.currentDocId === 'wps:/home/u/Documents:report.docx',
+    'docId=' + st.currentDocId);
+  check('J3 未把 A 的会话/历史迁到 B（acpSessionId 清空重建）', st.acpSessionId === null,
+    'sid=' + st.acpSessionId);
+  check('J4 A 的 volatile 缓存未被误迁移落盘', !env.store()['qp.history.' + volId] && !env.store()['qp.session.' + volId],
+    'keys=' + Object.keys(env.store()).filter(k => k.indexOf('qp.') === 0).join(','));
+}
+
+// ══ Scenario K：P23 验收#1——同实例内"关闭未保存 A → 新建同名未保存 B"必须全新会话 ══
+// 覆盖：WPS 复用默认名，B 的 volatile docId 与 A 相同；若关闭 A 时未清理 docStates，
+// B 会继承 A 的会话/历史。关闭（无活动文档）后清理残留，B 全新。
+console.log('Scenario K: P23 同实例关旧建新同名未保存文档 → 全新会话');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: '文字文稿1', path: '', appType: 'wps' },
+    openDocs: ['文字文稿1'],
+  });
+  const volId = env.state().currentDocId;
+  env.conn('connected');
+  const s1 = env.sessionNewSends();
+  env.respond(s1[s1.length - 1].id, { sessionId: 'S1' }, null);
+  check('K1 A 会话已建立（S1）', env.state().acpSessionId === 'S1', 'sid=' + env.state().acpSessionId);
+
+  // 关闭 A（不保存）→ 无活动文档 → 清理 A 的 volatile 状态
+  env.setOpenDocs([]);
+  env.setDocIdentity(null);
+  env.checkDoc();
+  check('K2 关闭后进入无文档态（currentDocId=default）', env.state().currentDocId === 'default',
+    'docId=' + env.state().currentDocId);
+
+  // 新建同名未保存文档 B → 相同 volatile docId，但不得继承 A 的会话
+  env.setDocIdentity({ name: '文字文稿1', path: '', appType: 'wps' });
+  env.setOpenDocs(['文字文稿1']);
+  env.checkDoc();
+  const st = env.state();
+  check('K3 新建 B 的 docId 与 A 相同（WPS 复用默认名）', st.currentDocId === volId,
+    'docId=' + st.currentDocId + ' volId=' + volId);
+  check('K4 B 不继承 A 的会话（acpSessionId 为空）', st.acpSessionId === null,
+    'sid=' + st.acpSessionId);
+  check('K5 B 重新发起新会话（session/new ≥2，无 session/load 复用 S1）', env.sessionNewSends().length >= 2,
+    'count=' + env.sessionNewSends().length);
+  check('K6 无 session/load 复用旧 S1', !env.sends().some(x => x.method === 'session/load'),
+    'sends=' + JSON.stringify(env.sends().map(x => x.method)));
 }
 
 console.log(failures === 0 ? '\n✅ 前端行为验证全部通过' : `\n❌ ${failures} 项失败`);
