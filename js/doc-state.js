@@ -73,7 +73,9 @@
   }
 
   // P16：构建环境上下文 preamble（独立文本块，仅进 ACP prompt、不进用户气泡）
-  // 契约：文档类型（appType）/ 完整路径（未保存标注"未保存的新文档"）/ 工作目录 + 三条行为规则。
+  // 契约：文档类型（appType）/ 完整路径（未保存标注"未保存的新文档"）/ 工作目录 + 行为规则。
+  // 按文档类型注入对应 wps-* 专项 skill（wps→wps-word、et→wps-excel、wpp→wps-ppt）；
+  // wps-office 是三者公共的通用/跨应用技能，一并与专项 skill 引用（通用操作见 wps-office）。
   // 无活动文档 → 返回 null（优雅降级：不发 preamble、不崩溃）。
   function buildPreamble() {
     var info = getDocEnvContext();
@@ -83,12 +85,17 @@
       et: 'Excel/WPS 表格',
       wpp: 'PowerPoint/WPS 演示'
     }[info.appType] || info.appType || '文档';
+    var docSkill = {
+      wps: 'wps-word',
+      et: 'wps-excel',
+      wpp: 'wps-ppt'
+    }[info.appType] || null;
     var name = info.name || '未命名文档';
     var saved = !!(info.path);
     var fullPath = saved ? (info.path.replace(/\/+$/, '') + '/' + name) : null;
     var pathDesc = saved ? fullPath : '（未保存的新文档）';
     var cwd = info.path || QP.SESSION_CWD;
-    return '【当前工作环境】（自动注入的环境上下文，请据此工作）\n'
+    var out = '【当前工作环境】（自动注入的环境上下文，请据此工作）\n'
       + '文档类型：' + appTypeLabel + '\n'
       + '文档名称：' + name + '\n'
       + '文档路径：' + pathDesc + '\n'
@@ -97,6 +104,11 @@
       + '1. 对文档做任何修改前，先读取文档当前状态，不要假设内容；\n'
       + '2. 本会话只围绕当前打开的活动文档工作，不要自行打开其他文档；\n'
       + '3. 同目录下的周边文档可按路径检索，但默认以当前文档为工作中心。';
+    if (docSkill) {
+      out += '\n4. 操作当前 WPS 文档前，先参考 ' + docSkill + ' skill 中对应文档类型的操作规范；'
+        + '通用操作（导出/打印/保存等）与跨应用需求参考 wps-office skill。';
+    }
+    return out;
   }
 
   // P15：消息变更后防抖落盘（localStorage，按 docId）
