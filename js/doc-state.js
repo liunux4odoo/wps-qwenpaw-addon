@@ -69,7 +69,7 @@
   function getSessionCwd() {
     var info = getDocEnvContext();
     if (info && info.path) return info.path;
-    return QP.SESSION_CWD;
+    return QP.resolveSessionCwd();
   }
 
   // P16：构建环境上下文 preamble（独立文本块，仅进 ACP prompt、不进用户气泡）
@@ -94,7 +94,7 @@
     var saved = !!(info.path);
     var fullPath = saved ? (info.path.replace(/\/+$/, '') + '/' + name) : null;
     var pathDesc = saved ? fullPath : '（未保存的新文档）';
-    var cwd = info.path || QP.SESSION_CWD;
+    var cwd = info.path || QP.resolveSessionCwd();
     var out = '【当前工作环境】（自动注入的环境上下文，请据此工作）\n'
       + '文档类型：' + appTypeLabel + '\n'
       + '文档名称：' + name + '\n'

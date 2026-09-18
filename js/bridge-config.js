@@ -136,6 +136,9 @@
               S.wpsMcpEntryReady = true;
               S.bridgeConfigErrorShown = false; // 配置恢复后允许后续失败再次提示
               if (r.acpServer) S.acpServerName = r.acpServer; // 版本倾斜检测（switchAgent）
+              // 平台通用默认工作目录（P16）：bridge 按平台解析（Linux/macOS /tmp、Windows %TEMP%），
+              // 覆盖 JS 平台探测兜底，供无活动文档时的 session cwd
+              if (r.sessionCwd) S.sessionCwd = r.sessionCwd;
               // Phase 2：能力标志（opencode 无审批/无 cancel/无 thought heartbeat 等），
               // 前端按标志适配协议偏好；缺失时保留 qwenpaw 兼容默认值
               if (r.capabilities && typeof r.capabilities === 'object') {

@@ -16,6 +16,35 @@
 
 > **ACP server 支持范围（2026-09-07 定案）**：本项目以 **QwenPaw 为主目标**（默认后端，完整体验），**opencode 为替代**——面向无法安装或不愿安装 QwenPaw 的用户，已能完整体验本项目功能。claudecode / kimicode / qcoder 等其它 code agent **暂不支持**。
 
+## Windows（实验性支持）
+
+> **现状（2026-09-18 核实）**：本项目官方验证平台为 Linux；但核心组件跨平台就绪，Windows 上可完整体验：
+> - **acp-bridge**（纯 Python asyncio）与 **wps-office-mcp**（submodule 自带 win32 PowerShell COM 通道）均跨平台；
+> - 加载项 JS/HTML 全部使用 XHR HTTP 短轮询（WPS 内置 Chromium 兼容），不依赖 WebSocket/fetch；
+> - Windows 上文档操作走 **PowerShell COM**（无需 Linux 的反向轮询 :58891 / noop 脚本 / POLL_PORT 补丁）。
+
+Windows 一键安装（PowerShell 5.1+，Windows 10/11）：
+
+```powershell
+.\scripts\install.ps1                # 完整安装（自检 + 构建 + 同步 + 注册 + 启动 bridge）
+.\scripts\install.ps1 -SkipBridge    # 只安装文件
+.\scripts\install.ps1 -BridgeOnly    # 只启动 bridge
+.\scripts\install.ps1 -AcpServer opencode   # 用 opencode 替代 qwenpaw 作为 ACP 后端
+```
+
+前提：WPS 个人版/企业版、Node.js ≥ 18、Python 3.10+（建议 3.12，`pip install websockets`）、qwenpaw 或 opencode 任一 ACP server。
+
+Windows 与 Linux 的差异与注意事项：
+
+| 项 | Linux | Windows |
+|---|---|---|
+| 加载项目录 | `~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_` | `%APPDATA%\kingsoft\wps\jsaddons\wps-qwenpaw-addon_` |
+| 注册方式 | 目录名自动发现 | publish.xml / jsplugins.xml / authaddin.json（脚本自动写入/启用） |
+| 文档操作通道 | 反向轮询（addon 拉取 :58891） | PowerShell COM（wps-office-mcp win32 分支，同步直连） |
+| 宏安全性 | 必须调到最低（否则不加载） | 无强制要求（脚本不自动改注册表） |
+
+> ⚠ Windows 侧边栏显示「WPS 桥: 重连中」属**预期现象**：COM 通道不用 :58891 轮询端口，不影响文档操作（QwenPaw→MCP→COM→WPS 全链路）。未打开文档时 session 工作目录回退为**平台通用默认**（Linux/macOS `/tmp`、Windows `%TEMP%`，由 bridge `/config` 下发），建议始终打开文档后使用（与 Linux 行为一致）。
+
 ## AI 后端选择（ACP server）
 
 本项目需要一个 ACP（Agent Client Protocol）后端提供智能体能力，**二选一**：

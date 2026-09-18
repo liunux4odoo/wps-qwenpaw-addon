@@ -43,6 +43,9 @@ var QP = (function () {
     sessionTimer: null,             // 会话建立看门狗定时器
     sessionFailed: false,           // P21：会话建立失败（重试用尽）——发送按钮保持禁用 + 占位提示
 
+    // ── ACP session 默认工作目录（平台通用，P16 兜底）──
+    sessionCwd: null,               // bridge /config 下发的平台通用默认值；未拉取前为 null（用 JS 平台探测兜底）
+
     // ── bridge /config 权威配置门禁（plan-2026-09-04 根因 2）──
     wpsMcpEntryReady: false,        // MCP_SERVERS[0].args 已由 /config 下发权威绝对路径
     bridgeConfigErrorShown: false,  // 错误卡片只展示一次（恢复后再失败可再次展示）
@@ -177,8 +180,23 @@ var QP = (function () {
 
     // ── 配置 / 常量 ──
     ACP_WS_URL: 'ws://127.0.0.1:8765',
-    // P16：QwenPaw ACP session 工作目录——默认兜底；实际用当前活动文档目录（getSessionCwd()）
-    SESSION_CWD: '/tmp/kilo',
+    // P16：QwenPaw ACP session 工作目录——默认兜底（无活动文档时）；实际用当前活动文档目录（getSessionCwd()）。
+    // 平台通用：/config 下发后以 S.sessionCwd（bridge 平台解析，Linux/macOS /tmp、Windows 用户 %TEMP%）为准；
+    // 未拉取前按平台探测兜底（仅 last-resort——正常路径会话创建已被 /config 门禁，bridge 值必已就绪）。
+    //   Windows -> 系统临时目录常量（JS 内无法取用户 %TEMP%，非精确等价，仅兜底）
+    //   其它（Linux/macOS）-> /tmp
+    SESSION_CWD: (function () {
+      try {
+        var pf = (typeof navigator !== 'undefined' && navigator.platform) ? String(navigator.platform) : '';
+        var ua = (typeof navigator !== 'undefined' && navigator.userAgent) ? String(navigator.userAgent) : '';
+        if (/Win/i.test(pf) || /Windows/i.test(ua)) return 'C:\\Windows\\Temp';
+      } catch (e) {}
+      return '/tmp';
+    })(),
+    // 解析当前 session 默认工作目录：/config 下发的平台通用值优先，未就绪用 JS 平台探测兜底
+    resolveSessionCwd: function () {
+      return (state.sessionCwd || QP.SESSION_CWD);
+    },
 
     // wps-office-mcp MCP 服务器（§5.1 + §13 v0.17 路线 P）：
     // 走 stdio（QwenPaw 每 ACP session spawn 独立 wps-mcp 子进程），bridge 集中分配独立 poll 端口

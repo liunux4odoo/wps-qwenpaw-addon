@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import socket
+import tempfile
 import time
 from collections import deque
 from urllib.parse import unquote
@@ -172,6 +173,9 @@ class AcpBridge:
         self.wps_mcp_entry = (wps_mcp_entry
                               or os.path.join(self.ui_root, "third_party", "opencode-wps",
                                               "wps-office-mcp", "dist", "index.js"))
+        # ACP session 无活动文档时的默认工作目录（平台通用）：Linux/macOS -> /tmp，Windows -> %TEMP%。
+        # 加载项 doc-state 在拿不到活动文档路径时用它兜底（原硬编码 /tmp/kilo 为 Linux 专属）。
+        self.session_cwd = tempfile.gettempdir()
         # 调试日志文件（None = 只写 stdout）
         self.log_file = log_file
         # 连接集与路由表
@@ -878,12 +882,15 @@ class AcpBridge:
                 # 不依赖客户端机器上的硬编码绝对路径（submodule 固定后可确定）。
                 # acpServer + capabilities：当前 ACP server 与能力标志（plan-2026-09-05 §5.1/§6，
                 # Phase 2 前端按标志适配协议偏好）。
+                # sessionCwd：ACP session 无活动文档时的默认工作目录，按平台通用解析
+                # （Linux/macOS -> /tmp，Windows -> %TEMP%），供加载项 session/new 兜底。
                 await self._http_json(writer, 200, {
                     "wpsMcpEntry": self.wps_mcp_entry,
                     "pollPortStart": POLL_PORT_START,
                     "pollPortEnd": POLL_PORT_END,
                     "acpServer": self.adapter.name,
                     "capabilities": dict(self.adapter.capabilities),
+                    "sessionCwd": self.session_cwd,
                 })
             elif path == "/servers" and method == "GET":
                 # Phase 3：可用 ACP server 列表 + 能力标志（plan-2026-09-05 §7），
