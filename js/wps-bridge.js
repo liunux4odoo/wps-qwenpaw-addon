@@ -124,6 +124,73 @@ var WpsBridge = (function () {
     }
   }
 
+  // ── Excel 辅助函数（端口自 opencode-wps-linux/handlers/excel-handler.js 顶部） ──
+
+  /** 将列号（1-based）转换为 Excel 列字母：1->A, 26->Z, 27->AA, 52->AZ, 703->AAA ... */
+  function colToLetter(n) {
+    n = parseInt(n, 10);
+    if (isNaN(n) || n < 1) return null;
+    var letters = '';
+    while (n > 0) {
+      var rem = (n - 1) % 26;
+      letters = String.fromCharCode(65 + rem) + letters;
+      n = Math.floor((n - 1) / 26);
+    }
+    return letters;
+  }
+
+  /** 将列参数（数字列号或字母串）统一解析为列字母：1->A, 27->AA, 'AB'->AB；非法返回 null */
+  function resolveColumnLetter(col) {
+    if (typeof col === 'number') return colToLetter(col);
+    if (typeof col === 'string') {
+      var t = col.trim().toUpperCase();
+      if (/^[A-Z]{1,3}$/.test(t)) return t;
+    }
+    return null;
+  }
+
+  /** 将列字母转回列号：A->1, Z->26, AA->27, AB->28；数字列号原样返回；非法返回 null */
+  function colToNumber(col) {
+    if (typeof col === 'number') return col >= 1 ? col : null;
+    if (typeof col === 'string') {
+      var t = col.trim().toUpperCase();
+      if (!/^[A-Z]{1,3}$/.test(t)) return null;
+      var n = 0;
+      for (var i = 0; i < t.length; i++) {
+        n = n * 26 + (t.charCodeAt(i) - 64);
+      }
+      return n;
+    }
+    return null;
+  }
+
+  // 对齐常量（与 opencode-wps excel-handler.js 保持一致）
+  var H_ALIGN_MAP = { left: -4131, center: -4108, right: -4152 };
+  var V_ALIGN_MAP = { top: -4160, center: -4108, bottom: -4107 };
+
+  /** 将对齐参数解析为 Excel 常量：数字直接使用，字符串走映射，非法值返回 null */
+  function resolveAlignment(value, map) {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string' && map[value.toLowerCase()] !== undefined) {
+      return map[value.toLowerCase()];
+    }
+    return null;
+  }
+
+  /** 将颜色参数解析为 Excel BGR 整数值：支持 #RRGGBB、RRGGBB、RGB 简写；数字直接返回 */
+  function toExcelColor(color) {
+    if (typeof color === 'number') return color;
+    if (typeof color !== 'string') return null;
+    var hex = color.trim();
+    if (hex.charAt(0) === '#') hex = hex.substring(1);
+    if (hex.length === 3) {
+      hex = hex.charAt(0) + hex.charAt(0) + hex.charAt(1) + hex.charAt(1) + hex.charAt(2) + hex.charAt(2);
+    }
+    if (!/^[0-9a-fA-F]{6}$/.test(hex)) return null;
+    var rgb = parseInt(hex, 16);
+    return ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+  }
+
   // ══════════════════════════════════════════════
   // 连接/信息类
   // ══════════════════════════════════════════════
@@ -832,6 +899,51 @@ var WpsBridge = (function () {
     }
   }
 
+  /** 获取书签列表（端口自 word-handler.js getBookmarks） */
+  function getBookmarks() {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      var list = [];
+      for (var i = 1; i <= doc.Bookmarks.Count; i++) {
+        list.push(doc.Bookmarks.Item(i).Name);
+      }
+      return ok({ bookmarks: list });
+    } catch (e) {
+      return fail('获取书签失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  /** 获取批注列表（端口自 word-handler.js getComments） */
+  function getComments() {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      var list = [];
+      for (var i = 1; i <= doc.Comments.Count; i++) {
+        var c = doc.Comments.Item(i);
+        list.push({ author: c.Author || '', text: c.Text, date: c.Date });
+      }
+      return ok({ comments: list });
+    } catch (e) {
+      return fail('获取批注失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  /** 插入超链接（端口自 word-handler.js insertHyperlink） */
+  function insertHyperlink(params) {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      if (!params || !params.url) return invalidParam('缺少 url');
+      var app = getApplication();
+      doc.Hyperlinks.Add(app.Selection.Range, params.url, '', '', params.text || params.url);
+      return ok({});
+    } catch (e) {
+      return fail('插入超链接失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
   /** 插入页眉 */
   function insertHeader(params) {
     try {
@@ -1005,6 +1117,37 @@ var WpsBridge = (function () {
     }
   }
 
+  /** 导出为 PDF（端口自 common-handler.js convertToPDF） */
+  function convertToPDF(params) {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      var outputPath = params && (params.outputPath || params.path);
+      if (!outputPath) return invalidParam('缺少 outputPath');
+      doc.ExportAsFixedFormat(outputPath, 17);
+      return ok({ outputPath: outputPath });
+    } catch (e) {
+      return fail('导出 PDF 失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  /** 获取文档统计（端口自 common-handler.js getDocumentStats） */
+  function getDocumentStats() {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      return ok({
+        name: doc.Name,
+        path: doc.FullName,
+        paragraphCount: doc.Paragraphs ? doc.Paragraphs.Count : 0,
+        wordCount: doc.Words ? doc.Words.Count : 0,
+        characterCount: doc.Characters ? doc.Characters.Count : 0
+      });
+    } catch (e) {
+      return fail('获取文档统计失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
   function openFile(params) {
     try {
       var filePath = params && (params.path || params.filePath);
@@ -1088,6 +1231,1630 @@ var WpsBridge = (function () {
       return ok({});
     } catch (e) {
       return fail('设置单元格失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  // ══════════════════════════════════════════════
+  // Excel（WPS 表格）方法
+  // 端口自 third_party/opencode-wps/opencode-wps-linux/handlers/excel-handler.js
+  // （2026-09-18 方案：上游 handler 有的命令全量同步到插件执行器，excel 85 个）
+  // 契约：每方法返回 { success, data, error }（与轮询 /result 一致）。
+  // 命名约定：poll.js POLL_ACTION_MAP[action] -> WpsBridge[action]。
+  // ══════════════════════════════════════════════
+
+  function getOpenWorkbooks() {
+    try {
+      var app = getApplication();
+      var wbs = app.Workbooks;
+      var list = [];
+      for (var i = 1; i <= wbs.Count; i++) {
+        var w = wbs.Item(i);
+        list.push({ name: w.Name, path: w.FullName, index: i });
+      }
+      return ok({ workbooks: list });
+    } catch (e) {
+      return fail('获取工作簿列表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function switchWorkbook(params) {
+    try {
+      var app = getApplication();
+      var wbs = app.Workbooks;
+      var target = params && (params.name || params.index);
+      var found = null;
+      if (typeof target === 'number') {
+        found = wbs.Item(target);
+      } else {
+        for (var i = 1; i <= wbs.Count; i++) {
+          if (wbs.Item(i).Name === target) { found = wbs.Item(i); break; }
+        }
+      }
+      if (!found) return fail('未找到工作簿: ' + target);
+      found.Activate();
+      return ok({ name: found.Name });
+    } catch (e) {
+      return fail('切换工作簿失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function openWorkbook(params) {
+    try {
+      var filePath = params && (params.path || params.filePath);
+      if (!filePath) return invalidParam('缺少 path');
+      var app = getApplication();
+      var wb = app.Workbooks.Open(filePath);
+      return ok({ name: wb.Name, path: wb.FullName });
+    } catch (e) {
+      return fail('打开工作簿失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function createWorkbook() {
+    try {
+      var app = getApplication();
+      var wb = app.Workbooks.Add();
+      return ok({ name: wb.Name });
+    } catch (e) {
+      return fail('创建工作簿失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function closeWorkbook(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var save = params && params.save !== undefined ? params.save : true;
+      wb.Close(save);
+      return ok({});
+    } catch (e) {
+      return fail('关闭工作簿失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getSheetList() {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheets = [];
+      for (var i = 1; i <= wb.Sheets.Count; i++) {
+        sheets.push({ name: wb.Sheets.Item(i).Name, index: i });
+      }
+      var activeSheet = '';
+      try { activeSheet = app.ActiveSheet ? app.ActiveSheet.Name : ''; } catch (e) {}
+      return ok({ sheets: sheets, activeSheet: activeSheet });
+    } catch (e) {
+      return fail('获取工作表列表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function switchSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Activate();
+      return ok({ name: sheet.Name });
+    } catch (e) {
+      return fail('切换工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function renameSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Name = params && params.name;
+      return ok({});
+    } catch (e) {
+      return fail('重命名工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function createSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var after = wb.Sheets.Item(wb.Sheets.Count);
+      var sheet = wb.Sheets.Add(null, after);
+      if (params && params.name) sheet.Name = params.name;
+      return ok({ name: sheet.Name });
+    } catch (e) {
+      return fail('创建工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function deleteSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Delete();
+      return ok({});
+    } catch (e) {
+      return fail('删除工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function copySheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var after = wb.Sheets.Item(wb.Sheets.Count);
+      sheet.Copy(null, after);
+      return ok({});
+    } catch (e) {
+      return fail('复制工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function moveSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var pos = (params && params.position) || wb.Sheets.Count;
+      sheet.Move(null, wb.Sheets.Item(pos));
+      return ok({});
+    } catch (e) {
+      return fail('移动工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getRangeData(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      var data = [];
+      // 优先批量读取（range.Value2 返回二维数组，一次 COM 往返）；失败时降级逐格（兼容旧 WPS JSAPI）
+      try {
+        var matrix = range.Value2;
+        if (matrix && typeof matrix === 'object' && matrix.length !== undefined) {
+          for (var r = 0; r < matrix.length; r++) {
+            var row = [];
+            var srcRow = matrix[r];
+            if (srcRow && typeof srcRow === 'object' && srcRow.length !== undefined) {
+              for (var c = 0; c < srcRow.length; c++) row.push(srcRow[c]);
+            } else if (srcRow === null || srcRow === undefined) {
+              // 空行（Value2 中为 null/undefined）：展开为与列数一致的 null 数组，避免列结构错位
+              for (var c = 0; c < range.Columns.Count; c++) row.push(null);
+            } else {
+              // 单行返回一维数组的情况
+              row.push(srcRow);
+            }
+            data.push(row);
+          }
+          return ok({ data: data, rows: range.Rows.Count, columns: range.Columns.Count });
+        }
+      } catch (e) {
+        log('excel', '批量读取失败，降级逐格: ' + (e && e.message ? e.message : e));
+      }
+      for (var r = 1; r <= range.Rows.Count; r++) {
+        var row = [];
+        for (var c = 1; c <= range.Columns.Count; c++) {
+          row.push(range.Cells.Item(r, c).Value2);
+        }
+        data.push(row);
+      }
+      return ok({ data: data, rows: range.Rows.Count, columns: range.Columns.Count });
+    } catch (e) {
+      return fail('读取范围数据失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setRangeData(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      var input = (params && params.data) || [];
+      // 将一行输入归一化为数组（兼容标量/null 行），供批量与逐格路径共用，避免降级时 input[r].length 抛 TypeError
+      function toRowArray(src, maxCols) {
+        var row = [];
+        if (src && typeof src === 'object' && src.length !== undefined) {
+          for (var c = 0; c < src.length && c < maxCols; c++) row.push(src[c]);
+        } else {
+          row.push(src);
+        }
+        return row;
+      }
+      // 优先批量写入（range.Value2 = 二维数组，一次 COM 往返）；失败时降级逐格
+      try {
+        var matrix = [];
+        for (var r = 0; r < input.length && r < range.Rows.Count; r++) {
+          matrix.push(toRowArray(input[r], range.Columns.Count));
+        }
+        range.Value2 = matrix;
+        return ok({});
+      } catch (e) {
+        log('excel', '批量写入失败，降级逐格: ' + (e && e.message ? e.message : e));
+      }
+      for (var r = 0; r < input.length && r < range.Rows.Count; r++) {
+        var srcRow = toRowArray(input[r], range.Columns.Count);
+        for (var c = 0; c < srcRow.length; c++) {
+          range.Cells.Item(r + 1, c + 1).Value2 = srcRow[c];
+        }
+      }
+      return ok({});
+    } catch (e) {
+      return fail('写入范围数据失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setFormula(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var rc = resolveRowCol(params && params.row, params && params.col);
+      if (!rc) return fail('无效的行/列参数: row=' + (params && params.row) + ' col=' + (params && params.col) + '（必须为正整数）');
+      sheet.Cells.Item(rc.row, rc.col).Formula = params && params.formula;
+      return ok({});
+    } catch (e) {
+      return fail('设置公式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getFormula(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var rc = resolveRowCol(params && params.row, params && params.col);
+      if (!rc) return fail('无效的行/列参数: row=' + (params && params.row) + ' col=' + (params && params.col) + '（必须为正整数）');
+      var formula = sheet.Cells.Item(rc.row, rc.col).Formula;
+      return ok({ formula: formula });
+    } catch (e) {
+      return fail('获取公式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getContext() {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = app.ActiveSheet;
+      var headers = [];
+      var headerRow = 0;
+      try {
+        var used = sheet.UsedRange;
+        if (used.Rows.Count > 0) {
+          // 读取首行真实值作为表头候选（若首行是数据而非表头，则 headerRow 标记为 0）
+          var colCount = Math.min(used.Columns.Count, 26);
+          var firstRowValues = [];
+          var textCount = 0;
+          for (var i = 1; i <= colCount; i++) {
+            var hv = used.Cells.Item(1, i).Value2;
+            var s = hv !== null && hv !== undefined ? String(hv) : '';
+            firstRowValues.push(s);
+            // 表头通常是文本：非空且非纯数字才算文本候选（过滤纯数字数据行误判）
+            if (s !== '' && isNaN(Number(s))) textCount++;
+          }
+          // 首行大部分单元格为文本时视为表头
+          if (textCount >= Math.ceil(colCount / 2)) {
+            headers = firstRowValues;
+            headerRow = 1;
+          }
+        }
+      } catch (e) {}
+
+      var sheets = [];
+      for (var i = 1; i <= wb.Sheets.Count; i++) {
+        sheets.push(wb.Sheets.Item(i).Name);
+      }
+
+      // selectedCell 包 try/catch：部分 WPS 版本在无选中/无活动窗口时访问 Application.Selection 抛错（而非返回 null）
+      var selectedCell = '';
+      try {
+        if (app.Selection) selectedCell = app.Selection.Address();
+      } catch (e) {}
+
+      return ok({
+        workbookName: wb.Name,
+        currentSheet: sheet.Name,
+        allSheets: sheets,
+        selectedCell: selectedCell,
+        headers: headers,
+        headerRow: headerRow
+      });
+    } catch (e) {
+      return fail('获取上下文失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getSelection() {
+    try {
+      // Selection 包 try/catch：无选中/无活动窗口时部分 WPS 抛错而非返回 null
+      var sel = null;
+      var app = getApplication();
+      try { sel = app && app.Selection; } catch (e) {}
+      if (!sel) return fail('没有选中的区域');
+      return ok({ address: sel.Address(), count: sel.Count, row: sel.Row, column: sel.Column });
+    } catch (e) {
+      return fail('获取选中区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function sortRange(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      // keyColumn 支持列字母（'A'）或完整地址（'A1'/'$A$1'）：纯字母补行号，避免 Range('A') 抛费解错误
+      var key = null;
+      if (params && params.keyColumn) {
+        var kc = String(params.keyColumn).trim();
+        if (/^[A-Za-z]+$/.test(kc)) kc = kc.toUpperCase() + '1';
+        key = sheet.Range(kc);
+      } else {
+        key = range.Columns.Item(1);
+      }
+      // order 大小写不敏感：'DESC'/'Desc' 都识别为降序，避免 AI 传大写静默变升序
+      var orderStr = String((params && params.order) || '').toLowerCase();
+      var order = orderStr === 'desc' ? 2 : 1;
+      range.Sort(key, order);
+      return ok({});
+    } catch (e) {
+      return fail('排序失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function autoFilter(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      if (params && params.criteria) {
+        // field 前置校验：criteria 存在但 field 缺失时 AutoFilter(undefined, ...) 抛费解错误
+        if (params.field === undefined || params.field === null) return fail('缺少 field（筛选条件列）');
+        range.AutoFilter(params.field, params.criteria);
+      } else {
+        range.AutoFilter();
+      }
+      return ok({});
+    } catch (e) {
+      return fail('筛选失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function createChart(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.dataRange);
+      var chartTypes = { column: 51, bar: 57, line: 4, pie: 5, area: 1, scatter: -4169 };
+      var chartType = chartTypes[params && params.chartType] || 51;
+      var chartObj = sheet.ChartObjects().Add((params && params.left) || 100, (params && params.top) || 100, 400, 300);
+      chartObj.Chart.SetSourceData(range);
+      chartObj.Chart.ChartType = chartType;
+      if (params && params.title) {
+        chartObj.Chart.HasTitle = true;
+        chartObj.Chart.ChartTitle.Text = params.title;
+      }
+      return ok({ chartName: chartObj.Name });
+    } catch (e) {
+      return fail('创建图表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function updateChart(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var chartObj = sheet.ChartObjects(params && params.chartName);
+      if (params && params.dataRange) chartObj.Chart.SetSourceData(sheet.Range(params.dataRange));
+      if (params && params.title) {
+        chartObj.Chart.HasTitle = true;
+        chartObj.Chart.ChartTitle.Text = params.title;
+      }
+      return ok({});
+    } catch (e) {
+      return fail('更新图表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function removeDuplicates(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      range.RemoveDuplicates((params && params.columns) || [1], 1);
+      return ok({});
+    } catch (e) {
+      return fail('去重失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setBorder(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && (params.range || params.rangeAddress));
+      var borders = range.Borders;
+      if (params && params.weight !== undefined) {
+        for (var i = 1; i <= 6; i++) { borders.Item(i).Weight = params.weight; }
+      }
+      if (params && params.styleIndex !== undefined) {
+        for (var i = 1; i <= 6; i++) { borders.Item(i).LineStyle = params.styleIndex; }
+      }
+      if (params && params.color !== undefined) {
+        var bc = toExcelColor(params.color);
+        if (bc === null) return fail('无效的边框颜色: ' + params.color + '，支持 #RRGGBB/RRGGBB/数字');
+        for (var i = 1; i <= 6; i++) { borders.Item(i).Color = bc; }
+      }
+      return ok({});
+    } catch (e) {
+      return fail('设置边框失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setCellFormat(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      var fmt = (params && params.format) || {};
+      // 数字格式（format 对象内的优先，顶层兼容旧调用）
+      if (fmt.numberFormat) range.NumberFormat = fmt.numberFormat;
+      else if (params && params.numberFormat) range.NumberFormat = params.numberFormat;
+      // 视觉格式（从 format 对象读取）
+      if (typeof fmt.fontSize === 'number' && fmt.fontSize > 0) range.Font.Size = fmt.fontSize;
+      if (fmt.bold !== undefined) range.Font.Bold = !!fmt.bold;
+      if (fmt.italic !== undefined) range.Font.Italic = !!fmt.italic;
+      if (fmt.fontName) range.Font.Name = fmt.fontName;
+      // 颜色：format 对象内优先，顶层参数兼容旧调用
+      if (fmt.fontColor !== undefined || (params && params.fontColor !== undefined)) {
+        var fc = toExcelColor(fmt.fontColor !== undefined ? fmt.fontColor : params.fontColor);
+        if (fc !== null) range.Font.Color = fc;
+      }
+      if (fmt.bgColor !== undefined || (params && params.bgColor !== undefined)) {
+        var bg = toExcelColor(fmt.bgColor !== undefined ? fmt.bgColor : params.bgColor);
+        if (bg !== null) range.Interior.Color = bg;
+      }
+      if (fmt.underline !== undefined) range.Font.Underline = !!fmt.underline;
+      if (fmt.strikethrough !== undefined) range.Font.Strikethrough = !!fmt.strikethrough;
+      // 水平/垂直对齐：format 对象内优先，顶层参数兼容旧调用
+      var hAlign = fmt.horizontalAlignment !== undefined ? fmt.horizontalAlignment : (params && params.horizontalAlignment);
+      if (hAlign !== undefined) {
+        var hv = resolveAlignment(hAlign, H_ALIGN_MAP);
+        if (hv !== null) range.HorizontalAlignment = hv;
+      }
+      var vAlign = fmt.verticalAlignment !== undefined ? fmt.verticalAlignment : (params && params.verticalAlignment);
+      if (vAlign !== undefined) {
+        var vv = resolveAlignment(vAlign, V_ALIGN_MAP);
+        if (vv !== null) range.VerticalAlignment = vv;
+      }
+      var wrap = fmt.wrapText !== undefined ? fmt.wrapText : (params && params.wrapText);
+      if (wrap !== undefined) range.WrapText = !!wrap;
+      if (params && params.mergeCells !== undefined) {
+        if (params.mergeCells) range.Merge(); else range.UnMerge();
+      }
+      return ok({});
+    } catch (e) {
+      return fail('设置单元格格式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setNumberFormat(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      range.NumberFormat = (params && (params.format || params.numberFormat));
+      return ok({});
+    } catch (e) {
+      return fail('设置数字格式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setColumnWidth(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Columns(params && params.column).ColumnWidth = params && params.width;
+      return ok({});
+    } catch (e) {
+      return fail('设置列宽失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setRowHeight(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Rows(params && params.row).RowHeight = params && params.height;
+      return ok({});
+    } catch (e) {
+      return fail('设置行高失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function autoFitColumn(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Columns(params && params.column).AutoFit();
+      return ok({});
+    } catch (e) {
+      return fail('自动调整列宽失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function autoFitRow(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Rows(params && params.row).AutoFit();
+      return ok({});
+    } catch (e) {
+      return fail('自动调整行高失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function autoFitAll() {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb);
+      if (!sheet) return fail('未找到工作表');
+      sheet.Cells.EntireColumn.AutoFit();
+      sheet.Cells.EntireRow.AutoFit();
+      return ok({});
+    } catch (e) {
+      return fail('自动调整失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function insertRows(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      // 行参数校验：row 必须为正整数，count 默认 1 且非负
+      var row = parseInt(params && params.row, 10);
+      if (isNaN(row) || row < 1) return fail('无效的行参数: ' + (params && params.row) + '（必须为正整数）');
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的插入行数: ' + (params && params.count));
+      sheet.Rows(row + ':' + (row + count - 1)).Insert();
+      return ok({});
+    } catch (e) {
+      return fail('插入行失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function deleteRows(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var row = parseInt(params && params.row, 10);
+      if (isNaN(row) || row < 1) return fail('无效的行参数: ' + (params && params.row) + '（必须为正整数）');
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的删除行数: ' + (params && params.count));
+      sheet.Rows(row + ':' + (row + count - 1)).Delete();
+      return ok({});
+    } catch (e) {
+      return fail('删除行失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function insertColumns(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var col = (params && params.column) || 1;
+      // count 校验：必须为正整数
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的插入列数: ' + (params && params.count));
+      var colLetter = resolveColumnLetter(col);
+      var colNum = colToNumber(col);
+      var endLetter = colToLetter(colNum + count - 1);
+      if (!colLetter || !colNum || !endLetter) return fail('无效的列参数: ' + col);
+      sheet.Columns(colLetter + ':' + endLetter).Insert();
+      return ok({});
+    } catch (e) {
+      return fail('插入列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function deleteColumns(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var col = (params && params.column) || 1;
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的删除列数: ' + (params && params.count));
+      var colLetter = resolveColumnLetter(col);
+      var colNum = colToNumber(col);
+      var endLetter = colToLetter(colNum + count - 1);
+      if (!colLetter || !colNum || !endLetter) return fail('无效的列参数: ' + col);
+      sheet.Columns(colLetter + ':' + endLetter).Delete();
+      return ok({});
+    } catch (e) {
+      return fail('删除列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function hideRows(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var row = parseInt(params && params.row, 10);
+      if (isNaN(row) || row < 1) return fail('无效的行参数: ' + (params && params.row) + '（必须为正整数）');
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的行数: ' + (params && params.count));
+      sheet.Rows(row + ':' + (row + count - 1)).Hidden = true;
+      return ok({});
+    } catch (e) {
+      return fail('隐藏行失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function hideColumns(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var col = resolveColumnLetter(params && params.column);
+      if (!col) return fail('无效的列参数: ' + (params && params.column));
+      sheet.Columns(col).Hidden = true;
+      return ok({});
+    } catch (e) {
+      return fail('隐藏列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function showRows(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var row = parseInt(params && params.row, 10);
+      if (isNaN(row) || row < 1) return fail('无效的行参数: ' + (params && params.row) + '（必须为正整数）');
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的行数: ' + (params && params.count));
+      sheet.Rows(row + ':' + (row + count - 1)).Hidden = false;
+      return ok({});
+    } catch (e) {
+      return fail('显示行失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function showColumns(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var col = resolveColumnLetter(params && params.column);
+      if (!col) return fail('无效的列参数: ' + (params && params.column));
+      sheet.Columns(col).Hidden = false;
+      return ok({});
+    } catch (e) {
+      return fail('显示列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function mergeCells(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).Merge();
+      return ok({});
+    } catch (e) {
+      return fail('合并单元格失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function unmergeCells(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).UnMerge();
+      return ok({});
+    } catch (e) {
+      return fail('取消合并失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function freezePanes(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var cell = sheet.Cells.Item((params && params.row) || 2, (params && params.col) || 2);
+      sheet.Activate();
+      cell.Activate();
+      app.ActiveWindow.FreezePanes = true;
+      return ok({});
+    } catch (e) {
+      return fail('冻结窗格失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function unfreezePanes() {
+    try {
+      var app = getApplication();
+      app.ActiveWindow.FreezePanes = false;
+      return ok({});
+    } catch (e) {
+      return fail('取消冻结失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function protectSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Protect((params && params.password) || '');
+      return ok({});
+    } catch (e) {
+      return fail('保护工作表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function unprotectSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Unprotect((params && params.password) || '');
+      return ok({});
+    } catch (e) {
+      return fail('取消保护失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function protectWorkbook(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      wb.Protect((params && params.password) || '');
+      return ok({});
+    } catch (e) {
+      return fail('保护工作簿失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function addCellComment(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var rc = resolveRowCol(params && params.row, params && params.col);
+      if (!rc) return fail('无效的行/列参数: row=' + (params && params.row) + ' col=' + (params && params.col) + '（必须为正整数）');
+      var cell = sheet.Cells.Item(rc.row, rc.col);
+      cell.AddComment((params && params.text) || '');
+      return ok({});
+    } catch (e) {
+      return fail('添加批注失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getCellComments(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var comments = [];
+      // 无批注保护：部分 WPS 版本 Comments 为 null 或访问 .Count 抛错，显式返回空列表
+      if (!sheet.Comments || !sheet.Comments.Count) return ok({ comments: [] });
+      for (var i = 1; i <= sheet.Comments.Count; i++) {
+        var c = sheet.Comments.Item(i);
+        comments.push({ cell: c.Parent.Address(), text: c.Text, author: c.Author || '' });
+      }
+      return ok({ comments: comments });
+    } catch (e) {
+      return fail('获取批注失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function deleteCellComment(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var rc = resolveRowCol(params && params.row, params && params.col);
+      if (!rc) return fail('无效的行/列参数: row=' + (params && params.row) + ' col=' + (params && params.col) + '（必须为正整数）');
+      sheet.Cells.Item(rc.row, rc.col).ClearComments();
+      return ok({});
+    } catch (e) {
+      return fail('删除批注失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function addConditionalFormat(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      // 前置校验：条件格式公式必填，避免 undefined 传参抛费解错误
+      if (!params || !params.formula) return fail('缺少 formula（条件格式判断公式）');
+      // FormatConditions.Add(Type=1 xlExpression, Operator=2 xlBetween, Formula1=1?, Formula2=formula)
+      var fc = range.FormatConditions.Add(1, 2, 1, params.formula);
+      // 颜色统一走 toExcelColor 转换
+      if (params.color !== undefined) {
+        var cc = toExcelColor(params.color);
+        if (cc === null) return fail('无效的条件格式颜色: ' + params.color + '，支持 #RRGGBB/RRGGBB/数字');
+        fc.Interior.Color = cc;
+      }
+      return ok({});
+    } catch (e) {
+      return fail('添加条件格式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function clearRange(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).Clear();
+      return ok({});
+    } catch (e) {
+      return fail('清除区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function clearFormats(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).ClearFormats();
+      return ok({});
+    } catch (e) {
+      return fail('清除格式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function findInSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var found = sheet.Cells.Find(params && (params.query || params.text));
+      if (found) {
+        return ok({ found: true, cell: found.Address(), value: found.Value2 });
+      }
+      return ok({ found: false });
+    } catch (e) {
+      return fail('查找失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function replaceInSheet(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      // findText 前置校验
+      if (!params || !params.findText) return fail('缺少 findText');
+      sheet.Cells.Replace(params.findText, params.replaceText);
+      return ok({});
+    } catch (e) {
+      return fail('替换失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setHyperlink(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var rc = resolveRowCol(params && params.row, params && params.col);
+      if (!rc) return fail('无效的行/列参数: row=' + (params && params.row) + ' col=' + (params && params.col) + '（必须为正整数）');
+      var cell = sheet.Cells.Item(rc.row, rc.col);
+      sheet.Hyperlinks.Add(cell, params && params.url);
+      if (params && params.text) cell.Value2 = params.text;
+      return ok({});
+    } catch (e) {
+      return fail('设置超链接失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setCellStyle(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      if (params && params.fontName) range.Font.Name = params.fontName;
+      if (params && params.fontSize) range.Font.Size = params.fontSize;
+      if (params && params.bold !== undefined) range.Font.Bold = params.bold;
+      // 与 setCellFormat 对齐：颜色统一走 toExcelColor 转换
+      if (params && params.fontColor !== undefined) {
+        var fc = toExcelColor(params.fontColor);
+        if (fc !== null) range.Font.Color = fc;
+      }
+      if (params && params.backgroundColor !== undefined) {
+        var bg = toExcelColor(params.backgroundColor);
+        if (bg !== null) range.Interior.Color = bg;
+      }
+      // 与 setCellFormat 对齐：对齐值统一走 resolveAlignment 转换
+      if (params && params.horizontalAlignment !== undefined) {
+        var hv = resolveAlignment(params.horizontalAlignment, H_ALIGN_MAP);
+        if (hv !== null) range.HorizontalAlignment = hv;
+      }
+      return ok({});
+    } catch (e) {
+      return fail('设置单元格样式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function calculateSheet() {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb);
+      if (!sheet) return fail('未找到工作表');
+      sheet.Calculate();
+      return ok({});
+    } catch (e) {
+      return fail('计算失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function wrapText(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).WrapText = true;
+      return ok({});
+    } catch (e) {
+      return fail('自动换行失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function lockCells(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).Locked = true;
+      return ok({});
+    } catch (e) {
+      return fail('锁定单元格失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function fillSeries(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      range.AutoFill(range.Resize((params && params.rowCount) || range.Rows.Count, (params && params.colCount) || range.Columns.Count));
+      return ok({});
+    } catch (e) {
+      return fail('填充序列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function copyRange(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var srcSheet = getExcelSheet(wb, params && (params.sourceSheet || params.sheet));
+      var dstSheet = getExcelSheet(wb, params && (params.targetSheet || params.sheet));
+      if (!srcSheet) return fail('未找到源工作表: ' + (params && (params.sourceSheet || params.sheet)));
+      if (!dstSheet) return fail('未找到目标工作表: ' + (params && (params.targetSheet || params.sheet)));
+      srcSheet.Range(params && (params.sourceRange || params.range)).Copy(dstSheet.Range(params && params.targetRange));
+      return ok({});
+    } catch (e) {
+      return fail('复制区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function pasteRange(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Paste(sheet.Range(params && params.targetRange));
+      return ok({});
+    } catch (e) {
+      return fail('粘贴失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function transpose(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var src = sheet.Range(params && params.range);
+      src.Copy();
+      var dst = sheet.Range(params && params.targetRange);
+      // xlPasteAll=-4104 是「粘贴全部」不是转置；转置需 PasteSpecial 第 4 参 Transpose=true（xlTranspose）
+      dst.PasteSpecial(-4104, false, false, true);
+      app.CutCopyMode = false;
+      return ok({});
+    } catch (e) {
+      return fail('转置失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function textToColumns(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      // TextToColumns(Destination, DataType, TextQualifier, ConsecutiveDelimiter, Tab, ...)
+      // DataType=xlDelimited=1，TextQualifier=xlTextQualifierDoubleQuote=1，ConsecutiveDelimiter=false，Tab=true
+      range.TextToColumns(range, 1, 1, false, true);
+      return ok({});
+    } catch (e) {
+      return fail('分列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function subtotal(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      range.Subtotal(1, -4157, range.Columns.Count, false, true, false);
+      return ok({});
+    } catch (e) {
+      return fail('分类汇总失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function consolidate(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      var sources = (params && params.sources) || [];
+      if (!Array.isArray(sources) || sources.length === 0) return fail('缺少 sources（待合并的区域列表）');
+      // function 显式校验（xlSum=4 默认），0/字符串非法显式 fail
+      var func = params && params.function !== undefined ? parseInt(params.function, 10) : 4;
+      if (isNaN(func) || func < 0) return fail('无效的合并函数: ' + (params && params.function));
+      range.Consolidate(sources, func);
+      return ok({});
+    } catch (e) {
+      return fail('合并计算失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function createPivotTable(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var pc = wb.PivotCaches().Create(1, sheet.Range(params && params.sourceRange));
+      var ptSheet = wb.Sheets.Add();
+      var pt = pc.CreatePivotTable(ptSheet.Range('A1'), (params && params.name) || 'PivotTable1');
+      if (params && params.rowField) pt.AddFields(params.rowField);
+      if (params && params.dataField) {
+        var df = pt.AddDataField(pt.PivotFields(params.dataField));
+        if (params.summarizeFunction !== undefined) df.Function = params.summarizeFunction;
+      }
+      return ok({});
+    } catch (e) {
+      return fail('创建数据透视表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function updatePivotTable(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var pt = sheet.PivotTables((params && params.name) || sheet.PivotTables(1).Name);
+      pt.RefreshTable();
+      return ok({});
+    } catch (e) {
+      return fail('更新透视表失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function createNamedRange(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      wb.Names.Add(params && params.name, wb.ActiveSheet.Range(params && params.range));
+      return ok({});
+    } catch (e) {
+      return fail('创建命名区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function getNamedRanges() {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var list = [];
+      for (var i = 1; i <= wb.Names.Count; i++) {
+        list.push({ name: wb.Names.Item(i).Name, range: wb.Names.Item(i).Value });
+      }
+      return ok({ namedRanges: list });
+    } catch (e) {
+      return fail('获取命名区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function deleteNamedRange(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      wb.Names.Item(params && params.name).Delete();
+      return ok({});
+    } catch (e) {
+      return fail('删除命名区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function groupRows(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var row = parseInt(params && params.row, 10);
+      if (isNaN(row) || row < 1) return fail('无效的行参数: ' + (params && params.row) + '（必须为正整数）');
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的行数: ' + (params && params.count));
+      var range = sheet.Range(row + ':' + (row + count - 1));
+      range.Group();
+      return ok({});
+    } catch (e) {
+      return fail('组合行失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function groupColumns(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var col = resolveColumnLetter(params && params.column);
+      // count 校验：必须为正整数
+      var count = parseInt(params && params.count, 10) || 1;
+      if (count < 1) return fail('无效的列数: ' + (params && params.count));
+      var colNum = colToNumber(params && params.column);
+      var endLetter = colToLetter(colNum + count - 1);
+      if (!col || !colNum || !endLetter) return fail('无效的列参数: ' + (params && params.column));
+      var range = sheet.Range(col + ':' + endLetter);
+      range.Group();
+      return ok({});
+    } catch (e) {
+      return fail('组合列失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function addDataValidation(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      var dv = range.Validation;
+      dv.Delete();
+      dv.Add(3, 1, 1, (params && params.formula1) || '', (params && params.formula2) || '');
+      return ok({});
+    } catch (e) {
+      return fail('添加数据验证失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setArrayFormula(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.range).FormulaArray = params && params.formula;
+      return ok({});
+    } catch (e) {
+      return fail('设置数组公式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setPrintArea(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.PageSetup.PrintArea = params && params.range;
+      return ok({});
+    } catch (e) {
+      return fail('设置打印区域失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function insertExcelImage(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var filePath = params && (params.path || params.imagePath);
+      if (!filePath) return invalidParam('缺少 path');
+      var pic = sheet.Shapes.AddPicture(filePath, false, true, (params && params.left) || 0, (params && params.top) || 0, (params && params.width) || -1, (params && params.height) || -1);
+      return ok({ name: pic.Name });
+    } catch (e) {
+      return fail('插入图片失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function exportChartAsImage(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var outputPath = params && (params.outputPath || params.path);
+      if (!outputPath) return invalidParam('缺少 outputPath');
+      var chartName = params && params.chartName;
+      if (!chartName) return invalidParam('缺少 chartName');
+      var format = ((params && params.format) || 'PNG').toUpperCase();
+      var filterName = format === 'JPEG' ? 'JPG' : format;
+      var chartObj = sheet.ChartObjects(chartName);
+      chartObj.Chart.Export(outputPath, filterName);
+      return ok({ chartName: chartName, outputPath: outputPath, format: filterName });
+    } catch (e) {
+      return fail('导出图表为图片失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function exportRangeAsImage(params) {
+    var tempChart = null;
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var outputPath = params && (params.outputPath || params.path);
+      if (!outputPath) return invalidParam('缺少 outputPath');
+      if (!params || !params.range) return invalidParam('缺少 range');
+      var format = ((params && params.format) || 'PNG').toUpperCase();
+      var filterName = format === 'JPEG' ? 'JPG' : format;
+      var range = sheet.Range(params.range);
+      range.CopyPicture(1, 2);
+      tempChart = sheet.ChartObjects().Add(0, 0, range.Width, range.Height);
+      tempChart.Activate();
+      tempChart.Chart.Paste();
+      tempChart.Chart.Export(outputPath, filterName);
+      tempChart.Delete();
+      tempChart = null;
+      return ok({ range: params.range, outputPath: outputPath, format: filterName });
+    } catch (e) {
+      if (tempChart) { try { tempChart.Delete(); } catch (ce) {} }
+      return fail('导出区域为图片失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function cleanData(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      // 清洗模式：trim=去首尾空白（默认，安全）；collapse=连续多空格折叠为单个；all=删除所有空白（激进，谨慎）
+      var mode = (params && params.mode) || 'trim';
+      var replaced = 0;
+      // 三模式统一用单元格级正则处理，不依赖 Range.Replace 的平台差异行为
+      // 1. 判断用**非全局正则**（.test 无 lastIndex）——带 g 的全局正则 .test() 会因 lastIndex 状态
+      //    导致相邻单元格交替漏判（经典 bug）
+      // 2. 替换用**每次新建的全局正则**——非全局正则 .replace 只替换第一处匹配，会漏掉同一单元格的后续匹配
+      var pattern = null;
+      var replacePattern = null;
+      if (mode === 'all') {
+        pattern = /[\s\u00a0]+/;
+        replacePattern = /[\s\u00a0]+/g;
+      } else if (mode === 'collapse') {
+        pattern = /[\t\n ]{2,}/;
+        replacePattern = /[\t\n ]{2,}/g;
+      } else {
+        // trim：仅去首尾空白
+        for (var i = 1; i <= range.Rows.Count; i++) {
+          for (var j = 1; j <= range.Columns.Count; j++) {
+            var cell = range.Cells.Item(i, j);
+            var v = cell.Value2;
+            if (typeof v === 'string') {
+              var t = v.replace(/^[\s\u00a0]+|[\s\u00a0]+$/g, '');
+              if (t !== v) { cell.Value2 = t; replaced++; }
+            }
+          }
+        }
+        return ok({ mode: mode, replaced: replaced });
+      }
+      for (var i = 1; i <= range.Rows.Count; i++) {
+        for (var j = 1; j <= range.Columns.Count; j++) {
+          var cell = range.Cells.Item(i, j);
+          var v = cell.Value2;
+          if (typeof v === 'string' && pattern.test(v)) {
+            cell.Value2 = v.replace(replacePattern, mode === 'all' ? '' : ' ');
+            replaced++;
+          }
+        }
+      }
+      return ok({ mode: mode, replaced: replaced });
+    } catch (e) {
+      return fail('清洗数据失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function copyFormat(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      sheet.Range(params && params.sourceRange).Copy();
+      sheet.Range(params && params.targetRange).PasteSpecial(-4122);
+      app.CutCopyMode = false;
+      return ok({});
+    } catch (e) {
+      return fail('复制格式失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function autoSum(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = getExcelSheet(wb, params && params.sheet);
+      if (!sheet) return fail('未找到工作表: ' + (params && params.sheet));
+      var range = sheet.Range(params && params.range);
+      range.Select();
+      var result;
+      if (typeof app.WorksheetFunction !== 'undefined' && app.WorksheetFunction.Sum) {
+        result = app.WorksheetFunction.Sum(range);
+      } else {
+        var cells = range.Cells;
+        var sum = 0;
+        for (var i = 1; i <= cells.Count; i++) {
+          var v = cells.Item(i).Value;
+          if (typeof v === 'number') sum += v;
+        }
+        result = sum;
+      }
+      return ok({ result: result });
+    } catch (e) {
+      return fail('自动求和失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function evaluateFormula(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var formula = params && params.formula;
+      var cell = (params && params.cell) || 'A1';
+      var sheet = wb.ActiveSheet;
+      if (typeof app.Evaluate === 'function') {
+        var result = app.Evaluate(formula);
+        return ok({ result: result });
+      }
+      var target = sheet.Range(cell);
+      var origFormula = target.Formula;
+      target.Formula = formula;
+      var value;
+      try {
+        value = target.Value;
+      } finally {
+        // 无论求值成功还是抛错，都必须恢复原公式，避免污染用户文档
+        target.Formula = origFormula;
+      }
+      return ok({ result: value });
+    } catch (e) {
+      return fail('公式计算失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function setZoom(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      // 显式数值转换 + 校验：字符串/NaN 会被 parseInt 拦截
+      var percent = parseInt(params && params.percent, 10);
+      if (isNaN(percent) || percent < 10 || percent > 400) return fail('缩放比例必须在10-400之间，当前值: ' + (params && params.percent));
+      app.ActiveWindow.Zoom = percent;
+      return ok({});
+    } catch (e) {
+      return fail('设置缩放失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function diagnoseFormula(params) {
+    try {
+      var app = getApplication();
+      var wb = app.ActiveWorkbook;
+      if (!wb) return fail('没有打开的工作簿');
+      var sheet = app.ActiveSheet;
+      var cell = sheet.Range(params && params.cell);
+      var value = cell.Value;
+      var formula = cell.Formula;
+      var errorType = null, diagnosis = '', suggestion = '';
+      var precedents = [];
+      if (typeof value === 'string' && value.charAt(0) === '#') {
+        errorType = value;
+        if (value === '#REF!') { diagnosis = '引用了不存在的单元格或区域'; suggestion = '检查引用区域是否被删除或移动'; }
+        else if (value === '#N/A') { diagnosis = '查找函数未找到匹配值'; suggestion = '确认查找值存在，或检查匹配条件'; }
+        else if (value === '#VALUE!') { diagnosis = '参数类型不正确或运算类型不匹配'; suggestion = '检查函数参数类型和引用单元格'; }
+        else if (value === '#NAME?') { diagnosis = '函数名或名称拼写错误'; suggestion = '检查函数名是否正确'; }
+        else if (value === '#DIV/0!') { diagnosis = '除数为零'; suggestion = '检查除数单元格，避免除以零'; }
+        else if (value === '#NUM!') { diagnosis = '数值无效或超出范围'; suggestion = '检查函数参数范围'; }
+        else if (value === '#NULL!') { diagnosis = '交集为空'; suggestion = '检查引用区域的交集是否存在'; }
+        else { diagnosis = '未知错误'; suggestion = '检查公式与引用'; }
+      }
+      try {
+        var refs = cell.DirectPrecedents;
+        if (refs) {
+          for (var i = 1; i <= refs.Areas.Count; i++) {
+            precedents.push(refs.Areas.Item(i).Address());
+          }
+        }
+      } catch (e) {}
+      return ok({ cell: params && params.cell, formula: formula, currentValue: value, errorType: errorType, diagnosis: diagnosis, suggestion: suggestion, precedents: precedents });
+    } catch (e) {
+      return fail('诊断公式失败: ' + (e && e.message ? e.message : e));
     }
   }
 
@@ -2908,6 +4675,9 @@ var WpsBridge = (function () {
     insertImage: insertImage,
     addComment: addComment,
     insertBookmark: insertBookmark,
+    getBookmarks: getBookmarks,
+    getComments: getComments,
+    insertHyperlink: insertHyperlink,
     insertHeader: insertHeader,
     insertFooter: insertFooter,
     generateTOC: generateTOC,
@@ -2923,12 +4693,102 @@ var WpsBridge = (function () {
     // 通用文件
     save: save,
     saveAs: saveAs,
+    convertToPDF: convertToPDF,
+    getDocumentStats: getDocumentStats,
     openFile: openFile,
 
     // 表格/演示
     getActiveWorkbook: getActiveWorkbook,
     getCellValue: getCellValue,
     setCellValue: setCellValue,
+
+    // Excel（WPS 表格）方法 —— 参见 poll.js POLL_ACTION_MAP Excel 段
+    getOpenWorkbooks: getOpenWorkbooks,
+    switchWorkbook: switchWorkbook,
+    openWorkbook: openWorkbook,
+    createWorkbook: createWorkbook,
+    closeWorkbook: closeWorkbook,
+    getSheetList: getSheetList,
+    switchSheet: switchSheet,
+    renameSheet: renameSheet,
+    createSheet: createSheet,
+    deleteSheet: deleteSheet,
+    copySheet: copySheet,
+    moveSheet: moveSheet,
+    getRangeData: getRangeData,
+    setRangeData: setRangeData,
+    setFormula: setFormula,
+    getFormula: getFormula,
+    getContext: getContext,
+    getSelection: getSelection,
+    sortRange: sortRange,
+    autoFilter: autoFilter,
+    createChart: createChart,
+    updateChart: updateChart,
+    removeDuplicates: removeDuplicates,
+    setBorder: setBorder,
+    setCellFormat: setCellFormat,
+    setNumberFormat: setNumberFormat,
+    setColumnWidth: setColumnWidth,
+    setRowHeight: setRowHeight,
+    autoFitColumn: autoFitColumn,
+    autoFitRow: autoFitRow,
+    autoFitAll: autoFitAll,
+    insertRows: insertRows,
+    deleteRows: deleteRows,
+    insertColumns: insertColumns,
+    deleteColumns: deleteColumns,
+    hideRows: hideRows,
+    hideColumns: hideColumns,
+    showRows: showRows,
+    showColumns: showColumns,
+    mergeCells: mergeCells,
+    unmergeCells: unmergeCells,
+    freezePanes: freezePanes,
+    unfreezePanes: unfreezePanes,
+    protectSheet: protectSheet,
+    unprotectSheet: unprotectSheet,
+    protectWorkbook: protectWorkbook,
+    addCellComment: addCellComment,
+    getCellComments: getCellComments,
+    deleteCellComment: deleteCellComment,
+    addConditionalFormat: addConditionalFormat,
+    clearRange: clearRange,
+    clearFormats: clearFormats,
+    findInSheet: findInSheet,
+    replaceInSheet: replaceInSheet,
+    setHyperlink: setHyperlink,
+    setCellStyle: setCellStyle,
+    calculateSheet: calculateSheet,
+    wrapText: wrapText,
+    lockCells: lockCells,
+    fillSeries: fillSeries,
+    copyRange: copyRange,
+    pasteRange: pasteRange,
+    transpose: transpose,
+    textToColumns: textToColumns,
+    subtotal: subtotal,
+    consolidate: consolidate,
+    createPivotTable: createPivotTable,
+    updatePivotTable: updatePivotTable,
+    createNamedRange: createNamedRange,
+    getNamedRanges: getNamedRanges,
+    deleteNamedRange: deleteNamedRange,
+    groupRows: groupRows,
+    groupColumns: groupColumns,
+    addDataValidation: addDataValidation,
+    setArrayFormula: setArrayFormula,
+    setPrintArea: setPrintArea,
+    insertExcelImage: insertExcelImage,
+    exportChartAsImage: exportChartAsImage,
+    exportRangeAsImage: exportRangeAsImage,
+    cleanData: cleanData,
+    copyFormat: copyFormat,
+    autoSum: autoSum,
+    evaluateFormula: evaluateFormula,
+    setZoom: setZoom,
+    diagnoseFormula: diagnoseFormula,
+
     getActivePresentation: getActivePresentation,
 
     // 通用方法（wps_execute_method 白名单路径）
