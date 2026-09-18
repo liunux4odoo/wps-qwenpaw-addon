@@ -407,6 +407,25 @@
     setSlideTheme: '设置幻灯片主题'
   };
 
+  // P24：连续相同反馈折叠（如批量 setCellValue 40 次只显示一条「✅ 写入单元格 ×40」），
+  // 消除刷屏；仅当上一条反馈仍是容器最后一条消息（无后续消息插入）时折叠，否则新建一条；
+  // 元素被清除/切换文档（parentNode 为空）时自动重置。
+  var lastFeedbackText = null;
+  var lastFeedbackEl = null;
+  var lastFeedbackCount = 0;
+  function addFeedback(text) {
+    if (text === lastFeedbackText && lastFeedbackEl && lastFeedbackEl.parentNode
+        && lastFeedbackEl.nextElementSibling === null) {
+      lastFeedbackCount++;
+      lastFeedbackEl.textContent = text + ' ×' + lastFeedbackCount;
+      return lastFeedbackEl;
+    }
+    lastFeedbackText = text;
+    lastFeedbackCount = 1;
+    lastFeedbackEl = ChatUi.addMessage('system', text);
+    return lastFeedbackEl;
+  }
+
   function onPollCommand(action, params) {
     QPLog('poll', '收到命令 action=' + action + ' params=' + JSON.stringify(params).slice(0, 300));
     var t0 = Date.now();
@@ -435,9 +454,9 @@
         if (result && result.success) {
           var summary = result.data && result.data.summary ? result.data.summary : '';
           var detail = result.data && result.data.count !== undefined ? '（' + result.data.count + ' 处）' : '';
-          ChatUi.addMessage('system', '✅ ' + FEEDBACK_ACTIONS[action] + (summary ? '：' + summary : '') + detail);
+          addFeedback('✅ ' + FEEDBACK_ACTIONS[action] + (summary ? '：' + summary : '') + detail);
         } else {
-          ChatUi.addMessage('system', '❌ ' + FEEDBACK_ACTIONS[action] + '失败：' + ((result && result.error) || '未知错误'));
+          addFeedback('❌ ' + FEEDBACK_ACTIONS[action] + '失败：' + ((result && result.error) || '未知错误'));
         }
         schedulePersist();
       } catch (e) {}
