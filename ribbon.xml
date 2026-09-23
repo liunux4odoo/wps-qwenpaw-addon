@@ -2,10 +2,14 @@
 <customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
   <ribbon startFromScratch="false">
     <tabs>
-      <tab id="qwenpawTab" label="QwenPaw AI" insertAfterMso="TabHome">
-        <group id="qwenpawMain" label="AI 助手">
+      <!-- 方案B：去掉自定义 tab「QwenPaw AI」，改为在内置「开始」标签下放一个大按钮。
+           WPS CustomUI 标准中 tab 元素没有 onAction 点击回调（点标签本身不触发任何 JS），
+           因此把入口收敛为一个 label="QwenPaw AI" 的大按钮，点击即展开侧边栏。
+           注：按钮必须位于 group 内、group 必须位于 tab 内（customUI schema 约束）。 -->
+      <tab idMso="TabHome">
+        <group id="qwenpawGroup" label="QwenPaw AI">
           <button id="btnShowTaskPane"
-                  label="AI 侧边栏"
+                  label="QwenPaw AI"
                   size="large"
                   onAction="OnShowTaskPane"
                   imageMso="Addins"
