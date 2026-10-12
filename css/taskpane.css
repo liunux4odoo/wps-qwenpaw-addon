@@ -402,6 +402,52 @@ html, body {
     word-break: break-all;
 }
 
+/* ── wps skill 安装入口（plan-2026-10-12）：当前 agent 的 skill 状态行 + 安装按钮 ── */
+.skill-status-row {
+    margin-top: 2px;
+}
+
+.skill-status-text {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: #555;
+    line-height: 1.4;
+    word-break: break-all;
+}
+
+.skill-status-text.ready {
+    color: #2e7d32;
+}
+
+.skill-status-text.loading {
+    color: #888;
+}
+
+.skill-status-text.error {
+    color: #c0392b;
+}
+
+.skill-install-btn {
+    flex-shrink: 0;
+    padding: 3px 12px;
+    border: none;
+    border-radius: 4px;
+    background: #2b579a;
+    color: #fff;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.skill-install-btn:hover {
+    background: #1e3f73;
+}
+
+.skill-install-btn:disabled {
+    background: #a0a0a0;
+    cursor: not-allowed;
+}
+
 .tool-status {
     font-size: 11px;
     color: #888;

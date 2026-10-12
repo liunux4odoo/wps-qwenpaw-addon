@@ -19,6 +19,8 @@ HTTP 端点（加载项侧 acp-client.js 使用）：
                                         "acpServer":...,"capabilities":{...}}（能力标志供前端适配，Phase 2）
   - GET  /agents                    -> {"agents":[{id,name,description}],"current":agent}（P3 agent/mode 列表）
   - POST /agent/set?agent=X         -> 切换 agent/mode（语义由 adapter 定：qwenpaw=重启子进程；opencode=记录选择，P3）
+  - GET  /skills?agent=X            -> 检测当前 agent 的 5 个 wps skill 安装/启用状态（plan-2026-10-12）
+  - POST /skills/install?agent=X    -> 为当前 agent 安装 5 个 wps skill（调用 ensure-wps-skills.py，幂等）
   - POST /acp/send?clientId=X       body=NDJSON ACP 请求（一行一条 JSON-RPC）-> 写 ACP server stdin
   - GET  /acp/poll?clientId=X       -> 该 clientId 的待下行 ACP 消息（JSONL，每行一条）
   - GET  /ui/*                      -> 加载项 UI 静态文件（CreateTaskPane 经此加载 taskpane.html，
@@ -50,6 +52,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import tempfile
 import time
 from collections import deque
@@ -92,6 +95,17 @@ POLL_PORT_OS_REPROBE = 60.0
 POLL_PORT_POOL_CAP = 64
 # 端口租期：client 超过该时长无任何 ACP 流量则视为失联，分配时回收其端口（防泄漏）。
 POLL_PORT_LEASE = 3600.0
+
+# ── wps skill 安装入口（docs/plan-2026-10-12-wps-skill-install-button.md）─────────────
+# bridge 直接调用 scripts/ensure-wps-skills.py（唯一判定源，不自行解析 skill.json）。
+# 超时预算：脚本内部单次 qwenpaw 调用 QWENPAW_TIMEOUT=60s；检测 1×agents list + 5×skills info，
+# 安装 5×(info+enable)，qwenpaw 冷启动慢，外层超时需明显大于单次 60s 上限。
+SKILLS_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "ensure-wps-skills.py"
+)
+SKILLS_CHECK_TIMEOUT = 120.0   # GET /skills 检测（最坏 6 次 qwenpaw 调用，qwenpaw 冷启动慢）
+SKILLS_INSTALL_TIMEOUT = 300.0 # POST /skills/install（最坏 10 次 qwenpaw 调用）
+SKILLS_SUPPORTED_SERVERS = ("qwenpaw",)  # ensure-wps-skills.py 只走 qwenpaw CLI（opencode 不适用）
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -467,6 +481,116 @@ class AcpBridge:
             else:
                 self._agents_failed_at = time.monotonic()
             return list(agents)
+
+    # ── wps skill 安装入口（plan-2026-10-12 §4）───────────────────────
+    # 直接调用 scripts/ensure-wps-skills.py（唯一判定源），bridge 不实现判定逻辑。
+    # 返回 (rc, stdout, stderr)：rc=None 表示脚本未能执行（超时/找不到/异常）。
+    async def _run_ensure_wps_skills(self, agent_id: str, check_only: bool):
+        """执行 ensure-wps-skills.py，返回 (exit_code|None, stdout, stderr)。"""
+        cmd = [sys.executable, SKILLS_SCRIPT, "--agent-id", agent_id, "--json"]
+        if check_only:
+            cmd.append("--check-only")
+        timeout = SKILLS_CHECK_TIMEOUT if check_only else SKILLS_INSTALL_TIMEOUT
+        log.info("skills %s agent=%s: %s", "check" if check_only else "install", agent_id, " ".join(cmd))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(os.environ, PYTHONUNBUFFERED="1"),
+            )
+        except FileNotFoundError as e:
+            return None, "", f"找不到 ensure-wps-skills.py：{e}"
+        except Exception as e:
+            return None, "", f"执行 ensure-wps-skills.py 失败：{e}"
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return None, "", f"ensure-wps-skills.py 执行超时（>{int(timeout)}s）"
+        return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+    def _skills_supported(self) -> bool:
+        """ensure-wps-skills.py 只支持 qwenpaw server（opencode 的 wps skill 不由此管理）。"""
+        return self.adapter.name in SKILLS_SUPPORTED_SERVERS
+
+    async def _http_skills_check(self, writer, agent: str) -> None:
+        """GET /skills?agent=X：检测当前 agent 的 5 个 wps skill 状态。"""
+        if not self._skills_supported():
+            await self._http_json(writer, 400, {
+                "ok": False, "error": f"当前 ACP server 为 {self.adapter.name}，wps skill 仅支持 qwenpaw",
+            })
+            return
+        if not agent:
+            await self._http_json(writer, 400, {"ok": False, "error": "缺少 agent 参数"})
+            return
+        rc, out, err = await self._run_ensure_wps_skills(agent, check_only=True)
+        if rc is None:
+            await self._http_json(writer, 502, {"ok": False, "error": err})
+            return
+        if rc in (1, 2):
+            # 用法/配置错误 或 qwenpaw CLI 失败：检测本身失败（无 missing 语义）
+            await self._http_json(writer, 502, {
+                "ok": False, "exit_code": rc, "error": (err or out).strip() or "wps skill 检测失败",
+            })
+            return
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            await self._http_json(writer, 502, {"ok": False, "error": "ensure-wps-skills.py 输出无法解析"})
+            return
+        skills = data.get("skills", {})
+        await self._http_json(writer, 200, {
+            "ok": True,
+            "agent": agent,
+            "missing": data.get("missing", []),
+            "installed": [n for n, r in skills.items() if r.get("status") == "ok"],
+            "detail": {
+                n: {"installed": bool(r.get("installed")), "enabled": bool(r.get("enabled")), "path": r.get("path")}
+                for n, r in skills.items()
+            },
+            "exit_code": rc,
+            "summary": data.get("summary", {}),
+        })
+
+    async def _http_skills_install(self, writer, agent: str) -> None:
+        """POST /skills/install?agent=X：为当前 agent 安装 5 个 wps skill（幂等）。"""
+        if not self._skills_supported():
+            await self._http_json(writer, 400, {
+                "ok": False, "error": f"当前 ACP server 为 {self.adapter.name}，wps skill 仅支持 qwenpaw",
+            })
+            return
+        if not agent:
+            await self._http_json(writer, 400, {"ok": False, "error": "缺少 agent 参数"})
+            return
+        rc, out, err = await self._run_ensure_wps_skills(agent, check_only=False)
+        if rc is None:
+            await self._http_json(writer, 502, {"ok": False, "error": err})
+            return
+        if rc in (1, 2):
+            await self._http_json(writer, 502, {
+                "ok": False, "exit_code": rc, "error": (err or out).strip() or "wps skill 安装失败（配置/环境错误）",
+            })
+            return
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            await self._http_json(writer, 502, {"ok": False, "error": "ensure-wps-skills.py 输出无法解析"})
+            return
+        await self._http_json(writer, 200, {
+            "ok": bool(data.get("ok")),
+            "exit_code": rc,
+            "agent": agent,
+            "summary": data.get("summary", {}),
+            "skills": data.get("skills", {}),
+        })
 
     async def switch_server(self, name: str) -> tuple[bool, str]:
         """Phase 3（plan-2026-09-05 §7）：运行时切换 ACP server adapter。
@@ -929,6 +1053,12 @@ class AcpBridge:
                     "agent": self.agent,
                     "error": err or None,
                 })
+            elif path == "/skills" and method == "GET":
+                # wps skill 检测（plan-2026-10-12）：当前 agent 的 5 个 wps skill 安装/启用状态
+                await self._http_skills_check(writer, query_params.get("agent", ""))
+            elif path == "/skills/install" and method == "POST":
+                # wps skill 安装（plan-2026-10-12）：为当前 agent 安装 5 个 wps skill（幂等）
+                await self._http_skills_install(writer, query_params.get("agent", ""))
             elif path == "/poll-port/allocate" and method == "POST":
                 port = self._allocate_port(client_id)
                 if port is not None:

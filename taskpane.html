@@ -49,6 +49,13 @@
             </div>
             <div id="capabilityNotes" class="capability-notes"></div>
 
+            <!-- wps skill 安装入口（plan-2026-10-12）：当前 agent 的 wps skill 状态 + 安装按钮 -->
+            <div id="skillStatusRow" class="settings-row skill-status-row" style="display:none">
+                <span id="skillStatusText" class="skill-status-text"></span>
+                <button id="skillInstallBtn" class="skill-install-btn" style="display:none"
+                        title="为当前 agent 安装 5 个 wps skill">安装</button>
+            </div>
+
             <!-- P22：提示词模板管理（设置面板内，纯前端 localStorage） -->
             <div class="settings-row settings-title-row"><span class="settings-title">提示词模板</span></div>
             <div id="promptList" class="prompt-list"></div>

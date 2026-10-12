@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ensure-wps-skills.py 单元测试 — 覆盖 docs/plan-2026-09-07 §5 边界表 12 个场景
-（原 10 + v2 新增 #11 缺块升级重装 / #12 源已含块幂等）。
+"""ensure-wps-skills.py 单元测试 — 覆盖 docs/plan-2026-09-07 §5 边界表 + plan-2026-10-12
+（--check-only 检测 + 升级覆盖语义）。
 
 用法：
   conda run -n py312 python scripts/test_ensure_wps_skills.py
@@ -13,8 +13,12 @@ v2（2026-09-07 降级要求）额外覆盖：
 - 首次安装后每份 SKILL.md 末尾含「环境检查与降级要求」块，且只有一份；
 - transform 幂等：源已含块不重复追加（#12）；
 - 已安装但缺降级块 → 重新复制（#11），其余 skill 不动；
-- 含降级块但内容不一致 → 报告差异不覆盖（#10，transform 后基准）；
 - 源目录不被修改。
+
+2026-10-12（plan-2026-10-12）升级覆盖语义：
+- 含降级块但内容不一致（源更新）→ 不再"只报告"，改为重新复制覆盖（#10 语义解除）；
+- --check-only：只检测不落盘，missing 数组区分未安装 / 缺降级块 / 源已更新；
+- 退出码：0=全就位，3=部分缺失，4=全部缺失。
 
 fake-qwenpaw 行为与真实 qwenpaw 对齐（2026-09-07 实机核实）：
 - `agents list`：读 data_root/agents.json，输出 JSON {"agents": [{id, workspace_dir, ...}]}
@@ -296,8 +300,8 @@ def test_idempotent():
     check("第三次仍 0", rc3 == 0, "rc={}".format(rc3))
 
 
-def test_content_diff_no_overwrite():
-    print("## 边界10：含降级块但内容不一致 → 报告差异但不覆盖（transform 后基准）")
+def test_content_diff_overwrites():
+    print("## 边界10：含降级块但内容不一致（源更新）→ 重新复制覆盖（2026-10-12 升级语义）")
     tmp = new_tmp()
     src_root, ws = setup(tmp)
     run_script(tmp, "test-agent")
@@ -310,9 +314,8 @@ def test_content_diff_no_overwrite():
         f.write(tampered)
     rc, out, _ = run_script(tmp, "test-agent")
     check("退出码 0", rc == 0, "rc={}".format(rc))
-    check("报告差异", "内容不一致" in out, out.strip())
     with open(target) as f:
-        check("未覆盖", f.read() == tampered)
+        check("已覆盖回源基准", f.read() == content)
     check("skill 仍 enabled",
           read_skill_json(tmp, "test-agent")["skills"]["wps-word"]["enabled"] is True)
 
@@ -451,6 +454,74 @@ def test_unexpected_info_failure():
     os.environ.pop("QP_FAKE_FAIL_INFO", None)
 
 
+def test_check_only_all_missing():
+    print("## 边界13：--check-only 全新 agent → missing 全 5，exit 4，不落盘")
+    tmp = new_tmp()
+    setup(tmp)
+    rc, out, _ = run_script(tmp, "test-agent", ["--check-only", "--json"])
+    data = json.loads(out)
+    check("exit_code=4", data.get("exit_code") == 4, "exit={}".format(data.get("exit_code")))
+    check("missing 全 5", sorted(data.get("missing", [])) == sorted(EXPECTED_SKILLS),
+          str(data.get("missing")))
+    ws = os.path.join(tmp, "qdata", "workspaces", "test-agent")
+    check("未落盘 skills 目录", not os.path.exists(os.path.join(ws, "skills")))
+    check("无 skill.json", read_skill_json(tmp, "test-agent") is None)
+
+
+def test_check_only_all_ok():
+    print("## 边界14：--check-only 已全装 → missing 空，exit 0")
+    tmp = new_tmp()
+    setup(tmp)
+    run_script(tmp, "test-agent")
+    rc, out, _ = run_script(tmp, "test-agent", ["--check-only", "--json"])
+    data = json.loads(out)
+    check("exit_code=0", data.get("exit_code") == 0, "exit={}".format(data.get("exit_code")))
+    check("missing 空", data.get("missing") == [], str(data.get("missing")))
+    check("summary.ok=5", data.get("summary", {}).get("ok") == 5, str(data.get("summary")))
+
+
+def test_check_only_stale():
+    print("## 边界15：--check-only 源更新（含块但内容不一致）→ missing 该 skill + 提示重装")
+    tmp = new_tmp()
+    src_root, ws = setup(tmp)
+    run_script(tmp, "test-agent")
+    target = os.path.join(ws, "skills", "wps-ppt", "SKILL.md")
+    with open(target) as f:
+        content = f.read()
+    tampered = content.replace("# wps-ppt", "# tampered")
+    with open(target, "w") as f:
+        f.write(tampered)
+    rc, out, _ = run_script(tmp, "test-agent", ["--check-only", "--json"])
+    data = json.loads(out)
+    check("exit_code=3（部分缺失）", data.get("exit_code") == 3, "exit={}".format(data.get("exit_code")))
+    check("missing 含 wps-ppt", data.get("missing") == ["wps-ppt"], str(data.get("missing")))
+    msg = data.get("skills", {}).get("wps-ppt", {}).get("message", "")
+    check("message 提示源已更新", "源已更新" in msg and "可重装" in msg, msg)
+    check("检测不覆盖（内容仍是 tampered）", "tampered" in open(target).read())
+    check("检测不改 enable 状态（保持安装时的 enabled=true）",
+          read_skill_json(tmp, "test-agent")["skills"]["wps-ppt"]["enabled"] is True)
+
+
+def test_check_only_missing_block():
+    print("## 边界16：--check-only 缺降级块 → 区分提示，非「源已更新」")
+    tmp = new_tmp()
+    src_root, ws = setup(tmp)
+    run_script(tmp, "test-agent")
+    src_md = os.path.join(src_root, "wps-office", "SKILL.md")
+    dst_md = os.path.join(ws, "skills", "wps-office", "SKILL.md")
+    with open(src_md) as f:
+        raw = f.read()
+    with open(dst_md, "w") as f:
+        f.write(raw)  # 源原样：缺降级块
+    rc, out, _ = run_script(tmp, "test-agent", ["--check-only", "--json"])
+    data = json.loads(out)
+    check("exit_code=3", data.get("exit_code") == 3, "exit={}".format(data.get("exit_code")))
+    check("missing 含 wps-office", data.get("missing") == ["wps-office"], str(data.get("missing")))
+    msg = data.get("skills", {}).get("wps-office", {}).get("message", "")
+    check("message 提示缺降级块", "缺少降级块" in msg, msg)
+    check("非「源已更新」", "源已更新" not in msg, msg)
+
+
 def test_json_output():
     print("## 附加：--json 输出机器可读摘要")
     tmp = new_tmp()
@@ -482,7 +553,7 @@ def main():
         test_working_dir_unresolvable,
         test_enable_failure,
         test_idempotent,
-        test_content_diff_no_overwrite,
+        test_content_diff_overwrites,
         test_source_untouched,
         test_missing_block_upgrade,
         test_source_has_block,
@@ -490,6 +561,10 @@ def main():
         test_dry_run_recopy_enabled,
         test_dry_run,
         test_unexpected_info_failure,
+        test_check_only_all_missing,
+        test_check_only_all_ok,
+        test_check_only_stale,
+        test_check_only_missing_block,
         test_json_output,
     ]
     for t in tests:

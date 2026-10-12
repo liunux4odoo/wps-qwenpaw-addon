@@ -12,8 +12,8 @@ enable` 启用（**不手动改 skill.json**）。
   skill 存在/启用状态由 `qwenpaw skills info` 判定，启用只调 `qwenpaw skills
   enable`。不手动解析 QWENPAW_WORKING_DIR、不手动改 skill.json。
 - **语义 = ensure**：不满足则补齐，满足则无操作；幂等。
-- **缺失则复制**：SKILL.md 缺失才复制；按「源 + 降级块」基准对比，内容不一致 →
-  报告差异但不覆盖（已知限制，升级覆盖语义需单独决策）。
+- **缺失或源更新则复制**：SKILL.md 缺失、缺降级块，或与「源 + 降级块」基准内容不一致
+  （源更新）→ 重新复制覆盖（2026-10-12 定案：升级覆盖语义，§5 #10 限制解除）。
 - **安装期 transform（v2）**：复制 SKILL.md 时统一追加「环境检查与降级要求」块
   （标准文案见 docs/plan §12）。只写目标目录，源 submodule 保持原样。已安装但
   缺降级块 → 视为未装好，重新复制（升级，§5 #11）；源或目标已含降级块则跳过
@@ -23,7 +23,7 @@ enable` 启用（**不手动改 skill.json**）。
 
 用法：
   python scripts/ensure-wps-skills.py --agent-id <ID> [--source-dir <DIR>]
-      [--qwenpaw <PATH>] [--json] [--dry-run]
+      [--qwenpaw <PATH>] [--json] [--dry-run] [--check-only]
 
 退出码契约（冻结，bridge 依赖）：
   0  全部就位（本次无操作，或补齐成功；输出 summary 区分 repaired）
@@ -32,6 +32,12 @@ enable` 启用（**不手动改 skill.json**）。
   2  qwenpaw CLI 调用失败：agents list / 版本探测等环境问题
   3  部分失败：部分 skill 复制/启用失败（其余已就位）
   4  完全失败：需要处理的 skill 全部失败
+
+--check-only（只检测不落盘，plan-2026-10-12 §4.3 路径 X）：
+  不复制、不 enable，只判定 5 个 wps skill 是否已安装且启用。
+  输出与 --json 同构，另含 missing 数组（未就位的 skill 名）。
+  退出码语义沿用：0=全部就位；3=部分缺失；4=全部缺失。
+  1/2 与正常模式含义相同（配置错误 / qwenpaw CLI 失败）。
 """
 import argparse
 import filecmp
@@ -116,6 +122,8 @@ def parse_args(argv):
     )
     p.add_argument("--json", action="store_true", help="输出机器可读 JSON 摘要（bridge 友好）")
     p.add_argument("--dry-run", action="store_true", help="只报告将要执行的动作，不实际改动")
+    p.add_argument("--check-only", action="store_true",
+                   help="只检测不落盘：判定 5 个 wps skill 是否已安装且启用（plan-2026-10-12 路径 X）")
     return p.parse_args(argv)
 
 
@@ -259,15 +267,19 @@ def has_degradation_block(md_path):
         return False
 
 
-def skill_needs_install(dst_skill_md):
-    """SKILL.md 缺失，或已安装但缺降级块 → 需要（重新）复制（§5 #11）。
+def skill_needs_install(skill_dir, workspace_dir, skill):
+    """SKILL.md 缺失、缺降级块，或与「源 + transform」基准不一致 → 需要（重新）复制。
 
-    已含完整降级块视为「按 transform 基准已安装」；其余内容不一致不触发重装
-    （已知限制，只报告不覆盖，§5 #10）。
+    升级覆盖语义（2026-10-12 定案）：源内容比目标新（内容不一致）不再只是报告，
+    而是触发重装覆盖（§5 #10 的限制解除）。已含完整降级块但正文与源不一致同样视为
+    需要重装（collect_diffs 覆盖）。
     """
+    dst_skill_md = os.path.join(workspace_dir, "skills", skill, "SKILL.md")
     if not os.path.isfile(dst_skill_md):
         return True
-    return not has_degradation_block(dst_skill_md)
+    if not has_degradation_block(dst_skill_md):
+        return True
+    return bool(collect_diffs(skill_dir, workspace_dir, skill))
 
 
 def copy_skill_files(skill_dir, dst_dir):
@@ -291,9 +303,11 @@ def copy_skill_files(skill_dir, dst_dir):
 
 
 def collect_diffs(skill_dir, workspace_dir, skill):
-    """对比目标与「源 + transform」基准，返回不一致的文件名（不覆盖，§5 #10）。
+    """对比目标与「源 + transform」基准，返回不一致的文件名。
 
     SKILL.md 的基准 = 源内容 + 降级块（transform 后预期内容）。
+    2026-10-12 起不一致会触发重装覆盖（skill_needs_install 判 True）；此处仍保留
+    独立函数，供 dry-run / 检测 / 报告区分「哪几个文件不一致」。
     """
     diffs = []
     for fn in SKILL_FILES:
@@ -323,14 +337,14 @@ def ensure_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir, dry_run):
     """
     dst_dir = os.path.join(workspace_dir, "skills", skill)
     dst_skill_md = os.path.join(dst_dir, "SKILL.md")
-    need_install = skill_needs_install(dst_skill_md)
+    need_install = skill_needs_install(skill_dir, workspace_dir, skill)
 
     if dry_run:
         if need_install:
             if not os.path.isfile(dst_skill_md):
                 kind = "copy+enable"
             else:
-                # 升级场景（缺降级块）：查询启用态，输出与实际运行一致的动作
+                # 升级场景（缺降级块 / 源内容不一致）：查询启用态，输出与实际运行一致的动作
                 try:
                     info = skill_info(cmd, agent_id, skill)
                     kind = "re-copy" if info["enabled"] else "re-copy+enable"
@@ -407,6 +421,67 @@ def ensure_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir, dry_run):
     }
 
 
+def check_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir):
+    """只检测不落盘（--check-only）：判定 skill 是否已安装且启用（plan-2026-10-12 路径 X）。
+
+    返回 {"status", "installed", "enabled", "path", "message"}：
+      status 取 "ok"（已安装且启用）或 "missing"（未就位，原因见 message）。
+    升级覆盖语义（2026-10-12）：源与目标内容不一致（源更新）→ 视为 missing，提示重装。
+    复用 skill_info + has_degradation_block + collect_diffs，不复制、不 enable、不改文件。
+    """
+    dst_skill_md = os.path.join(workspace_dir, "skills", skill, "SKILL.md")
+    installed = os.path.isfile(dst_skill_md)
+    if not installed:
+        return {
+            "status": "missing",
+            "installed": False,
+            "enabled": False,
+            "path": None,
+            "message": "未安装",
+        }
+    if not has_degradation_block(dst_skill_md):
+        info = skill_info(cmd, agent_id, skill)
+        return {
+            "status": "missing",
+            "installed": True,
+            "enabled": bool(info["enabled"]),
+            "path": info["path"],
+            "message": "缺少降级块（旧版安装），可重装",
+        }
+    info = skill_info(cmd, agent_id, skill)
+    if not info["exists"]:
+        return {
+            "status": "missing",
+            "installed": True,
+            "enabled": False,
+            "path": info["path"],
+            "message": "磁盘存在但 qwenpaw 未识别该 skill",
+        }
+    if collect_diffs(skill_dir, workspace_dir, skill):
+        return {
+            "status": "missing",
+            "installed": True,
+            "enabled": bool(info["enabled"]),
+            "path": info["path"],
+            "message": "源已更新（内容不一致），可重装",
+        }
+    if not info["enabled"]:
+        return {
+            "status": "missing",
+            "installed": True,
+            "enabled": False,
+            "path": info["path"],
+            "message": "已安装但未启用",
+        }
+    return {
+        "status": "ok",
+        "installed": True,
+        "enabled": True,
+        "path": info["path"],
+        "message": "已就位",
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -437,6 +512,57 @@ def main(argv=None):
     except UsageError as e:
         print("ensure-wps-skills: 错误: {}".format(e), file=sys.stderr)
         return EXIT_USAGE
+
+    # ── --check-only：只检测不落盘（plan-2026-10-12 §4.3 路径 X） ──
+    if args.check_only:
+        results = {}
+        for skill, skill_dir in skills.items():
+            try:
+                results[skill] = check_one_skill(cmd, agent_id, workspace_dir, skill, skill_dir)
+            except (QwenpawError, OSError) as e:
+                results[skill] = {
+                    "status": "missing",
+                    "installed": False,
+                    "enabled": False,
+                    "path": None,
+                    "message": str(e),
+                }
+        missing = [name for name, r in results.items() if r["status"] != STATUS_OK]
+        summary = {
+            "total": len(results),
+            "ok": sum(1 for r in results.values() if r["status"] == STATUS_OK),
+            "missing": len(missing),
+        }
+        all_ok = len(missing) == 0
+
+        if args.json:
+            print(json.dumps({
+                "ok": all_ok,
+                "exit_code": EXIT_OK if all_ok else (
+                    EXIT_FAIL if summary["ok"] == 0 else EXIT_PARTIAL
+                ),
+                "agent_id": agent_id,
+                "workspace_dir": workspace_dir,
+                "source_dir": args.source_dir,
+                "check_only": True,
+                "missing": missing,
+                "skills": results,
+                "summary": summary,
+            }, ensure_ascii=False, indent=2))
+        else:
+            print("agent_id={} workspace={} (check-only)".format(agent_id, workspace_dir))
+            for skill, r in results.items():
+                print("  {:<16} {:<9} {}".format(skill, r["status"], r.get("message", "")))
+            print(
+                "summary: total={total} ok={ok} missing={missing}".format(**summary)
+            )
+            print("missing: {}".format(", ".join(missing) if missing else "(none)"))
+
+        if all_ok:
+            return EXIT_OK
+        if summary["ok"] == 0:
+            return EXIT_FAIL
+        return EXIT_PARTIAL
 
     results = {}
     for skill, skill_dir in skills.items():

@@ -41,7 +41,9 @@
           populateAgentSelect(el, S.agentList, target);
           if (S.agentCached && S.agentCached !== cur) {
             QPLog('P3', '上次选择 agent=' + S.agentCached + ' 与 bridge 当前=' + cur + ' 不一致，请求切换');
-            switchAgent(S.agentCached);
+            switchAgent(S.agentCached); // 切换成功后由 switchAgent 触发 skill 检测
+          } else {
+            checkWpsSkills(target); // 侧边栏加载完成 → 检测当前 agent 的 wps skill 状态
           }
         } catch (e) { fail('解析失败'); }
       };
@@ -115,6 +117,7 @@
           ChatUi.addMessage('system', '已选择 mode「' + agentId + '」，将在下次会话生效');
         }
         updateSendAvailability();
+        checkWpsSkills(agentId); // 切换成功 → 检测新 agent 的 wps skill 状态
         return;
       }
       // 版本倾斜防护：bridge 是 opencode 但未下发 switchSemantics（旧 bridge）→ mode 切换不会真正
@@ -138,9 +141,125 @@
       ChatUi.showEmptyHint();
       if (S.acpState === 'connected') ensureSession();
       updateSendAvailability(); // P21：agent 切换重建中会话未建 → 发送按钮禁用
+      checkWpsSkills(agentId); // 切换成功 → 检测新 agent 的 wps skill 状态
     };
     xhr.onerror = function () {
       ChatUi.addMessage('error', 'agent 切换失败（bridge 不可达）');
+    };
+    xhr.send();
+  }
+
+  // ── wps skill 安装入口（plan-2026-10-12）──
+  // 检测当前 agent 的 5 个 wps skill 状态并更新设置面板行；仅 qwenpaw server 显示。
+  // 走 bridge /skills（GET 检测 / POST /skills/install 安装），bridge 复用 ensure-wps-skills.py，
+  // 前端不自行判定。检测 timeout 需盖过 5×skills info 冷启动（bridge SKILLS_CHECK_TIMEOUT=120s）。
+  var skillStatusEl = null;
+  var skillInstallBtn = null;
+
+  function skillStatusEls() {
+    if (!skillStatusEl) skillStatusEl = document.getElementById('skillStatusText');
+    if (!skillInstallBtn) skillInstallBtn = document.getElementById('skillInstallBtn');
+    return { text: skillStatusEl, btn: skillInstallBtn };
+  }
+
+  function setSkillRowVisible(show) {
+    var row = document.getElementById('skillStatusRow');
+    if (row) row.style.display = show ? '' : 'none';
+  }
+
+  function renderSkillError(msg) {
+    var els = skillStatusEls();
+    if (!els.text) return;
+    els.text.className = 'skill-status-text error';
+    els.text.textContent = msg;
+    if (els.btn) els.btn.style.display = 'none';
+  }
+
+  function checkWpsSkills(agentId) {
+    // opencode 的 wps skill 由 ~/.opencode/skills 管理，ensure-wps-skills.py 不适用 → 隐藏行
+    if (S.acpServerName !== 'qwenpaw' || !agentId) {
+      setSkillRowVisible(false);
+      return;
+    }
+    var els = skillStatusEls();
+    if (!els.text) return;
+    setSkillRowVisible(true);
+    els.text.className = 'skill-status-text loading';
+    els.text.textContent = 'wps skill 检测中…';
+    if (els.btn) els.btn.style.display = 'none';
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', 'http://127.0.0.1:8766/skills?agent=' + encodeURIComponent(agentId), true);
+    xhr.timeout = 120000;
+    xhr.onload = function () {
+      if (xhr.status !== 200) {
+        renderSkillError('wps skill 检测失败（HTTP ' + xhr.status + '）');
+        return;
+      }
+      try {
+        var r = JSON.parse(xhr.responseText);
+        if (!r.ok) { renderSkillError(r.error || 'wps skill 检测失败'); return; }
+        var missing = r.missing || [];
+        if (!missing.length) {
+          els.text.className = 'skill-status-text ready';
+          els.text.textContent = 'wps skill 已就绪';
+          if (els.btn) els.btn.style.display = 'none';
+        } else {
+          els.text.className = 'skill-status-text';
+          els.text.textContent = '当前 agent 缺少 ' + missing.join(' / ');
+          if (els.btn) {
+            els.btn.style.display = '';
+            els.btn.disabled = false;
+            els.btn.textContent = '安装';
+          }
+        }
+      } catch (e) { renderSkillError('wps skill 检测失败（解析错误）'); }
+    };
+    xhr.onerror = function () { renderSkillError('wps skill 检测失败（bridge 不可达）'); };
+    xhr.ontimeout = function () { renderSkillError('wps skill 检测超时'); };
+    xhr.send();
+  }
+
+  function installWpsSkills(agentId) {
+    var els = skillStatusEls();
+    if (!els.btn) return;
+    els.btn.disabled = true;
+    els.btn.textContent = '安装中…';
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', 'http://127.0.0.1:8766/skills/install?agent=' + encodeURIComponent(agentId), true);
+    xhr.timeout = 300000; // 5 skill 逐个 info+enable（bridge SKILLS_INSTALL_TIMEOUT=300s）
+    xhr.onload = function () {
+      if (xhr.status !== 200) {
+        els.btn.disabled = false;
+        els.btn.textContent = '安装';
+        ChatUi.addMessage('error', 'wps skill 安装失败（HTTP ' + xhr.status + '）');
+        return;
+      }
+      try {
+        var r = JSON.parse(xhr.responseText);
+        if (r.ok) {
+          QPLog('P3', 'wps skill 安装成功: ' + agentId);
+          checkWpsSkills(agentId); // 成功后刷新检测状态
+        } else {
+          els.btn.disabled = false;
+          els.btn.textContent = '安装';
+          ChatUi.addMessage('error', 'wps skill 安装失败：' + (r.error || ('exit_code=' + r.exit_code)));
+          checkWpsSkills(agentId);
+        }
+      } catch (e) {
+        els.btn.disabled = false;
+        els.btn.textContent = '安装';
+        ChatUi.addMessage('error', 'wps skill 安装失败（解析错误）');
+      }
+    };
+    xhr.onerror = function () {
+      els.btn.disabled = false;
+      els.btn.textContent = '安装';
+      ChatUi.addMessage('error', 'wps skill 安装失败（bridge 不可达）');
+    };
+    xhr.ontimeout = function () {
+      els.btn.disabled = false;
+      els.btn.textContent = '安装';
+      ChatUi.addMessage('error', 'wps skill 安装超时，请稍后重试');
     };
     xhr.send();
   }
@@ -309,6 +428,19 @@
         if (esel.value && S.acpSessionId) applyConfigOption('effort', esel.value);
       });
     }
+    // plan-2026-10-12：安装按钮 → 为当前选中 agent 安装 wps skill
+    var ibtn = document.getElementById('skillInstallBtn');
+    if (ibtn) {
+      ibtn.addEventListener('click', function () {
+        var sel = document.getElementById('agentSelect');
+        var agentId = (sel && sel.value) ? sel.value : S.agentCached;
+        if (!agentId) {
+          ChatUi.addMessage('error', '无当前 agent，无法安装 wps skill');
+          return;
+        }
+        installWpsSkills(agentId);
+      });
+    }
   }
 
   // 应用会话级配置（opencode set_config_option，V9：configOptions 只读不生效，只能 set）
@@ -349,4 +481,6 @@
   globalThis.loadServerList = loadServerList;
   globalThis.bindSettingsUI = bindSettingsUI;
   globalThis.bindClearButton = bindClearButton;
+  globalThis.checkWpsSkills = checkWpsSkills;
+  globalThis.installWpsSkills = installWpsSkills;
 })();
