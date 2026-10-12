@@ -934,17 +934,31 @@ var WpsBridge = (function () {
    * 开启/关闭修订模式（端口自 upstream proofread.ts enableTrackChangesHandler）
    * 上游断链修复（方案 plan-2026-10-12）：插件侧绕过 opencode-wps-linux 执行层，
    * 直连 WPS JSAPI `doc.TrackRevisions`。契约：data 含 success/trackChanges/active。
+   * RC-3/#395 修复：设置后独立回读真值，不一致判失败，不得回显入参造成假成功。
    */
   function enableTrackChanges(params) {
     try {
       var doc = getActiveDoc();
       if (!doc) return fail('没有打开的文档');
       var enable = params && params.enable;
-      // 上游 schema 默认 true（enable 缺省视为开启），非布尔值显式拒绝
+      // 上游 #401 缺省语义：缺省 = 开启（true），仅显式 false 才算关闭；非布尔显式拒绝
       if (enable === undefined || enable === null) enable = true;
       if (typeof enable !== 'boolean') return invalidParam('enable 必须为布尔值');
       doc.TrackRevisions = enable;
-      return ok({ success: true, trackChanges: enable, active: enable });
+      // RC-3 独立回读：另起一次读 TrackRevisions 取真值（与上游 Issue #395 修复语义一致）
+      var actual = false;
+      try {
+        actual = !!doc.TrackRevisions;
+      } catch (e) {
+        var readErr = (e && e.message ? e.message : e);
+        log('wps', 'enableTrackChanges 回读 TrackRevisions 异常（属性访问形式需探针确认）: ' + readErr);
+        return fail('设置修订模式失败: ' + readErr);
+      }
+      if (actual !== enable) {
+        log('wps', 'enableTrackChanges 未生效：期望=' + enable + ' 回读=' + actual);
+        return fail('修订模式设置未生效（期望 ' + enable + '，回读 ' + actual + '）');
+      }
+      return ok({ success: true, trackChanges: actual, active: actual });
     } catch (e) {
       var err = (e && e.message ? e.message : e);
       log('wps', 'enableTrackChanges 属性访问失败（TrackRevisions 形式需真机探针确认）: ' + err);
