@@ -203,5 +203,5 @@ wps_office_search 索引 ✅（gateway:262-263）
 | `js/poll.js` | +2 个 POLL_ACTION_MAP 映射 | ✅ 10101dd 已提交 |
 | `js/wps-bridge.js` | +2 个方法（enableTrackChanges / getTrackChangesStatus） | ✅ 10101dd 已提交 |
 | RC-3 修订 | enableTrackChanges 改独立回读真值（§4.2） | ✅ cef4fe6 已提交 |
-| 同步 | 复制到已安装 addon 目录（`~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`） | ⬜ 待 RC-3 修订后同步 |
+| 同步 | 复制到已安装 addon 目录（`~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`） | ✅ 已同步（diff 为空） |
 | 真机探针记录 | 5.0 步骤的确认结果（属性访问形式），附在提交说明 | ⬜ 待执行 |
