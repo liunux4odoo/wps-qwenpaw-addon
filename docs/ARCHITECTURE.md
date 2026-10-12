@@ -52,12 +52,18 @@
 
 ## §0 文档元信息
 
-- **方案版本**：v0.25（ACP server 兼容范围定案，2026-09-07）
-- **上一里程碑**：v0.24 多 ACP server 配置化落地（docs/plan-2026-09-05）；v0.25 明确 ACP server 支持范围：qwenpaw 为主目标 + opencode 为替代，其余 code agent（claudecode/kimicode/qcoder 等）兼容冻结推迟
+- **方案版本**：v0.27（bridge 请求-响应路由 per-client 化，2026-10-12）
+- **上一里程碑**：v0.26 加载项 main.js 按域拆分；v0.27 修复 bridge 多 client 并发下全局 FIFO 响应路由乱序丢响应（docs/plan-2026-10-12-bridge-per-client-queue.md）
 - **变更控制**：任何架构层决策的修改需回到 discuss agent 重启讨论
 
 ### 变更历史
 
+- **v0.27（bridge ACP 请求-响应路由 per-client 化，2026-10-12）**：
+  - **问题**：WPS 全新打开新文档（新进程 → 新 taskpane 实例）建会话慢 25s+；全局 FIFO 请求队列（`_request_queue`）在响应乱序时把「队头不匹配」的请求 popleft 丢弃，连带弹出**别的 client 的在途请求** → 其响应失去归属（target=None）→ 前端看门狗 25s 超时。日志实证 6 次 `order mismatch` 同一时刻 + 新实例 session/new（id=1）无响应
+  - **方案**（docs/plan-2026-10-12-bridge-per-client-queue.md）：`_request_queue` 全局 `deque[(rid, client_id)]` 改为 `_request_queues: dict[client_id, deque[rid]]`（per-client FIFO）。`_pop_request_owner(rid)` 先**非破坏性定位归属 client**（按 client 插入顺序扫描，同 rid 多 client 按先发者优先，语义与旧「按转发顺序归属」一致），再在**该 client 自己的队列内** FIFO 匹配（同 client 内乱序只丢弃它自己，不跨 client 误伤）。`_route_down` 响应（id+result/error）无归属时**安全丢弃不广播**（防串台）；WS 响应改按 `ws_pending` 定向回（不再依赖广播）
+  - **契约冻结**：前端协议（id 从 1 递增、clientId 格式、`/acp/send|poll` 语义）、ACP server 交互（stdin 顺序写 / stdout 读）、路线 P 注入（WPS_POLL_PORT / wpsMcpEntry / close 回收端口）、`http_session_client` sid→client 映射、25s 看门狗均不变
+  - **验收**：新增 `bridge/test_per_client_route.py`（计划 §5.1-7：单 client 回归 / 多 client 同 rid 隔离 / 并发乱序不误丢 / 空队列安全丢弃 / client 清理后残留不误路由 / session/load cachedSid / session/close 端口回收）全绿；`test_skills_route.py` / `test_adapter.py`（真实 qwenpaw E2E）零回归；`py_compile` 通过
+  - **遗留（非本次 scope）**：窗格复用已在前端修复（多 WPS 窗口天然多实例，per-client 队列是正确架构）；前端 25s 看门狗保持兜底；若真机仍有偶发慢，另查 qwenpaw ACP server 对 session/new 是否有全局串行瓶颈
 - **v0.26（加载项 main.js 拆分，2026-09-07）**：
   - **`js/main.js`（原 1987 行）按域拆为十个控制器模块**：`app-state`（全局状态容器 QP + QPLog + localStorage 持久化）/ `doc-state`（P8 文档隔离 + P16 环境上下文）/ `bridge-config`（/config + poll 端口）/ `session`（会话生命周期 + 看门狗）/ `agents`（P3 agent + Phase 3 server + 设置面板）/ `acp-events`（响应/流式/审批）/ `watchdog`（P2 中断恢复）/ `actions`（发送/停止/清空/附件 + UI 状态）/ `poll`（角色 B 分发）/ `ribbon`（taskpane 创建/切换）；`main.js` 仅剩 initTaskpane 接线 + 对外接口（136 行）
   - **形态**：无 ES module / 构建工具（manifest + 两份 HTML 普通 `<script>` 顺序加载），采用**IIFE 包裹 + 单一状态容器 `QP`**——可变状态集中在 `app-state.js` 的 `QP.state`（各控制器 IIFE 内 `var S = QP.state`，闭包私有不落全局）；跨文件函数经 `globalThis.<fn>` **最小导出**（仅导出被引用者，内部函数/常量留在闭包）。**加载顺序固定** `app-state → doc-state → bridge-config → session → agents → acp-events → watchdog → actions → poll → ribbon → main`（main.js 最末）
@@ -117,7 +123,7 @@
   - **bridge 集中分配端口**（acp-bridge.py 新增职责）：`POST /poll-port/allocate` / `GET /poll-port` / `POST /poll-port/release`（59000+ 段，60s 释放宽限期防残留碰撞）；`session/new`/`session/load` 转发前强制注入 `env.WPS_POLL_PORT`（权威值，ACP schema env 为 `[{name,value}]` 列表）；`session/close` 自动回收；`session/new` 响应补记 `session_id → poll_port`；`/status` 暴露 `ports`/`session_ports`
   - **加载项 main.js**：`MCP_SERVERS` 从 http 改回 **stdio**（`{name:'wps',command:'node',args:[dist/index.js],env:[{name:'WPS_POLL_PORT',value:'<port>'}]}`）；`initTaskpane` 先 `allocatePollPort()`（同步 XHR，失败回退 58891）再连 ACP + 启动 WpsPollClient 轮询分配端口；`closeSession` 显式 `releasePollPort()`；acp-client.js 暴露 `getClientId()` 复用同一 clientId
   - **验证通过（Python 端到端，真实 qwenpaw acp）**：allocate 唯一且幂等；http 型 mcpServer 不占端口；`session/new` 注入后 qwenpaw spawn 的 wps-mcp 进程 environ 含 `WPS_POLL_PORT=<port>`；`session/close` 自动释放；release 后 60s 宽限期不复用
-  - **审查加固（2026-09-03，code review 后）**：①多窗口请求 id 路由去重——`http_pending` 平铺 id 表改为**全局 FIFO 队列**（`_request_queue` + `_pop_request_owner`，qwenpaw 顺序处理/顺序回响应，同 id 响应按转发顺序归属，杜绝多窗口 session 串台/端口错配）；②`_inject_poll_port` 非对象 JSON 防护（`isinstance(msg, dict)`）；③`/status` 默认脱敏（端口/session 映射仅 `?debug=1` 暴露）；④分配池上限 64 + 1h 租期自动回收失联 client；⑤`_allocate_port` O(1) 占用集 + 宽限期满复用兜底；⑥加载项端口分配改**异步 XHR**（sync XHR 忽略 timeout 无法超时回退）+ ACP 重连时 `syncPollPort()` 重同步权威端口
+  - **审查加固（2026-09-03，code review 后）**：①多窗口请求 id 路由去重——`http_pending` 平铺 id 表改为**全局 FIFO 队列**（`_request_queue` + `_pop_request_owner`，qwenpaw 顺序处理/顺序回响应，同 id 响应按转发顺序归属，杜绝多窗口 session 串台/端口错配；2026-10-12 已改为 per-client 队列，见 §v0.27）；②`_inject_poll_port` 非对象 JSON 防护（`isinstance(msg, dict)`）；③`/status` 默认脱敏（端口/session 映射仅 `?debug=1` 暴露）；④分配池上限 64 + 1h 租期自动回收失联 client；⑤`_allocate_port` O(1) 占用集 + 宽限期满复用兜底；⑥加载项端口分配改**异步 XHR**（sync XHR 忽略 timeout 无法超时回退）+ ACP 重连时 `syncPollPort()` 重同步权威端口
   - **部署配套**：addon 文件已同步到 `~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/`；待 WPS 实机重开侧边栏端到端验收（§8.3）
   - **⚠️ 部署依赖（跨仓库）**：wps-office-mcp 的 `WPS_POLL_PORT` 支持只在 **opencode-wps 仓库未提交的工作区**（`src/client/wps-client.ts` + 重新 build 的 `dist/`）——若该仓库被从已提交源码重新 checkout/rebuild，`dist` 会退回 `POLL_PORT=58891`，路线 P 的多窗口隔离即失效。**需把该改动 commit 进 opencode-wps（或加 build 步骤）并固定版本**后再依赖它
 
@@ -501,7 +507,7 @@ wps-office-mcp（Node.js 子进程，每 session 一个，各自监听独立 pol
 - **响应**：`{"jsonrpc":"2.0","id":N,"result":{...}}` 或 `{"error":{"code":-32602,"message":"...","data":{...}}}`
 - **流式下行**：`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":S,"update":{"content":{"text":"...","type":"text"},"sessionUpdate":"agent_message_chunk"}}}`——**无 id 的通知**，每 token 一条；`sessionUpdate` 取值含 `agent_message_chunk`（文本增量）、`available_commands_update`、`usage_update`
 - `session/prompt` 的 `prompt` 参数是 **list**：`[{"type":"text","text":"..."}]`；响应 `result.stopReason` 为 `end_turn`/`cancelled`
-- 桥接服务**下行路由规则**：带 `params.sessionId` 的通知 → 按 sessionId 路由到对应连接；带 `id` 的响应 → 路由到发起该请求的连接（上行转发时记录 id→conn）；其余 → 广播
+- 桥接服务**下行路由规则**：带 `params.sessionId` 的通知 → 按 sessionId 路由到对应连接；带 `id` 的响应 → 从**归属 client 的 per-client 请求队列**路由到发起该请求的连接（2026-10-12 起，`_request_queues`，多窗口同 id 靠各 client 队列隔离，见 §v0.27）；其余 → 广播
 
 **MVP 约束**：
 

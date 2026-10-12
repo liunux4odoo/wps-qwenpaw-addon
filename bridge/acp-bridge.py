@@ -75,6 +75,12 @@ UPSTREAM_QUEUE_MAX = 512      # 上行排队条数上限（异常积压时丢最
 UPSTREAM_QUEUE_MAX_BYTES = 8 * 1024 * 1024  # 上行排队字节预算（覆盖超大单条消息，双上限）
 UPSTREAM_QUEUE_TTL = 30.0     # 排队消息最长等待秒数（超时丢弃，前端看门狗+重试兜底）
 
+# ── per-client 请求队列（docs/plan-2026-10-12-bridge-per-client-queue.md）──────────────────
+# 请求 id 归属从「全局 FIFO」改为「每 client 独立 FIFO」：响应乱序时只在归属 client 自己的
+# 队列内 popleft 丢弃，绝不弹出别的 client 的请求（全局 FIFO 的「队头不匹配即丢弃」会把
+# 其他 client 的在途请求弹出，导致其响应失去归属 -> 前端 25s 看门狗超时）。
+PER_CLIENT_QUEUE_MAX = 512   # 单 client 在途请求数上限（防异常堆积，丢弃最旧，对应 UPSTREAM_QUEUE_MAX 精神）
+
 # ── stdio reader 行缓冲（docs/plan-2026-09-03-bridge-stdout-reader-fix.md）──────────────────
 # asyncio StreamReader.readline 默认行缓冲上限 64KB：qwenpaw 工具大返回值（如 getActiveDocument
 # 文档全文）作为单行 JSON 超限时 readline 抛 ValueError → reader 任务崩溃 → 下行永久断。
@@ -199,8 +205,10 @@ class AcpBridge:
         # HTTP 客户端（clientId -> 下行队列 deque[str]）
         self.http_clients: dict[str, deque] = {}
         self.http_session_client: dict[str, str] = {}
-        # 请求 id 归属队列（多窗口同 id 靠转发顺序去重，见 _pop_request_owner）
-        self._request_queue: deque[tuple[object, str]] = deque()
+        # 请求 id 归属队列（per-client FIFO：client_id -> deque[rid]，见 _pop_request_owner）
+        # 计划 docs/plan-2026-10-12-bridge-per-client-queue.md：每个 client 独立队列，
+        # 响应乱序时只在归属 client 自己的队列内匹配，不跨 client 误伤。
+        self._request_queues: dict[str, deque[object]] = {}
         # 路线 P：集中分配 poll 端口（59000+ 段，poll port ↔ session id 映射）
         self._port_allocated: dict[str, int] = {}     # client_id -> port
         self._port_used: set[int] = set()             # 当前占用端口（O(1) 判占用）
@@ -719,18 +727,41 @@ class AcpBridge:
 
     # ── 下行路由（stdio -> 前端） ──────────────────────────────────
     def _pop_request_owner(self, rid: object) -> str | None:
-        """按转发顺序从请求队列弹出该 id 的归属 client。
+        """按 per-client 队列弹出该 id 的归属 client（docs/plan-2026-10-12-bridge-per-client-queue.md）。
 
         每个窗口的 ACP 请求 id 都从 1 递增（js/acp-client.js `var id = ++seq`），
-        多窗口并发必然出现同 id 请求。ACP server 顺序处理 stdin、按请求顺序回响应，
-        因此这里用全局 FIFO 队列按顺序去重：谁先发该 id，响应就归谁。"""
-        while self._request_queue:
-            q_rid, cid = self._request_queue.popleft()
-            if q_rid == rid:
-                return cid
-            log.warning("request id %r response arrived but queue head was %r (order mismatch)",
-                        rid, q_rid)
-        return None
+        多窗口并发必然出现同 id 请求。响应本身不带 client 归属（ACP 响应信封只有
+        id+result/error，session/new 的 result.sessionId 除外），因此：
+
+        1. **先定位归属 client**（非破坏性）：按 client 插入顺序扫描各队列，找 rid
+           在哪个 client 的队列里（同 rid 多 client 时按插入顺序优先 = 先发该 id 的
+           client，语义与旧「按转发顺序归属」一致）。定位阶段**不弹出任何东西**。
+        2. **再在归属 client 自己的队列内 FIFO 匹配**：队头不匹配时 popleft 丢弃——
+           但只影响该 client 自己（同 client 顺序请求 ACP 顺序处理，理论上不乱序；
+           若乱序属该 client 自身问题）。
+
+        旧全局 FIFO 在「队头不匹配即弹出丢弃」时会连带弹出别的 client 的在途请求，
+        导致其响应失去归属 -> 前端 25s 超时。本实现绝不弹出/丢弃别的 client 的请求。
+        """
+        owner = None
+        for cid in list(self._request_queues.keys()):
+            if rid in self._request_queues[cid]:
+                owner = cid
+                break
+        if owner is None:
+            return None
+        q = self._request_queues[owner]
+        while q:
+            if q[0] == rid:
+                q.popleft()
+                break
+            log.warning("request id %r response arrived but %s queue head was %r (order mismatch)",
+                        rid, owner, q[0])
+            q.popleft()
+        if not q:
+            # 队列清空即从路由表移除（client 生命周期：残留响应不再扫到该 client）
+            del self._request_queues[owner]
+        return owner
 
     async def _route_down(self, text: str) -> None:
         """把 ACP server stdout 的一条 ACP 消息路由到对应前端。
@@ -738,13 +769,16 @@ class AcpBridge:
         log.debug("downstream: %s", self._summarize_acp(text))
         target = None
         sid = None
+        msg = None
+        is_response = False
         try:
             msg = json.loads(text)
             params = msg.get("params")
             if isinstance(params, dict) and params.get("sessionId"):
                 sid = str(params["sessionId"])
             elif "id" in msg and ("result" in msg or "error" in msg):
-                # 响应（无 params.sessionId）：按转发顺序取归属（多窗口同 id 去重）
+                # 响应（无 params.sessionId）：从归属 client 的 per-client 队列取归属
+                is_response = True
                 target = self._pop_request_owner(msg["id"])
             # 路线 P：session/new 响应带 result.sessionId -> 记录 session_id -> poll port
             if isinstance(msg.get("result"), dict):
@@ -772,24 +806,25 @@ class AcpBridge:
                 self.http_clients[cid].append(text)
             return
 
-        if target is not None:
-            if target in self.http_clients:
-                self.http_clients[target].append(text)
-                return
-            wconn = self.ws_pending.pop(msg["id"], None) if False else None
-            for c in list(self.ws_pending.values()):
-                if c:
-                    pass
-            # WebSocket 路由：遍历找 id 匹配
-            wconn = self.ws_pending.get(msg["id"])
+        if target is not None and target in self.http_clients:
+            self.http_clients[target].append(text)
+            return
+
+        # 响应（id+result/error）：WebSocket 请求按 ws_pending 定向回；HTTP 响应无归属
+        # （client 已清理/残留）则**安全丢弃，不广播**——广播会把 A 的响应误发给所有
+        # client 造成串台（docs/plan-2026-10-12-bridge-per-client-queue.md §4.3 空队列）。
+        if is_response:
+            wconn = self.ws_pending.get(msg["id"]) if msg is not None else None
             if wconn:
                 try:
                     await wconn.send(text)
                 except Exception:
                     self.ws_conns.discard(wconn)
                 return
+            log.warning("downstream response id=%r has no owning client, dropped (safe)", msg["id"])
+            return
 
-        # 其余（广播类）：发给所有 HTTP + WS 客户端
+        # 其余（通知/广播类）：发给所有 HTTP + WS 客户端
         for cid in list(self.http_clients):
             self.http_clients[cid].append(text)
         for c in list(self.ws_conns):
@@ -898,14 +933,19 @@ class AcpBridge:
         # 路线 P：session/new 注入 WPS_POLL_PORT；session/close 回收端口；wpsMcpEntry 权威路径注入
         raw = self._inject_poll_port(raw, client_id)
         log.info("upstream[%s]: %s", client_id or "ws", self._summarize_acp(raw))
-        # 记录请求归属（多窗口同 id 靠转发顺序去重，见 _pop_request_owner）
+        # 记录请求归属（per-client FIFO：多窗口同 id 靠各 client 队列隔离，见 _pop_request_owner）
         try:
             msg = json.loads(raw)
             rid = msg.get("id")
             if rid is not None and client_id and msg.get("method"):
                 # 只登记「客户端发起的请求」（带 method）；respond（id+result，无 method）
                 # 是对 ACP server 下行请求的应答，server 不会回响应，不入队。
-                self._request_queue.append((rid, client_id))
+                q = self._request_queues.setdefault(client_id, deque())
+                if len(q) >= PER_CLIENT_QUEUE_MAX:
+                    log.warning("client %s in-flight request queue full (%d), dropped oldest",
+                                client_id, PER_CLIENT_QUEUE_MAX)
+                    q.popleft()
+                q.append(rid)
             params = msg.get("params")
             if isinstance(params, dict) and params.get("sessionId"):
                 sid = str(params["sessionId"])
