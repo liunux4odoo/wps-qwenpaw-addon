@@ -1,12 +1,16 @@
 # 开发方案：移植 enableTrackChanges / getTrackChangesStatus 到插件执行器
 
-> 状态：已实施（js/poll.js + js/wps-bridge.js，静态/回归测试通过）；§5.0 真机探针 + E2E 验收待执行
-> 日期：2026-10-12
+> 状态：已实施并提交（10101dd + cef4fe6，js/poll.js + js/wps-bridge.js，静态/回归测试通过）；
+> ⚠️ §5.0 真机探针 + E2E 验收待执行。
+> 日期：2026-10-12（2026-10-12 重核后修订）
 > 背景：`wps_word_enable_track_changes` / `wps_word_get_track_changes_status`
-> 调用报「未支持的命令」。诊断确认是上游断链：gateway/proofread.ts 有定义，
-> 但 opencode-wps-linux 执行层无实现（更新上游后仍未修复）。WPS Linux JSAPI
-> 已验证支持修订模式（`KyWpsDocument::put_TrackRevisions`/`get_TrackRevisions`），
-> 方案 A = 插件侧绕过断链直连 WPS JSAPI 实现。
+> 调用报「未支持的命令」。诊断确认是**上游 Linux 路径断链**：
+> gateway/proofread.ts 有定义及 handler，**上游 Windows 路径（wps-com.ps1
+> PowerShell COM）已完整实现并修复**（RC-3 谎报成功 / #401 缺省语义），
+> 但 opencode-wps-linux 执行层（Linux/assistant/shared 三层）无实现——0 命中。
+> WPS Linux JSAPI 已验证支持修订模式（`KyWpsDocument::put_TrackRevisions`
+> /`get_TrackRevisions`），方案 A = 插件侧绕过断链直连 WPS JSAPI 实现，
+> **契约对齐上游 Windows 实现 + 吸收 RC-3/#401 修复教训**。
 
 ---
 
@@ -20,32 +24,58 @@
 2. **`getTrackChangesStatus`**：查询当前活动 Word 文档的修订模式状态。
 
 非目标（NOT scope）：
-- 不改动上游 opencode-wps（零 fork 铁律，且上游未修复）。
+- 不改动上游 opencode-wps（零 fork 铁律；上游 Linux 路径本就不实现，改上游
+  等于替上游补功能，超出零 fork 边界；上游 Windows 路径无需动）。
 - 不实现 proofread 模块其余工具（replaceInParagraph / proofreadBasic /
-  confirmBatchAiProofread——若也有断链，另立方案）。
+  confirmBatchAiProofread——若也有 Linux 断链，另立方案）。
 - 不改 WPS JSAPI 本身（已验证原生支持）。
-- 不做 Windows/Mac 兼容（插件跑在 Linux）。
+- 不做 Windows/Mac 兼容（插件跑在 Linux；Windows 已有上游 wps-com.ps1 实现）。
 
 ---
 
-## 2. 现状与接入点（已核实）
+## 2. 现状与接入点（已核实，2026-10-12 用上游 7e0128a 全树重核）
 
-### 断链链路
+### 断链链路（Linux 路径）
 ```
 wps_office_search 索引 ✅（gateway:262-263）
-  → MCP handler ✅（proofread.ts enableTrackChangesHandler → invokeAction('enableTrackChanges'))
-  → opencode-wps-linux 执行层 ❌（无 trackChanges action）
-  → 插件执行器 ❌（POLL_ACTION_MAP 无 / wps-bridge.js 无）
-  → 报「未支持的命令」（poll.js else 分支）
+  → MCP handler ✅（proofread.ts enableTrackChangesHandler → executeMethod('enableTrackChanges'))
+  → wps-client.ts 平台分流 ✅（win32→PowerShell COM / linux→linuxPollServer / darwin→macPollServer）
+  → Linux 执行层 ❌（opencode-wps-linux / opencode-wps-assistant / shared / src/poll 四目录
+                     trackChanges|TrackRevisions|Revisions|AcceptAll|put_Track 全 0 命中）
+  → 插件执行器（原 ❌，现已实现 ✅）
+  → 报「未支持的命令」（poll.js else 分支，未实现 action 的兜底）
 ```
+
+### 上游现状（7e0128a 全树核实，修正此前"上游未修复"结论）
+- **Windows 路径已完整实现**：`wps-office-mcp/scripts/wps-com.ps1` 有
+  `enableTrackChanges`（`$doc.TrackRevisions = $enable` + 真实回读 `active`）
+  与 `getTrackChangesStatus`（回读 + `Revisions.Count`）。
+- **修复教训（移植必须吸收）**：
+  - **RC-3 / Issue #395「enableTrackChanges 谎报成功」**：PS1 一次往返里
+    `trackChanges = $enable`（回写入参回显）+ `active = $doc.TrackRevisions`
+    （真实回读）同属一次往返，**无法区分「真生效」与「写入被静默拒绝」**。
+    上游修复 = **另起一次独立 `getTrackChangesStatus` 往返**取真值，不一致即
+    判失败（`proofread.ts` 中 `actual !== wantEnable → failResult`）。
+  - **Issue #401「缺省语义反转」**：`wantEnable = !(enable === false)`——
+    仅显式 false 才算请求关闭，缺省 = 开启（与治理层 `governance.js`
+    `wantEnable` 同口径；此前 `enable === true` 把缺省误当 false）。
+  - **Issue #382「method 放 params 里」**：兼容 `method` 参数位置（网关层）。
+- **当前插件实现（10101dd）与上游教训的差距**：
+  - `enableTrackChanges` 直接返回 `active: enable`（回写入参回显）——
+    **正是 RC-3 bug 修复前的行为**，需补独立回读（§4.2）。
+  - 缺省语义已对齐（`enable === undefined/null → true`，非布尔拒绝）✅。
 
 ### 上游契约（入参/出参，必须对齐）
 - **enableTrackChanges**：
-  - 入参：`{ enable: boolean }`（true=开启，false=关闭）
+  - 入参：`{ enable: boolean }`（true=开启，false=关闭；缺省=开启）
   - 响应需含：`success: boolean`、`trackChanges: boolean`、`active: boolean`
   - 成功文案：`修订模式已开启/已关闭！所有后续修改将被跟踪记录。`
+  - ⚠️ 上游 handler 会**另起一次** `getTrackChangesStatus` 独立回读校验，
+    插件响应不一致时由 handler 判失败。插件自身也应按 RC-3 教训返回
+    **真实回读值**（见 §4.2 修订），双保险。
 - **getTrackChangesStatus**：
-  - 响应需含：`success: boolean`、`active: boolean`（读取修订状态）
+  - 响应需含：`success: boolean`、`active: boolean`、`revisionCount: number`
+    （上游 Windows 返回 `trackChanges` + `revisionCount`）
 - 上游 handler 期望从 `executeMethod` 返回 `{ success, data: { active } }` 结构。
 
 ### WPS JSAPI（已验证存在）
@@ -72,6 +102,11 @@ wps_office_search 索引 ✅（gateway:262-263）
 4. **WPS JSAPI 直连**：不经过上游断链，插件直接调 `Application.ActiveDocument`。
 5. **poll.js else 分支「未支持的命令」保留**：作为未实现 action 的兜底，
    不改动（新增的 action 只是不再落入该分支）。
+6. **⚠️ RC-3 独立回读（重核后新增冻结）**：enableTrackChanges 必须独立回读
+   `doc.TrackRevisions` 取真值，不得直接回写 `active: enable` 造成假成功；
+   不一致判失败。对齐上游 Issue #395 修复语义。
+7. **⚠️ 缺省语义（重核后新增冻结）**：`enable` 缺省 = 开启（true），仅显式
+   `false` 才算请求关闭；非布尔值显式拒绝。对齐上游 Issue #401 修复语义。
 
 ---
 
@@ -82,18 +117,27 @@ wps_office_search 索引 ✅（gateway:262-263）
   - `enableTrackChanges: 'enableTrackChanges'`
   - `getTrackChangesStatus: 'getTrackChangesStatus'`
 
-### 4.2 `js/wps-bridge.js`
-- 新增 `enableTrackChanges(params)` 方法：
-  - `getActiveDoc()` → 无文档 fail
-  - `params.enable` 缺省/非 boolean 处理：按上游契约（缺省视为 true？或
-    invalidParam？——**由 code agent 按上游定义决定，方案不预定**；但返回
-    必须含 success/trackChanges/active）
-  - 设置 `doc.TrackRevisions = enable`（精确属性形式实施时探针确认）
-  - 返回 `ok({ success: true, trackChanges: enable, active: enable })`
-- 新增 `getTrackChangesStatus()` 方法：
-  - `getActiveDoc()` → 无文档 fail
-  - 读 `doc.TrackRevisions`（或等价读 API）
-  - 返回 `ok({ success: true, active: <实际状态> })`
+### 4.2 `js/wps-bridge.js`（10101dd 已实现，⚠️ 待补 RC-3 独立回读）
+
+**`enableTrackChanges(params)`（已实现，需修订）：**
+- `getActiveDoc()` → 无文档 fail
+- 缺省语义（已对齐上游 #401）：`enable === undefined/null → true`；非布尔
+  → `invalidParam('enable 必须为布尔值')`（当前实现已满足 ✅）
+- 设置 `doc.TrackRevisions = enable`（精确属性形式实施时探针确认）
+- **⚠️ 修订点（RC-3 教训）**：当前返回 `ok({ success: true, trackChanges:
+  enable, active: enable })` 是**回写入参回显**——`TrackRevisions` 写入被
+  静默拒绝时无法发现（正是上游 RC-3 修复前的 bug）。**必须改为独立回读**：
+  - 设置后**另起一次**读 `doc.TrackRevisions` 取真值 `actual`
+  - `actual !== enable` → 返回 fail（含"修订模式设置未生效"文案 + 期望/回读值）
+  - 一致 → `ok({ success: true, trackChanges: actual, active: actual })`
+  - （上游 handler 侧还有第二道校验，插件先自校验，双保险）
+
+**`getTrackChangesStatus()`（已实现，对齐上游 Windows 契约 ✅）：**
+- `getActiveDoc()` → 无文档 fail
+- 读 `doc.TrackRevisions` → `active`；`doc.Revisions.Count` → `revisionCount`
+  （读失败降级 0，不崩）
+- 返回 `ok({ success: true, active, trackChanges: active, revisionCount })`
+  （当前实现已满足 ✅；`active` 为 plan 附加字段，与 enableTrackChanges 对齐）
 - 遵循现有错误处理：try/catch → `fail('...失败: ' + msg)`。
 
 ### 4.3 边界情况（8 维清单）
@@ -140,19 +184,24 @@ wps_office_search 索引 ✅（gateway:262-263）
    再查 `getTrackChangesStatus` → `active: false`。
 7. 无文档时调用 → fail('没有打开的文档')。
 8. 非 word 应用（如打开表格）调用 → 明确错误，不崩溃。
+9. **⚠️ RC-3 回读验证（修订后新增）**：enableTrackChanges 返回值中的
+   `active`/`trackChanges` 必须是**真实回读值**而非回写入参——真机确认：
+   开启成功后返回值与文档实际修订状态一致；若 WPS 拒绝写入（如只读文档），
+   插件返回 fail 而非假成功（可临时用只读文档验证）。
 
 ### 回归
-9. 现有 bridge/skill 测试全绿（`python3 bridge/test_skills_route.py`、
-   `python3 bridge/test_adapter.py`）。
-10. 同步到已安装 addon 目录，重启 WPS 后重复 4-8。
+10. 现有 bridge/skill 测试全绿（`python3 bridge/test_skills_route.py`、
+    `python3 bridge/test_adapter.py`）。
+11. 同步到已安装 addon 目录，重启 WPS 后重复 4-9。
 
 ---
 
 ## 6. 交付物清单
 
-| 交付物 | 说明 |
-|---|---|
-| `js/poll.js` | +2 个 POLL_ACTION_MAP 映射 |
-| `js/wps-bridge.js` | +2 个方法（enableTrackChanges / getTrackChangesStatus） |
-| 同步 | 复制到已安装 addon 目录（`~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`） |
-| 真机探针记录 | 5.0 步骤的确认结果（属性访问形式），附在提交说明 |
+| 交付物 | 说明 | 状态 |
+|---|---|---|
+| `js/poll.js` | +2 个 POLL_ACTION_MAP 映射 | ✅ 10101dd 已提交 |
+| `js/wps-bridge.js` | +2 个方法（enableTrackChanges / getTrackChangesStatus） | ✅ 10101dd 已提交 |
+| RC-3 修订 | enableTrackChanges 改独立回读真值（§4.2） | ✅ cef4fe6 已提交 |
+| 同步 | 复制到已安装 addon 目录（`~/.local/share/Kingsoft/wps/jsaddons/wps-qwenpaw-addon_/js/`） | ⬜ 待 RC-3 修订后同步 |
+| 真机探针记录 | 5.0 步骤的确认结果（属性访问形式），附在提交说明 | ⬜ 待执行 |
