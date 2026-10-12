@@ -77,6 +77,51 @@
     }
   }
 
+  // 尝试从 PluginStorage 恢复持久化的窗格 ID（WPS 重启后内存缓存为空，但存储有旧 ID）。
+  // 返回恢复的 ID（字符串）或 ''（无/读取失败）。
+  function restoreTaskPaneId() {
+    if (taskpaneIdCache) return taskpaneIdCache;
+    try {
+      var stored = window.Application.PluginStorage.getItem('taskpane_id');
+      if (stored) {
+        taskpaneIdCache = String(stored);
+        QPLog('main', 'restoreTaskPaneId: 从 PluginStorage 恢复 taskpane_id=' + taskpaneIdCache);
+      }
+    } catch (e) {
+      console.error('[main] 读取 taskpane_id 失败: ' + errMsg(e));
+    }
+    return taskpaneIdCache || '';
+  }
+
+  // 复用优先 + 创建兜底：先尝试找回已有窗格（含 PluginStorage 恢复的 ID），
+  // 有效则直接显示（不新建，避免累积多个 taskpane 实例并发 poll/建会话）；
+  // 找回失败/无效/异常才新建。
+  // 背景：此前 OnShowTaskPane 每次点击都 createTaskPane 新建（旧窗格仅隐藏不销毁），
+  // 导致 WPS 累积多个侧边栏实例，打开新文档时并发 session/new 排队超时（见日志 25s 超时）。
+  function getOrCreateTaskPane() {
+    restoreTaskPaneId();
+    if (taskpaneIdCache) {
+      try {
+        var existing = window.Application.GetTaskPane(taskpaneIdCache);
+        if (existing) {
+          if (!setTaskPaneDockPosition(existing)) {
+            console.error('[main] 找回窗格停靠校正失败（窗格仍可用）');
+          }
+          try {
+            existing.Visible = true;
+          } catch (e) {
+            console.error('[main] 设置找回窗格可见失败: ' + errMsg(e));
+          }
+          QPLog('main', 'getOrCreateTaskPane: 复用已有窗格 ID=' + taskpaneIdCache);
+          return existing;
+        }
+      } catch (e) {
+        console.error('[main] GetTaskPane 异常，回退新建: ' + errMsg(e));
+      }
+    }
+    return createTaskPane();
+  }
+
   // 方案B（2026-09-23）：取消启动自动展开——打开 WPS 不再弹侧边栏；
   // 仅点击 ribbon 的「QwenPaw AI」按钮（OnShowTaskPane）时才创建并展开窗格。
   // 历史背景：v0.11 曾因启动瞬间（无文档/CEF 未就绪）CreateTaskPane 得到空白窗格被缓存；
@@ -94,15 +139,11 @@
   };
 
   // 按钮：打开/切换侧边栏
-  // 总是新建正确的对话窗格（不复用可能为空白/失效的旧窗格）；先隐藏旧窗格避免堆积。
+  // 复用已有窗格（GetTaskPane 找回），无效才新建——避免累积多个 taskpane 实例。
+  // 背景：此前每次点击都 CreateTaskPane 新建（旧窗格仅隐藏不销毁），导致 WPS
+  // 累积多个侧边栏实例并发 poll + session/new，打开新文档时建会话排队超时。
   window.OnShowTaskPane = function () {
-    if (taskpaneIdCache) {
-      try {
-        var old = window.Application.GetTaskPane(taskpaneIdCache);
-        if (old) { old.Visible = false; }
-      } catch (e) {}
-    }
-    createTaskPane();
+    getOrCreateTaskPane();
     if (QP.state.ribbonUI) {
       try { QP.state.ribbonUI.Invalidate(); } catch (e) {}
     }
