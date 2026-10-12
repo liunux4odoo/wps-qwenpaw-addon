@@ -37,6 +37,8 @@
     insertImage: 'insertImage',
     addComment: 'addComment',
     getComments: 'getComments',
+    enableTrackChanges: 'enableTrackChanges',
+    getTrackChangesStatus: 'getTrackChangesStatus',
     insertBookmark: 'insertBookmark',
     getBookmarks: 'getBookmarks',
     insertHyperlink: 'insertHyperlink',

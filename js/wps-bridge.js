@@ -930,6 +930,53 @@ var WpsBridge = (function () {
     }
   }
 
+  /**
+   * 开启/关闭修订模式（端口自 upstream proofread.ts enableTrackChangesHandler）
+   * 上游断链修复（方案 plan-2026-10-12）：插件侧绕过 opencode-wps-linux 执行层，
+   * 直连 WPS JSAPI `doc.TrackRevisions`。契约：data 含 success/trackChanges/active。
+   */
+  function enableTrackChanges(params) {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      var enable = params && params.enable;
+      // 上游 schema 默认 true（enable 缺省视为开启），非布尔值显式拒绝
+      if (enable === undefined || enable === null) enable = true;
+      if (typeof enable !== 'boolean') return invalidParam('enable 必须为布尔值');
+      doc.TrackRevisions = enable;
+      return ok({ success: true, trackChanges: enable, active: enable });
+    } catch (e) {
+      var err = (e && e.message ? e.message : e);
+      log('wps', 'enableTrackChanges 属性访问失败（TrackRevisions 形式需真机探针确认）: ' + err);
+      return fail('设置修订模式失败: ' + err);
+    }
+  }
+
+  /**
+   * 查询修订模式状态（端口自 upstream proofread.ts getTrackChangesStatusHandler）
+   * 契约：data 含 trackChanges/revisionCount（上游 handler 消费）；active 为
+   * plan 附加字段，与 enableTrackChanges 对齐。
+   */
+  function getTrackChangesStatus() {
+    try {
+      var doc = getActiveDoc();
+      if (!doc) return fail('没有打开的文档');
+      var active;
+      try {
+        active = !!doc.TrackRevisions;
+      } catch (e) {
+        var readErr = (e && e.message ? e.message : e);
+        log('wps', 'getTrackChangesStatus 读 TrackRevisions 异常（属性访问形式需探针确认）: ' + readErr);
+        return fail('读取修订模式状态失败: ' + readErr);
+      }
+      var revisionCount = 0;
+      try { revisionCount = doc.Revisions ? doc.Revisions.Count : 0; } catch (e) {}
+      return ok({ success: true, active: active, trackChanges: active, revisionCount: revisionCount });
+    } catch (e) {
+      return fail('获取修订模式状态失败: ' + (e && e.message ? e.message : e));
+    }
+  }
+
   /** 插入超链接（端口自 word-handler.js insertHyperlink） */
   function insertHyperlink(params) {
     try {
@@ -4677,6 +4724,8 @@ var WpsBridge = (function () {
     insertBookmark: insertBookmark,
     getBookmarks: getBookmarks,
     getComments: getComments,
+    enableTrackChanges: enableTrackChanges,
+    getTrackChangesStatus: getTrackChangesStatus,
     insertHyperlink: insertHyperlink,
     insertHeader: insertHeader,
     insertFooter: insertFooter,
