@@ -29,7 +29,7 @@ function loadEnv(initialConfigMode, opts) {
   opts = opts || {};
   const st = {
     timers: [], timerSeq: 0,
-    chatCalls: { status: [], messages: [], errorCards: [] },
+    chatCalls: { status: [], messages: [], errorCards: [], restores: [], emptyHints: 0, placeholders: [] },
     acpCalls: { send: [], connected: false }, acpIdSeq: 0,
     store: {}, els: {},
     acpCbs: { conn: null, response: null, update: null, request: null },
@@ -42,6 +42,12 @@ function loadEnv(initialConfigMode, opts) {
   };
   // 预置记住的 server（Phase 3：qp.server）
   if (opts.savedServer) st.store['qp.server'] = opts.savedServer;
+  // plan-2026-10-15：预置 localStorage 历史/会话（volatile 反查测试用）
+  if (opts.prestore) {
+    for (const k in opts.prestore) {
+      if (Object.prototype.hasOwnProperty.call(opts.prestore, k)) st.store[k] = String(opts.prestore[k]);
+    }
+  }
 
   function fakeSetTimeout(fn, ms) {
     const id = ++st.timerSeq;
@@ -74,8 +80,9 @@ function loadEnv(initialConfigMode, opts) {
     addErrorCard(title, text, opts) { st.chatCalls.errorCards.push({ title, text, opts }); },
     setStatus(label) { st.chatCalls.status.push(label); },
     setConnStateText() {}, setWpsState() {}, snapshot() { return []; },
-    restore() {}, clear() {}, showEmptyHint() {}, showTyping() {}, hideTyping() {},
-    setInputEnabled() {}, setPlaceholder() {}, setBusy() {}, appendAssistantChunk() {}, finishAssistant() {},
+    restore(msgs) { st.chatCalls.restores.push(msgs ? msgs.slice() : []); },
+    clear() {}, showEmptyHint() { st.chatCalls.emptyHints++; }, showTyping() {}, hideTyping() {},
+    setInputEnabled() {}, setPlaceholder(text) { st.chatCalls.placeholders.push(text || ''); }, setBusy() {}, appendAssistantChunk() {}, finishAssistant() {},
     addToolCard() { return {}; }, markToolCard() {},
     toggleSettings() {}, setServerList() {}, setServerDesc() {}, setCapabilityNotes() {},
     populateConfigOptions() {}, addApprovalCard() {},
@@ -104,6 +111,8 @@ function loadEnv(initialConfigMode, opts) {
     getItem(k) { return Object.prototype.hasOwnProperty.call(st.store, k) ? st.store[k] : null; },
     setItem(k, v) { st.store[k] = String(v); },
     removeItem(k) { delete st.store[k]; },
+    key(i) { return Object.keys(st.store)[i] || null; },
+    get length() { return Object.keys(st.store).length; },
   };
 
   function XHRStub() {}
@@ -216,6 +225,12 @@ function loadEnv(initialConfigMode, opts) {
     sends() { return st.acpCalls.send; },
     sessionNewSends() { return st.acpCalls.send.filter(s => s.method === 'session/new'); },
     chat() { return st.chatCalls; },
+    // plan-2026-10-15：断言辅助（volatile 反查 / Path 等待）
+    restores() { return st.chatCalls.restores; },
+    emptyHints() { return st.chatCalls.emptyHints; },
+    placeholders() { return st.chatCalls.placeholders; },
+    hasTimer(ms) { return st.timers.some(t => !t.fired && t.ms === ms); },
+    volatile(id) { return sandbox.isVolatileDocId(id); },
     // P23：Scenario G 控制活动文档身份 / 打开文档集合 / 触发文档复查 / 读状态与 localStorage
     setDocIdentity(info) { st.docIdentity = info; },
     setOpenDocs(list) { st.openDocs = (list || []).slice(); },
@@ -530,6 +545,308 @@ console.log('Scenario K: P23 同实例关旧建新同名未保存文档 → 全�
     'count=' + env.sessionNewSends().length);
   check('K6 无 session/load 复用旧 S1', !env.sends().some(x => x.method === 'session/load'),
     'sends=' + JSON.stringify(env.sends().map(x => x.method)));
+}
+
+// ══ plan-2026-10-15：打开已保存文档瞬间 Path 未就位 → volatile docId 反查历史/会话恢复 ══
+// 覆盖方案 §5 场景 1-13（§5.1-11 单元/集成 + §5.13 回归由 A-K 场景覆盖）。
+const HIST_DOC = 'wps:/home/u/Documents:同.docx';
+const HIST_NAME = '同.docx';
+const HIST_MSGS = JSON.stringify([{ role: 'user', text: '你好' }]);
+
+// 辅助：无同名历史的"真新建/首开"断言（立即收敛、显示空提示、零等待、连上即 session/new）
+function assertImmediateNew(env, label) {
+  const st = env.state();
+  check(label + ' docIdPending=false（立即收敛）', st.docIdPending === false,
+    'docId=' + st.currentDocId + ' pending=' + st.docIdPending);
+  check(label + ' 显示空提示', env.emptyHints() === 1, 'emptyHints=' + env.emptyHints());
+  check(label + ' 无 500ms 等待定时器', !env.hasTimer(500));
+  check(label + ' 未恢复任何历史', env.restores().length === 0);
+  env.conn('connected');
+  check(label + ' ACP 连上后立即 session/new', env.sessionNewSends().length === 1,
+    'count=' + env.sessionNewSends().length);
+}
+
+// Scenario 1：正常已保存（Path 非空）→ 零变化（恢复历史 + session/load，不进入等待）
+console.log('Scenario 1: 正常已保存（Path 非空）→ 恢复历史 + session/load');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: 'report.docx', path: '/home/u/Documents', appType: 'wps' },
+    prestore: {
+      'qp.history.wps:/home/u/Documents:report.docx': JSON.stringify([{ role: 'user', text: 'hi' }]),
+      'qp.session.wps:/home/u/Documents:report.docx': 'S-PREV',
+    },
+  });
+  const st = env.state();
+  check('S1 docId 为稳定 id', st.currentDocId === 'wps:/home/u/Documents:report.docx',
+    'docId=' + st.currentDocId);
+  check('S1 docIdPending 恒 false（不进入等待）', st.docIdPending === false);
+  check('S1 历史同步恢复', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+  check('S1 未显示空提示', env.emptyHints() === 0, 'emptyHints=' + env.emptyHints());
+  check('S1 无 500ms 等待定时器', !env.hasTimer(500));
+  env.conn('connected');
+  const loads = env.sends().filter(s => s.method === 'session/load');
+  check('S1 复用会话缓存 session/load', loads.length === 1 && loads[0].params.sessionId === 'S-PREV',
+    'loads=' + JSON.stringify(loads));
+}
+
+// Scenario 2：打开已保存但 Path 空 + 有同名历史 → 进入等待 → Path 就位 → 恢复
+console.log('Scenario 2: 打开已保存但 Path 空 + 同名历史 → 等待 → 就位恢复');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      ['qp.history.' + HIST_DOC]: HIST_MSGS,
+      ['qp.session.' + HIST_DOC]: 'S-PREV',
+    },
+  });
+  const st = env.state();
+  check('S2 进入等待（docIdPending=true）', st.docIdPending === true,
+    'pending=' + st.docIdPending);
+  check('S2 等待期不恢复历史', env.restores().length === 0);
+  check('S2 等待期不显示空提示', env.emptyHints() === 0, 'emptyHints=' + env.emptyHints());
+  check('S2 占位为「正在识别文档…」', env.placeholders().indexOf('正在识别文档…') !== -1,
+    'placeholders=' + JSON.stringify(env.placeholders()));
+  check('S2 有 500ms 等待定时器', env.hasTimer(500));
+  // Path 就位 → 等待收敛
+  env.setDocIdentity({ name: HIST_NAME, path: '/home/u/Documents', appType: 'wps' });
+  env.fireMs(500);
+  const st2 = env.state();
+  check('S2 Path 就位后收敛到稳定 id', st2.currentDocId === HIST_DOC,
+    'docId=' + st2.currentDocId);
+  check('S2 收敛后 docIdPending=false', st2.docIdPending === false);
+  check('S2 历史恢复', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+  const loads = env.sends().filter(s => s.method === 'session/load');
+  check('S2 收敛后复用会话 session/load', loads.length === 1 && loads[0].params.sessionId === 'S-PREV',
+    'loads=' + JSON.stringify(loads));
+}
+
+// Scenario 3：等待超时（Path 一直空）→ 降级 X：用反查 docId 恢复历史 + 会话
+console.log('Scenario 3: 等待超时 → 降级 X（恢复反查历史 + 会话）');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      ['qp.history.' + HIST_DOC]: HIST_MSGS,
+      ['qp.session.' + HIST_DOC]: 'S-PREV',
+    },
+  });
+  check('S3 进入等待', env.state().docIdPending === true);
+  for (let i = 0; i < 8; i++) env.fireMs(500); // 耗尽等待链（3s 上限）
+  const st = env.state();
+  check('S3 降级 X：收敛到反查 docId', st.currentDocId === HIST_DOC,
+    'docId=' + st.currentDocId);
+  check('S3 降级后 docIdPending=false', st.docIdPending === false);
+  check('S3 降级后历史恢复', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+  const loads = env.sends().filter(s => s.method === 'session/load');
+  check('S3 降级后复用会话 session/load', loads.length === 1 && loads[0].params.sessionId === 'S-PREV',
+    'loads=' + JSON.stringify(loads));
+}
+
+// Scenario 4/5/6：无同名历史（真新建/首开/文字文稿5）→ 立即建会话，零等待
+console.log('Scenario 4/5/6: 无同名历史 → 立即建会话，零等待（不被误判为打开）');
+{
+  const env4 = loadEnv('ok', { docIdentity: { name: '新建文档.docx', path: '', appType: 'wps' } });
+  check('S4 docId 为 volatile', env4.volatile(env4.state().currentDocId), 'docId=' + env4.state().currentDocId);
+  assertImmediateNew(env4, 'S4 新建文档（无同名历史）');
+
+  const env5 = loadEnv('ok', { docIdentity: { name: '首次打开.docx', path: '', appType: 'wps' } });
+  check('S5 docId 为 volatile', env5.volatile(env5.state().currentDocId), 'docId=' + env5.state().currentDocId);
+  assertImmediateNew(env5, 'S5 首次打开无历史文档');
+
+  const env6 = loadEnv('ok', { docIdentity: { name: '文字文稿5', path: '', appType: 'wps' } });
+  check('S6 docId 为 volatile', env6.volatile(env6.state().currentDocId), 'docId=' + env6.state().currentDocId);
+  assertImmediateNew(env6, 'S6 新建"文字文稿5"（无同名历史）');
+}
+
+// Scenario 7：保存过"文字文稿5"文件（有同名历史）→ 进入等待并恢复（用户提醒的反例）
+console.log('Scenario 7: 保存过"文字文稿5" → 反查命中进入等待并恢复');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: '文字文稿5', path: '', appType: 'wps' },
+    prestore: {
+      'qp.history.wps:/home/u/Documents:文字文稿5': HIST_MSGS,
+      'qp.session.wps:/home/u/Documents:文字文稿5': 'S-PREV',
+    },
+  });
+  check('S7 反查命中 → 进入等待（不误判为新建）', env.state().docIdPending === true,
+    'pending=' + env.state().docIdPending);
+  env.setDocIdentity({ name: '文字文稿5', path: '/home/u/Documents', appType: 'wps' });
+  env.fireMs(500);
+  const st = env.state();
+  check('S7 收敛到稳定 id', st.currentDocId === 'wps:/home/u/Documents:文字文稿5',
+    'docId=' + st.currentDocId);
+  check('S7 历史恢复', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+}
+
+// Scenario 8：多命中同名（不同目录）→ 有 session key 优先、再比条数，不崩溃
+console.log('Scenario 8: 多命中同名 → 择一（session 优先 / 条数次之），不崩溃');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      ['qp.history.wps:/a:' + HIST_NAME]: JSON.stringify([{ role: 'user', text: 'a1' }]),
+      ['qp.session.wps:/a:' + HIST_NAME]: 'S-A',
+      ['qp.history.wps:/b:' + HIST_NAME]: JSON.stringify([{ role: 'user', text: 'b1' }, { role: 'user', text: 'b2' }]),
+    },
+  });
+  check('S8 进入等待', env.state().docIdPending === true);
+  for (let i = 0; i < 8; i++) env.fireMs(500);
+  const st = env.state();
+  check('S8 多命中 → 有 session 的 /a 胜出（降级 X 用反查 docId）', st.currentDocId === 'wps:/a:' + HIST_NAME,
+    'docId=' + st.currentDocId);
+  check('S8 恢复 /a 的 1 条历史', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+  const loads = env.sends().filter(s => s.method === 'session/load');
+  check('S8 复用 /a 的会话 S-A', loads.length === 1 && loads[0].params.sessionId === 'S-A',
+    'loads=' + JSON.stringify(loads));
+
+  const env8b = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      ['qp.history.wps:/a:' + HIST_NAME]: JSON.stringify([{ role: 'user', text: 'a1' }]),
+      ['qp.history.wps:/b:' + HIST_NAME]: JSON.stringify([{ role: 'user', text: 'b1' }, { role: 'user', text: 'b2' }]),
+    },
+  });
+  for (let i = 0; i < 8; i++) env8b.fireMs(500);
+  check('S8b 无 session key → 历史条数多的 /b 胜出', env8b.state().currentDocId === 'wps:/b:' + HIST_NAME,
+    'docId=' + env8b.state().currentDocId);
+  check('S8b 恢复 /b 的 2 条历史', env8b.restores().length === 1 && env8b.restores()[0].length === 2,
+    'restores=' + JSON.stringify(env8b.restores().map(r => r.length)));
+}
+
+// Scenario 9：G1 会话门禁——等待期 ACP 连上不得建会话（session/new），收敛后补触发 session/load
+console.log('Scenario 9: G1 会话门禁（等待期 ACP 连上不建会话）');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      ['qp.history.' + HIST_DOC]: HIST_MSGS,
+      ['qp.session.' + HIST_DOC]: 'S-PREV',
+    },
+  });
+  check('S9 进入等待', env.state().docIdPending === true);
+  env.conn('connected'); // ACP 在等待期连上
+  check('S9 等待期不发送 session/new（G1 门禁）', env.sessionNewSends().length === 0,
+    'count=' + env.sessionNewSends().length);
+  check('S9 等待期也不发送 session/load', env.sends().filter(s => s.method === 'session/load').length === 0,
+    'sends=' + JSON.stringify(env.sends().map(s => s.method)));
+  // Path 就位 → 收敛 → 补触发建会话（走 session/load，非 session/new）
+  env.setDocIdentity({ name: HIST_NAME, path: '/home/u/Documents', appType: 'wps' });
+  env.fireMs(500);
+  const st = env.state();
+  check('S9 收敛后 docIdPending=false', st.docIdPending === false);
+  check('S9 收敛后走 session/load（非 session/new）',
+    env.sessionNewSends().length === 0 && env.sends().filter(s => s.method === 'session/load').length === 1,
+    'sends=' + JSON.stringify(env.sends().map(s => s.method)));
+  check('S9 历史恢复', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+}
+
+// Scenario 10：G2 幂等——等待期 docCheck 抢先收敛到稳定 id → 等待收敛不二次判定
+console.log('Scenario 10: G2 幂等（docCheck 抢先收敛）');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: { ['qp.history.' + HIST_DOC]: HIST_MSGS },
+  });
+  check('S10 进入等待', env.state().docIdPending === true);
+  // 等待期间 Path 就位 + ACP 连上（onAcpConnChange → checkDocNow 即时复查）→ docCheck 先收敛
+  env.setDocIdentity({ name: HIST_NAME, path: '/home/u/Documents', appType: 'wps' });
+  env.conn('connected');
+  const st1 = env.state();
+  check('S10 docCheck 已收敛到稳定 id', st1.currentDocId === HIST_DOC, 'docId=' + st1.currentDocId);
+  check('S10 等待期无会话建立（门禁）',
+    env.sessionNewSends().length === 0 && env.sends().filter(s => s.method === 'session/load').length === 0,
+    'sends=' + JSON.stringify(env.sends().map(s => s.method)));
+  // 等待链仍在 → 幂等收敛
+  env.fireMs(500);
+  const st2 = env.state();
+  check('S10 等待收敛幂等（docIdPending=false，不二次判定）', st2.docIdPending === false,
+    'pending=' + st2.docIdPending);
+  check('S10 currentDocId 保持稳定 id', st2.currentDocId === HIST_DOC, 'docId=' + st2.currentDocId);
+  check('S10 历史已恢复（docCheck 或等待收敛，至多两次幂等重渲染）',
+    env.restores().length >= 1 && env.restores().length <= 2,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+  check('S10 收敛后建会话一次（无缓存 → session/new）', env.sessionNewSends().length === 1,
+    'count=' + env.sessionNewSends().length);
+}
+
+// Scenario 11：G4a 反查防御——旧 volatile/default 数据不参与匹配
+console.log('Scenario 11: 反查防御（跳过旧 volatile / default key）');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      'qp.history.default': JSON.stringify([{ role: 'user', text: 'def' }]),
+      ['qp.history.wps::unsaved::legacyToken::' + HIST_NAME]: JSON.stringify([{ role: 'user', text: 'vol' }]),
+    },
+  });
+  check('S11 旧 volatile/default 数据不参与匹配 → 按新建（docIdPending=false）',
+    env.state().docIdPending === false, 'pending=' + env.state().docIdPending);
+  check('S11 显示空提示（不恢复旧数据）', env.emptyHints() === 1, 'emptyHints=' + env.emptyHints());
+  check('S11 无 500ms 等待定时器', !env.hasTimer(500));
+}
+
+// Scenario 12：B7 等待期文档被关闭 → 不主动建会话（G1），docCheck 落定 default 后再建
+console.log('Scenario 12: B7 等待期文档关闭 → 不主动建会话');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: { ['qp.history.' + HIST_DOC]: HIST_MSGS },
+  });
+  check('S12 进入等待', env.state().docIdPending === true);
+  env.conn('connected'); // ACP 在等待期连上（门禁生效）
+  check('S12 等待期无会话（门禁）',
+    env.sessionNewSends().length === 0 && env.sends().filter(s => s.method === 'session/load').length === 0,
+    'sends=' + JSON.stringify(env.sends().map(s => s.method)));
+  // 等待期文档被关闭 → 下一步等待收敛 resolvedId=null
+  env.setDocIdentity(null);
+  env.setOpenDocs([]);
+  env.fireMs(500);
+  const st = env.state();
+  check('S12 收敛后 docIdPending=false', st.docIdPending === false, 'pending=' + st.docIdPending);
+  check('S12 不主动建会话（B7 无真实稳定 id，不发 session/new）', env.sessionNewSends().length === 0,
+    'count=' + env.sessionNewSends().length);
+  check('S12 显示空提示', env.emptyHints() === 1, 'emptyHints=' + env.emptyHints());
+  // docCheckNow 落定 default → switchToDoc → 触发建会话
+  env.checkDoc();
+  check('S12 docCheck 后进入 default', env.state().currentDocId === 'default',
+    'docId=' + env.state().currentDocId);
+  check('S12 docCheck 落定后建会话（session/new 一次）', env.sessionNewSends().length === 1,
+    'count=' + env.sessionNewSends().length);
+}
+
+// Scenario 13：永久空 Path → 超时降级 X 的结果不被后续 docCheck 抹掉（守卫生效）
+console.log('Scenario 13: 永久空 Path → 降级 X 不被 docCheck 抹掉');
+{
+  const env = loadEnv('ok', {
+    docIdentity: { name: HIST_NAME, path: '', appType: 'wps' },
+    prestore: {
+      ['qp.history.' + HIST_DOC]: HIST_MSGS,
+      ['qp.session.' + HIST_DOC]: 'S-PREV',
+    },
+  });
+  check('S13 进入等待', env.state().docIdPending === true);
+  for (let i = 0; i < 8; i++) env.fireMs(500); // 超时降级 X
+  const st1 = env.state();
+  check('S13 降级 X 收敛到反查 docId', st1.currentDocId === HIST_DOC, 'docId=' + st1.currentDocId);
+  check('S13 历史已恢复', env.restores().length === 1 && env.restores()[0].length === 1,
+    'restores=' + JSON.stringify(env.restores().map(r => r.length)));
+  // docCheck 周期触发（Path 仍空 → 同名 volatile）→ 不得切回 volatile 抹掉降级结果
+  env.checkDoc();
+  const st2 = env.state();
+  check('S13 docCheck 不抹掉降级结果（currentDocId 仍为稳定 id）', st2.currentDocId === HIST_DOC,
+    'docId=' + st2.currentDocId);
+  check('S13 无额外 restore/空提示清屏', env.restores().length === 1, 'restores=' + env.restores().length);
+  check('S13 不额外建会话（无 session/new）', env.sessionNewSends().length === 0,
+    'count=' + env.sessionNewSends().length);
+  check('S13 会话缓存仍走 session/load（S-PREV）',
+    env.sends().filter(s => s.method === 'session/load').length === 1,
+    'sends=' + JSON.stringify(env.sends().filter(s => s.method === 'session/load').map(s => s.params.sessionId)));
 }
 
 console.log(failures === 0 ? '\n✅ 前端行为验证全部通过' : `\n❌ ${failures} 项失败`);

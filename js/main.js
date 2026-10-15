@@ -60,14 +60,37 @@
     updateSendAvailability();
 
     // P8/P15：确定当前文档 id，恢复该文档的历史消息（前端缓存）
+    // plan-2026-10-15：volatile docId 反查判定——打开已保存文档瞬间 Path 未就位时，
+    // 反查 localStorage 同名历史恢复，避免"打开文档历史丢失、AI 失忆"。
+    // resolveInitDocId：反查命中 → 进入 Path 等待（异步 onDone，等待期不恢复/不显示空提示）；
+    // 未命中 / 已保存 / default → 同步 onDone（行为与旧版一致）。
     S.currentDocId = getDocId();
-    var cachedMsgs = QP.loadHistory(S.currentDocId);
-    if (cachedMsgs && cachedMsgs.length) {
-      ChatUi.restore(cachedMsgs);
-      QPLog('P15', '恢复文档 ' + S.currentDocId + ' 历史 ' + cachedMsgs.length + ' 条');
-    } else {
-      ChatUi.showEmptyHint();
-    }
+    resolveInitDocId(S.currentDocId, function (resolvedId, degraded, waited) {
+      S.currentDocId = resolvedId || S.currentDocId;
+      if (resolvedId && !isVolatileDocId(resolvedId)) {
+        var hist = QP.loadHistory(resolvedId);
+        var sid = QP.loadCachedSessionId(resolvedId);
+        if (hist && hist.length) {
+          ChatUi.restore(hist);
+          QPLog('P15', '恢复文档 ' + resolvedId + ' 历史 ' + hist.length + ' 条'
+            + (degraded ? '（超时降级 X）' : '（Path 就位）'));
+        } else {
+          ChatUi.showEmptyHint();
+        }
+        if (sid) QPLog('P15', '恢复会话缓存 ' + resolvedId + ' -> ' + sid);
+      } else {
+        ChatUi.showEmptyHint();
+      }
+      if (waited) {
+        // 等待路径收敛：docIdPending 已清除。仅对真实稳定 id 补触发建会话（若 ACP 已在等待期连上，
+        // 门禁曾挂起它）；B7/B8（文档消失/切走，resolvedId=null）不主动建会话——由 docCheckNow/
+        // switchToDoc 在落定实际文档后触发，避免拿陈旧 volatile docId 建会话（G1）。
+        if (resolvedId && !isVolatileDocId(resolvedId)) {
+          ensureSession();
+        }
+        updateSendAvailability();
+      }
+    });
     startDocCheck();
 
     // 2. 从 bridge 拉取确定性配置（wps-mcp 入口），完成后再分配 poll 端口 + 连接 ACP，

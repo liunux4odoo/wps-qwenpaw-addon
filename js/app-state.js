@@ -81,6 +81,7 @@ var QP = (function () {
     currentDocId: null,             // 当前活动文档 id（会话隔离 key）
     docStates: {},                  // docId -> {acpSessionId, messages}
     docSwitchDeferred: false,       // P8：AI 在途响应期间检测到文档变化 → 延迟到响应结束再切换
+    docIdPending: false,            // plan-2026-10-15：volatile docId 反查判定未收敛（等待 Path 就位期间门禁 ensureSession）
     persistTimer: null,             // P15：历史落盘防抖
     agentList: [],                  // P3：可用 agent 列表
     agentCached: null,              // P3：localStorage 记住的上次 agent
@@ -163,6 +164,46 @@ var QP = (function () {
     } catch (e) {}
   }
 
+  // plan-2026-10-15：volatile docId 历史反查（只读工具）——
+  // 遍历 localStorage 的 qp.history.* / qp.session.* key，查找与给定文件名（name）全等匹配的
+  // 已保存 docId（打开已保存文档瞬间 Path 未就位时，用 volatile 的 name 反查真实历史归属）。
+  // 规则（方案 §4.2）：
+  //   - 防御性跳过 volatile key（含 ::unsaved::，P23 前旧数据可能残留）与 default key；
+  //   - 多命中择一：有 qp.session.<docId> 的优先（会话更新信号），再比历史条数最多者；
+  //   - 只读：不写、不删、不迁移任何 key；localStorage 不可用时返回 null（走 volatile 新建）。
+  // @returns {string|null} 单个已保存 docId（命中时），否则 null。
+  function lookupSavedDocIdByName(name) {
+    if (!name) return null;
+    var best = null;
+    var bestScore = -1;
+    try {
+      var ids = {};
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (!k) continue;
+        if (k.indexOf('qp.history.') === 0) ids[k.substring('qp.history.'.length)] = true;
+        else if (k.indexOf('qp.session.') === 0) ids[k.substring('qp.session.'.length)] = true;
+      }
+      for (var id in ids) {
+        if (!Object.prototype.hasOwnProperty.call(ids, id)) continue;
+        if (id === 'default') continue;                              // 跳过 default
+        if (isVolatileDocIdForPersist(id)) continue;                 // 跳过 volatile key
+        if (id.split(':').pop() !== name) continue;                  // name 全等匹配
+        var score = 0;
+        try {
+          if (localStorage.getItem(sessionKey(id)) !== null) score += 100000;
+          var raw = localStorage.getItem(historyKey(id));
+          var msgs = (raw && JSON.parse(raw)) || [];
+          if (Array.isArray(msgs)) score += msgs.length;
+        } catch (e) {}
+        if (score > bestScore) { bestScore = score; best = id; }
+      }
+    } catch (e) {
+      return null;
+    }
+    return best;
+  }
+
   // Phase 3：从 localStorage 读取记住的 model/effort（按 server 隔离；会话级不跨会话，新会话需重新应用）
   function loadSavedConfigOptions() {
     try {
@@ -242,6 +283,7 @@ var QP = (function () {
     saveHistory: saveHistory,
     loadCachedSessionId: loadCachedSessionId,
     saveCachedSessionId: saveCachedSessionId,
+    lookupSavedDocIdByName: lookupSavedDocIdByName,
     loadSavedConfigOptions: loadSavedConfigOptions,
     saveSavedConfigOptions: saveSavedConfigOptions
   };

@@ -69,7 +69,9 @@
     var ready = (S.acpState === 'connected') && (S.acpSessionId !== null) && !S.waitingResponse;
     ChatUi.setInputEnabled(ready);
     var ph;
-    if (S.acpState !== 'connected') {
+    if (S.docIdPending) {
+      ph = '正在识别文档…'; // plan-2026-10-15：volatile 反查等待 Path 就位期间的占位
+    } else if (S.acpState !== 'connected') {
       ph = '连接中…（等待 ACP 就绪）';
     } else if (S.sessionFailed && S.acpSessionId === null) {
       ph = '会话建立失败，请点击错误卡片重试';

@@ -199,6 +199,16 @@
     var id = (info && info.name) ? makeDocId(info) : 'default';
     var prev = S.currentDocId;
     var count = (info && info.name) ? readDocCount(info.appType) : null;
+    // plan-2026-10-15：降级收敛（超时降级 X / 就位收敛）后 Path 仍未就位时，WPS 身份仍是同名
+    // volatile docId——不得把已收敛的稳定 currentDocId 切回 volatile（否则 switchToDoc 会抹掉刚
+    // 恢复的历史/会话，使超时降级 X 自毁）。同一文档（同名）→ 保持稳定 id，仅更新跟踪态；
+    // Path 真正就位后 id 变稳定，本守卫自然放行（G3 纠正到真实路径）。
+    if (id !== prev && !isVolatileDocId(prev) && isVolatileDocId(id)
+        && prev.split(':').pop() === String(id).split('::').pop()) {
+      if (info && info.name) { lastIdentity = info; lastDocCount = count; }
+      lastCheckDocId = id;
+      return;
+    }
     if (!id || id === prev) {
       // 无变化：仅跟踪当前身份与集合数量（P23 同名就地保存 / 改名保存判定用）
       if (info && info.name) { lastIdentity = info; lastDocCount = count; }
@@ -360,6 +370,62 @@
     }
   }
 
+  // ── plan-2026-10-15：volatile docId 历史反查 + Path 就位等待 ──
+  // 背景：打开已保存文档瞬间 Path 可能未就位（空字符串）→ makeDocId 生成 volatile docId，
+  // 历史/会话缓存不落盘（P23）→ "打开文档历史丢失、AI 失忆"。本逻辑在初始化时：
+  //   - 反查 localStorage 同名已保存 docId（QP.lookupSavedDocIdByName）；
+  //   - 命中 → 判定"打开中的已保存文档，Path 未就位"→ 置位 S.docIdPending（门禁 ensureSession）+ 短轮询等待 Path；
+  //   - Path 就位 → 正常收敛；超时（≤3s）→ 降级 X（用反查 docId 恢复历史 + 会话）。
+  //   - 未命中 / 已保存 / default → 同步 onDone（行为与旧版一致，零等待）。
+  // setTimeout 链实现轮询（不用 setInterval）：测试 harness 的 fakeSetInterval 不触发，链式才能确定性驱动。
+  var INIT_WAIT_STEP_MS = 500;   // Path 就位轮询步长
+  var INIT_WAIT_MAX_MS = 3000;   // 等待上限（超时降级路径 X）
+  var initWaitTimer = null;      // 等待定时器（setTimeout 链，模块私有）
+
+  // 初始化 docId 判定（main.js initTaskpane 调用）。
+  // @param {string} currentId  initTaskpane 已计算的 S.currentDocId（与 getDocId() 同源）
+  // @param {Function} onDone(resolvedId, degraded, waited)
+  //   resolvedId：待使用的 docId；null = 按新建处理（不挂历史）；
+  //   degraded：超时降级 X（用反查 docId 恢复，Path 未就位）；
+  //   waited：是否经过了等待（true 时 main.js 需在收敛后补触发 ensureSession，因等待期门禁可能挂起过它）。
+  function resolveInitDocId(currentId, onDone) {
+    if (!isVolatileDocId(currentId)) { onDone(currentId, false, false); return; }
+    var name = String(currentId).split('::').pop();
+    var foundId = QP.lookupSavedDocIdByName(name);
+    if (!foundId) { onDone(currentId, false, false); return; }
+    // 命中 → 打开中的已保存文档，Path 未就位：置门禁 + 进入等待
+    S.docIdPending = true;
+    updateSendAvailability(); // 占位「正在识别文档…」（updateSendAvailability 含 docIdPending 分支）
+    startInitPathWait(name, foundId, function (rid, degraded) {
+      if (initWaitTimer) { clearTimeout(initWaitTimer); initWaitTimer = null; }
+      S.docIdPending = false;
+      onDone(rid, degraded, true);
+    });
+  }
+
+  function startInitPathWait(volatileName, foundId, finish) {
+    var waited = 0;
+    function step() {
+      // G2 幂等：等待期间 docCheck（3s 周期 / ACP 连接时即时复查）已把 currentDocId 收敛到稳定 id
+      // （switchToDoc 或保存迁移）→ 不二次判定，直接按当前 stable id 收敛。
+      var cur = S.currentDocId;
+      if (cur && !isVolatileDocId(cur) && cur !== 'default') { finish(cur, false); return; }
+      var info = null;
+      try { info = getDocEnvContext(); } catch (e) {}
+      // B7：等待期间活动文档消失（activeDocument 不可用）→ 中止等待，按新建处理（不挂旧历史）
+      if (!info || !info.name) { finish(null, false); return; }
+      // Path 就位 → 正常收敛（按真实身份生成稳定 docId）
+      if (info.path) { finish(makeDocId(info), false); return; }
+      // B8：等待期间切到另一未保存文档 → 交 docCheckNow 3s 周期接管（按新建处理，不挂旧历史）
+      if (info.name !== volatileName) { finish(null, false); return; }
+      waited += INIT_WAIT_STEP_MS;
+      if (waited >= INIT_WAIT_MAX_MS) { finish(foundId, true); return; } // B9：超时降级 X
+      updateSendAvailability(); // 等待期占位保持「正在识别文档…」（防 ACP 连接等事件覆盖）
+      initWaitTimer = setTimeout(step, INIT_WAIT_STEP_MS);
+    }
+    step(); // 立即复查一次（Path 可能瞬间已就位），再进入轮询
+  }
+
   // 仅导出跨文件需要的函数（globalThis === window）
   globalThis.getDocId = getDocId;
   globalThis.isVolatileDocId = isVolatileDocId;
@@ -370,4 +436,5 @@
   globalThis.checkDocNow = checkDocNow;
   globalThis.flushDeferredDocSwitch = flushDeferredDocSwitch;
   globalThis.startDocCheck = startDocCheck;
+  globalThis.resolveInitDocId = resolveInitDocId;
 })();

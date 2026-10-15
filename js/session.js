@@ -35,6 +35,12 @@
   // 根因 2：wps-mcp 入口必须是权威绝对路径（/config 下发）才发 session/new，未就绪先拉 /config。
   // 根因 1：发送后启动看门狗（超时清 pending + 重试 ≤1 + 可见错误），防请求被丢弃后永久锁死。
   function ensureSession() {
+    // plan-2026-10-15 G1：volatile docId 反查判定未收敛（等待 Path 就位）→ 不建会话，
+    // 避免用 volatile docId 发 session/new（恰是本 bug 路径）。判定收敛后由 main.js 补触发。
+    if (S.docIdPending) {
+      QPLog('main', 'ensureSession: docId 判定中（等待 Path 就位），跳过');
+      return;
+    }
     if (S.acpSessionId) return;
     // 已有在途的 session/new 或 session/load：不重复发送（防 onAcpConnChange 重入/onUserSend 竞态）
     for (var k in S.pendingRequests) {
